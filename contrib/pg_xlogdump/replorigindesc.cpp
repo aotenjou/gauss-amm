@@ -1,0 +1,1 @@
+../../src/gausskernel/storage/access/rmgrdesc/replorigindesc.cpp

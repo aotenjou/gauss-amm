@@ -1,0 +1,87 @@
+-- Run this test with the AMM validation GUCs in the postmaster configuration.
+-- AMM external sorts must preserve all runs when a tuple allocation forces a
+-- mid-input flush.  The aggregate's internal datum sort exercises that path.
+SHOW gs_amm_enabled;
+ gs_amm_enabled 
+----------------
+ on
+(1 row)
+
+SHOW gs_amm_legacy_control_enabled;
+ gs_amm_legacy_control_enabled 
+-------------------------------
+ on
+(1 row)
+
+SHOW gs_amm_resize_cooldown_ms;
+ gs_amm_resize_cooldown_ms 
+---------------------------
+ 0
+(1 row)
+
+SHOW enable_resource_track;
+ enable_resource_track 
+-----------------------
+ off
+(1 row)
+
+SELECT position('reset=true' in gs_amm_reset_state()) = 1 AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT position('chosen_action=BORROW_FROM_BUFFER' in gs_amm_controller_step(64, 0, 0)) = 1 AS borrowed;
+ borrowed 
+----------
+ t
+(1 row)
+
+SELECT position('admitted=true' in gs_amm_begin_ap(4, 4, 4, 0)) = 1 AS admitted;
+ admitted 
+----------
+ t
+(1 row)
+
+SELECT count(*) AS count_all, count(DISTINCT payload) AS count_distinct
+FROM (
+    SELECT lpad(g::text, 1024, 'x') AS payload
+    FROM generate_series(1, 50000) AS g
+    ORDER BY payload
+) ordered;
+ count_all | count_distinct 
+-----------+----------------
+     50000 |          50000
+(1 row)
+
+SELECT count(*) AS count_all, count(DISTINCT payload) AS count_distinct
+FROM (
+    SELECT lpad(g::text, 1024, 'x') AS payload
+    FROM generate_series(1, 50000) AS g
+    ORDER BY payload
+) ordered;
+ count_all | count_distinct 
+-----------+----------------
+     50000 |          50000
+(1 row)
+
+SELECT position('released=true' in gs_amm_end_ap()) = 1 AS released;
+ released 
+----------
+ t
+(1 row)
+
+SELECT position('active_ap_count=0' in gs_amm_status()) > 0
+       AND position('ap_active_granules=0' in gs_amm_status()) > 0
+       AND position('dynamic_used_mb=0' in gs_amm_status()) > 0 AS grant_cleaned;
+ grant_cleaned 
+---------------
+ t
+(1 row)
+
+SELECT position('reset=true' in gs_amm_reset_state()) = 1 AS restored;
+ restored 
+----------
+ t
+(1 row)
+

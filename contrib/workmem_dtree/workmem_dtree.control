@@ -1,0 +1,5 @@
+# workmem_dtree extension
+comment = 'decision-tree work_mem predictor for GaussAMM experiments'
+default_version = '1.0'
+module_pathname = '$libdir/workmem_dtree'
+relocatable = true

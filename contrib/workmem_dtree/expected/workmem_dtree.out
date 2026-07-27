@@ -1,0 +1,56 @@
+CREATE EXTENSION workmem_dtree;
+SELECT array_length(gs_workmem_dtree_predict(ARRAY[
+    1.0, 2.0, 1.0, 0.0, 6.0, 128.0, 1000.0, 0.0, 0.0,
+    1.0, 2.0, 0.0, 1024.0, 768.0, 0.25, 64.0, 8.0, 12.0, ln(1001.0)
+]::float8[]), 1);
+ array_length 
+--------------
+            3
+(1 row)
+
+WITH prediction AS (
+    SELECT gs_workmem_dtree_predict(ARRAY[
+    1.0, 2.0, 1.0, 0.0, 6.0, 128.0, 1000.0, 0.0, 0.0,
+    1.0, 2.0, 0.0, 1024.0, 768.0, 0.25, 64.0, 8.0, 12.0, ln(1001.0)
+]::float8[]) AS bounds
+)
+SELECT bounds[1] >= bounds[2] AS cache_ge_onepass FROM prediction;
+ cache_ge_onepass 
+------------------
+ t
+(1 row)
+
+SELECT provolatile = 'i' AS immutable_predictor,
+       fencedmode = false AS not_fenced
+FROM pg_proc
+WHERE proname = 'gs_workmem_dtree_predict';
+ immutable_predictor | not_fenced 
+---------------------+------------
+ t                   | t
+(1 row)
+
+WITH detail AS (
+    SELECT * FROM gs_workmem_dtree_predict_detail(ARRAY[
+    1.0, 2.0, 1.0, 0.0, 6.0, 128.0, 1000.0, 0.0, 0.0,
+    1.0, 2.0, 0.0, 1024.0, 768.0, 0.25, 64.0, 8.0, 12.0, ln(1001.0)
+]::float8[])
+)
+SELECT raw_cache_kb >= calibrated_cache_kb AS raw_ge_calibrated,
+       calibrated_cache_kb >= calibrated_onepass_kb AS calibrated_ge_onepass,
+       calibrated_onepass_kb >= calibrated_multipass_kb AS calibrated_ge_multipass,
+       model_version > 0 AS model_version_present,
+       calibration_scale > 0 AS calibration_scale_positive
+FROM detail;
+ raw_ge_calibrated | calibrated_ge_onepass | calibrated_ge_multipass | model_version_present | calibration_scale_positive 
+-------------------+-----------------------+-------------------------+-----------------------+----------------------------
+ t                 | t                     | t                       | t                     | t
+(1 row)
+
+SELECT provolatile = 's' AS stable_detail,
+       fencedmode = false AS not_fenced
+FROM pg_proc
+WHERE proname = 'gs_workmem_dtree_predict_detail';
+ stable_detail | not_fenced 
+---------------+------------
+ t             | t
+(1 row)
