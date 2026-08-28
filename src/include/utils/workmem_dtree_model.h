@@ -6,7 +6,7 @@
 
 #define MEMTUNE_WORKMEM_FEATURE_SCHEMA "workmem-3bound-features-v1"
 #define MEMTUNE_WORKMEM_FEATURE_COUNT 19
-#define MEMTUNE_WORKMEM_MODEL_VERSION 1
+#define MEMTUNE_WORKMEM_MODEL_VERSION 2
 
 typedef struct GsAmmDtreeDetail GsAmmDtreeDetail;
 

@@ -199,6 +199,10 @@ typedef struct {
 
 #define SLAB_SLOT_SIZE 1024
 
+/* Keep a reclaim poll bounded so a large in-memory sort yields periodically
+ * while its tuple payloads are being written to the frozen tape. */
+#define AMM_SORT_RECLAIM_BATCH_TUPLES 256
+
 typedef union SlabSlot {
     union SlabSlot *nextfree;
     char buffer[SLAB_SLOT_SIZE];
@@ -418,6 +422,11 @@ struct Tuplesortstate {
     int current;      /* array index (only used if SORTEDINMEM) */
     bool eof_reached; /* reached EOF (needed for cursors) */
 
+    /* A forward-only cursor may have returned a tuple immediately before an
+     * AMM reclaim poll. Keep it alive until the next fetch because the
+     * caller's result slot may still reference it. */
+    void *amm_reclaim_hold_tuple;
+
     /* markpos_xxx holds marked position for mark and restore */
     long markpos_block; /* tape block# (only used if SORTEDONTAPE) */
     int markpos_offset; /* saved "current", or offset in tape block */
@@ -522,7 +531,14 @@ struct Tuplesortstate {
     int64 spill_size;
     bool relisustore;
     uint64 spill_count;   /* the times of spilling to disk */
+
+    /* AP-native sorts are polled by the backend when the controller revokes
+     * a granule.  The list is backend-local and only contains live states. */
+    Tuplesortstate *amm_reclaim_next;
+    bool amm_reclaim_registered;
 };
+
+static THR_LOCAL Tuplesortstate *AmmSortReclaimStates = NULL;
 
 /*
  * Is the given tuple allocated from the slab memory arena?
@@ -564,18 +580,15 @@ struct Tuplesortstate {
 static void ApplyGsAmmEffectiveSortGrant(Tuplesortstate* state)
 {
     int grant_kb = GsAmmCurrentBackendGrantKB();
-    int64 grant_bytes;
+    uint64 grant_bytes;
     int64 used_mem;
 
     if (grant_kb <= 0)
         return;
 
-    grant_bytes = Max((int64)grant_kb, (int64)64) * 1024L;
-    if (grant_bytes >= state->allowedMem)
-        return;
-
     used_mem = state->allowedMem - state->availMem;
-    state->allowedMem = grant_bytes;
+    grant_bytes = Max(GsAmmCurrentBackendGrantPoolBytes(), (uint64)Max(grant_kb, 64) * 1024);
+    state->allowedMem = Max(grant_bytes, (uint64)Max(used_mem, 64 * 1024));
     state->availMem = state->allowedMem - used_mem;
 }
 
@@ -762,6 +775,9 @@ static Size AmmSortIndexTupleBytes(TupleDesc tuple_desc, Datum* values, const bo
 static void AmmSortAllocationError(const char* allocation_name, Size bytes);
 static bool AmmSortReserveSpillMemory(Tuplesortstate* state);
 static void AmmSortReleaseSpillMemory(Tuplesortstate* state);
+static void AmmSortRegisterReclaimState(Tuplesortstate *state);
+static void AmmSortUnregisterReclaimState(Tuplesortstate *state);
+static bool AmmSortSpillSortedInMemory(Tuplesortstate *state);
 
 static void AmmSortAllocationError(const char* allocation_name, Size bytes)
 {
@@ -828,6 +844,39 @@ static void AmmSortReleaseSpillMemory(Tuplesortstate* state)
     }
 }
 
+static void AmmSortRegisterReclaimState(Tuplesortstate *state)
+{
+    if (state == NULL || state->tuplecontext == NULL || !IsA(state->tuplecontext, AmmGranuleContext) ||
+        state->amm_reclaim_registered)
+        return;
+
+    state->amm_reclaim_next = AmmSortReclaimStates;
+    AmmSortReclaimStates = state;
+    state->amm_reclaim_registered = true;
+}
+
+static void AmmSortUnregisterReclaimState(Tuplesortstate *state)
+{
+    Tuplesortstate *previous = NULL;
+    Tuplesortstate *current = AmmSortReclaimStates;
+
+    if (state == NULL || !state->amm_reclaim_registered)
+        return;
+
+    while (current != NULL && current != state) {
+        previous = current;
+        current = current->amm_reclaim_next;
+    }
+    if (current == state) {
+        if (previous == NULL)
+            AmmSortReclaimStates = current->amm_reclaim_next;
+        else
+            previous->amm_reclaim_next = current->amm_reclaim_next;
+    }
+    state->amm_reclaim_next = NULL;
+    state->amm_reclaim_registered = false;
+}
+
 static SortTuple* AmmSortTryResizeMemtuples(Tuplesortstate* state, int newmemtupsize)
 {
     Size new_bytes = (Size)newmemtupsize * sizeof(SortTuple);
@@ -863,6 +912,8 @@ static bool AmmSortEnsureTupleCapacity(Tuplesortstate* state, Size tuple_bytes)
     }
 
     (void)AmmGranuleContextReleaseFreeMemory(state->tuplecontext);
+    (void)AmmGranuleContextReleaseFreeMemory(state->sortcontext);
+    (void)GsAmmGrantProcessPendingReclaim();
     capacity_available = AmmGranuleContextCanAllocate(state->tuplecontext, tuple_bytes);
     (void)MemoryContextSwitchTo(oldcontext);
     return capacity_available;
@@ -961,7 +1012,7 @@ static Tuplesortstate* tuplesort_begin_common(int64 workMem, bool randomAccess, 
     uint64 amm_grant_id = GsAmmCurrentBackendGrantId();
 
     if (amm_grant_kb > 0)
-        workMem = Min(workMem, (int64)amm_grant_kb);
+        workMem = Max((int64)(GsAmmCurrentBackendGrantPoolBytes() / 1024), (int64)64);
 
     /* See leader_takeover_tapes() remarks on randomAccess support */
     if (coordinate && randomAccess)
@@ -975,7 +1026,16 @@ static Tuplesortstate* tuplesort_begin_common(int64 workMem, bool randomAccess, 
         uint64 context_bytes = Max(GsAmmCurrentBackendGrantPoolBytes(),
             Max((uint64)workMem, (uint64)64) * 1024);
 
-        sortcontext = AmmGranuleContextCreate(CurrentMemoryContext, "TupleSort main", amm_grant_id, context_bytes);
+        /* Keep sort metadata, tape state, and spill buffers outside the AP
+         * granule.  Only caller-owned tuple payloads are grant-backed, so a
+         * completed spill can return the physical granule to TP immediately. */
+        sortcontext = AllocSetContextCreate(CurrentMemoryContext,
+            "TupleSort main",
+            ALLOCSET_DEFAULT_MINSIZE,
+            ALLOCSET_DEFAULT_INITSIZE,
+            ALLOCSET_DEFAULT_MAXSIZE,
+            STANDARD_CONTEXT,
+            context_bytes);
         tuplecontext = AmmGranuleContextCreate(sortcontext, "Caller tuples", amm_grant_id, context_bytes);
     } else {
         sortcontext = AllocSetContextCreate(CurrentMemoryContext, "TupleSort main", ALLOCSET_DEFAULT_MINSIZE,
@@ -1018,6 +1078,7 @@ static Tuplesortstate* tuplesort_begin_common(int64 workMem, bool randomAccess, 
 
     state->memtupcount = 0;
     state->memtupsize = 1024; /* initial guess */
+    state->amm_reclaim_hold_tuple = NULL;
     state->growmemtuples = true;
     state->slabAllocatorUsed = false;
     state->memtuples = (SortTuple*)AmmSortTryAlloc(
@@ -1070,6 +1131,8 @@ static Tuplesortstate* tuplesort_begin_common(int64 workMem, bool randomAccess, 
         Assert(state->nParticipants >= 1);
     }
     state->peakMemorySize = 0;
+
+    AmmSortRegisterReclaimState(state);
 
     (void)MemoryContextSwitchTo(oldcontext);
 
@@ -1460,7 +1523,6 @@ void tuplesort_set_bound(Tuplesortstate* state, int64 bound)
  */
 void tuplesort_end(Tuplesortstate* state)
 {
-    uint64 lifecycle_generation = GsAmmCurrentQueryLifecycleGeneration();
     uint64 current_memory_bytes;
     uint64 peak_memory_bytes;
 
@@ -1470,10 +1532,6 @@ void tuplesort_end(Tuplesortstate* state)
     current_memory_bytes = state->allowedMem > state->availMem ?
         (uint64)(state->allowedMem - state->availMem) : 0;
     peak_memory_bytes = Max(current_memory_bytes, (uint64)Max(state->peakMemorySize, 0));
-    GsAmmReportOperatorPeak(lifecycle_generation, peak_memory_bytes);
-    GsAmmReportQuerySpill(lifecycle_generation, state->spill_size > 0 ? (uint64)state->spill_size : 0,
-        state->spill_count > UINT_MAX ? UINT_MAX : (uint32)state->spill_count);
-
 #ifdef TRACE_SORT
     long spaceUsed;
 
@@ -1522,6 +1580,8 @@ void tuplesort_end(Tuplesortstate* state)
         ExecDropSingleTupleTableSlot(econtext->ecxt_scantuple);
         FreeExecutorState(state->estate);
     }
+
+    AmmSortUnregisterReclaimState(state);
 
     (void)MemoryContextSwitchTo(oldcontext);
 
@@ -2211,6 +2271,21 @@ static bool tuplesort_gettuple_common(Tuplesortstate* state, bool forward, SortT
         case TSS_SORTEDONTAPE:
             Assert(forward || state->randomAccess);
             Assert(state->slabAllocatorUsed);
+
+            /* A partial in-memory spill retains the tuple returned by the
+             * preceding FETCH until this call. The caller's result slot is
+             * now being replaced, so release that AMM allocation before
+             * reading from the tape. */
+            if (state->amm_reclaim_hold_tuple != NULL) {
+                FREEMEM(state, GetMemoryChunkSpace(state->amm_reclaim_hold_tuple));
+                pfree_ext(state->amm_reclaim_hold_tuple);
+                state->amm_reclaim_hold_tuple = NULL;
+                if (state->tuplecontext != NULL) {
+                    Size released_bytes = AmmGranuleContextReleaseFreeMemory(state->tuplecontext);
+                    if (released_bytes > 0)
+                        GsAmmRecordApReclaimPoll(released_bytes);
+                }
+            }
             
             /*
              * The slot that held the tuple that we returned in previous
@@ -2365,6 +2440,11 @@ bool tuplesort_gettupleslot(Tuplesortstate* state, bool forward, TupleTableSlot*
     MemoryContext oldcontext = MemoryContextSwitchTo(state->sortcontext);
     SortTuple stup;
 
+    /* Invalidate the caller's previous result before a partial-cursor spill
+     * releases its held tuple in tuplesort_gettuple_common(). */
+    if (forward && state->amm_reclaim_hold_tuple != NULL)
+        (void)ExecClearTuple(slot);
+
     if (!tuplesort_gettuple_common(state, forward, &stup))
         stup.tuple = NULL;
 
@@ -2400,6 +2480,9 @@ bool tuplesort_gettupleslot_into_tuplestore(
     SortTuple stup;
 
     Assert(tstate != NULL);
+
+    if (forward && state->amm_reclaim_hold_tuple != NULL)
+        (void)ExecClearTuple(slot);
 
     if (!tuplesort_gettuple_common(state, forward, &stup))
         stup.tuple = NULL;
@@ -3492,6 +3575,131 @@ static void sort_bounded_heap(Tuplesortstate* state)
 
     state->status = TSS_SORTEDINMEM;
     state->boundUsed = true;
+}
+
+/*
+ * Materialize an already-completed in-memory sort as one frozen tape.  This
+ * is used only after the AMM controller has revoked a granule.  The tuple
+ * payloads are written and freed one at a time; the remaining tape and sort
+ * metadata live in the ordinary sort context and therefore do not pin the
+ * revoked physical granule.
+ */
+static bool AmmSortSpillSortedInMemory(Tuplesortstate *state)
+{
+    int tapenum;
+    int tuple_start;
+    int batch_count = 0;
+
+    if (state == NULL || state->status != TSS_SORTEDINMEM || state->tapeset != NULL ||
+        state->memtuples == NULL || state->memtupcount <= 0 || !SERIAL(state) ||
+        state->randomAccess || !state->tuples)
+        return false;
+
+    /* Rewriting a cursor that has already advanced would need to restore a
+     * tape position while retaining random-access marks.  Leave that case to
+     * the normal operator cleanup path. */
+    if (state->eof_reached || state->current >= state->memtupcount)
+        return false;
+
+    /* A partially consumed forward-only result can still be converted to a
+     * sequential tape. The last tuple returned to the caller is retained
+     * until the next fetch; every earlier returned tuple can be released. */
+    if (state->current > 0) {
+        state->amm_reclaim_hold_tuple = state->memtuples[state->current - 1].tuple;
+        for (int i = 0; i + 1 < state->current; i++) {
+            if (state->memtuples[i].tuple != NULL)
+                free_sort_tuple(state, &state->memtuples[i]);
+            state->memtuples[i].tuple = NULL;
+        }
+    }
+
+    inittapes(state, true);
+    tapenum = state->tp_tapenum[state->destTape];
+    tuple_start = state->current;
+    for (int i = tuple_start; i < state->memtupcount; i++) {
+        WRITETUP(state, tapenum, &state->memtuples[i]);
+        if (++batch_count >= AMM_SORT_RECLAIM_BATCH_TUPLES) {
+            /* writetup_heap returns tuple payloads to the AMM context.  Drop
+             * free chunks at each bounded safe point; sort metadata remains
+             * valid until the complete run has been materialized. */
+            (void)AmmGranuleContextReleaseFreeMemory(state->tuplecontext);
+            batch_count = 0;
+            CHECK_FOR_INTERRUPTS();
+        }
+    }
+    Size released_bytes = AmmGranuleContextReleaseFreeMemory(state->tuplecontext);
+    /* Do not reset or delete tuplecontext while a held result tuple remains
+     * live. It is released at the next FETCH, which is the next safe point. */
+    GsAmmRecordApReclaimPoll(released_bytes);
+    state->memtupcount = 0;
+    markrunend(state, tapenum);
+    state->currentRun = 1;
+    state->tp_runs[state->destTape] = 1;
+    state->tp_dummy[state->destTape] = 0;
+
+    FREEMEM(state, GetMemoryChunkSpace(state->memtuples));
+    pfree_ext(state->memtuples);
+    state->memtuples = NULL;
+    state->memtupsize = 0;
+    state->growmemtuples = false;
+
+    if (state->amm_reclaim_hold_tuple == NULL && state->tuplecontext != NULL) {
+        MemoryContextDelete(state->tuplecontext);
+        state->tuplecontext = NULL;
+    }
+
+    state->result_tape = tapenum;
+    LogicalTapeFreeze(state->tapeset, state->result_tape);
+    state->status = TSS_SORTEDONTAPE;
+    state->current = 0;
+    state->eof_reached = false;
+    state->markpos_block = 0L;
+    state->markpos_offset = 0;
+    state->markpos_eof = false;
+
+    /* TSS_SORTEDONTAPE reads variable-sized tuples through the slab arena. */
+    if (state->tuples)
+        init_slab_allocator(state, 2);
+    else
+        init_slab_allocator(state, 0);
+    return true;
+}
+
+bool tuplesort_process_amm_reclaim(void)
+{
+    Tuplesortstate *state;
+    bool processed = false;
+
+    if (!GsAmmGrantReclaimPending())
+        return false;
+
+    for (state = AmmSortReclaimStates; state != NULL; state = state->amm_reclaim_next) {
+        MemoryContext oldcontext;
+        bool state_processed;
+
+        if (!state->amm_reclaim_registered || state->status != TSS_SORTEDINMEM)
+            continue;
+        oldcontext = MemoryContextSwitchTo(state->sortcontext);
+        state_processed = AmmSortSpillSortedInMemory(state);
+        if (state_processed) {
+            processed = true;
+        }
+        (void)MemoryContextSwitchTo(oldcontext);
+    }
+    return processed;
+}
+
+void tuplesort_clear_amm_reclaim_states(void)
+{
+    /*
+     * This is used while the owning grant is being torn down.  Some callers
+     * can have already deleted a sort context without reaching tuplesort_end
+     * (for example during error/cursor cleanup), so the registry may contain
+     * stale Tuplesortstate pointers.  Detach the list without dereferencing
+     * those pointers; normal tuplesort_end() unregisters live states before
+     * deleting their context.
+     */
+    AmmSortReclaimStates = NULL;
 }
 
 /*

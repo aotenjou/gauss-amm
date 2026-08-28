@@ -55,90 +55,28 @@ typedef struct GsAmmGranuleMeta {
 } GsAmmGranuleMeta;
 
 #define GS_AMM_DTREE_BOUND_COUNT 3
-#define GS_AMM_DTREE_FEEDBACK_RING_SIZE 4096
-#define GS_AMM_DTREE_CALIBRATION_TABLE_SIZE 1024
-#define GS_AMM_DTREE_MIN_CALIBRATION_SAMPLES 8
-#define GS_AMM_DTREE_SCALE_MIN 0.5
-#define GS_AMM_DTREE_SCALE_MAX 4.0
 #define GS_AMM_ADMISSION_REASON_LENGTH 32
 #define GS_AMM_AP_LIFECYCLE_GENERATION_STEPS 4
 #define GS_AMM_AP_LIFECYCLE_OWNER_EPOCH_STEPS 2
 
 typedef struct GsAmmDtreeDetail {
-    double raw_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double calibrated_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
+    double bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
     int64 model_version;
     int64 leaf_id;
-    int64 calibration_version;
-    double calibration_scale;
 } GsAmmDtreeDetail;
-
-typedef struct GsAmmDtreeFeedbackSample {
-    uint64 sample_id;
-    uint64 session_id;
-    int64 model_version;
-    int64 leaf_id;
-    int64 calibration_version;
-    double calibration_scale;
-    double raw_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double calibrated_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double observed_work_mem_kb;
-    double runtime_ms;
-    double spill_mb;
-    uint64 spill_bytes;
-    uint32 spill_files;
-    uint32 spill_events;
-    int hash_nbatch;
-    int hash_multipass_count;
-    double grant_mb;
-    double tp_drop_ratio;
-    double io_pressure;
-    bool backpressure;
-    bool error;
-    bool measurement_valid;
-    int64 sample_time;
-} GsAmmDtreeFeedbackSample;
-
-typedef struct GsAmmDtreeCalibrationLeafState {
-    bool initialized;
-    int64 model_version;
-    int64 leaf_id;
-    int64 calibration_version;
-    double calibration_scale;
-    uint64 feedback_sample_count;
-    uint64 feedback_sample_dropped;
-    double ewma_qerror;
-    double ewma_underpredict_rate;
-    double ewma_spill_mb;
-    double ewma_runtime_ms;
-    double last_observed_work_mem_kb;
-    double last_raw_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double last_calibrated_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    int bad_update_count;
-    int rollback_count;
-    bool frozen;
-    int64 last_update_time;
-} GsAmmDtreeCalibrationLeafState;
-
-typedef struct GsAmmDtreeFeedbackRing {
-    uint64 next_sample_id;
-    uint64 next_calibration_sample_id;
-    uint64 feedback_sample_count;
-    uint64 feedback_sample_dropped;
-    uint64 calibration_sample_dropped;
-    int64 last_calibration_tick;
-    GsAmmDtreeFeedbackSample samples[GS_AMM_DTREE_FEEDBACK_RING_SIZE];
-} GsAmmDtreeFeedbackRing;
 
 typedef enum GsAmmMemoryMode {
     GS_AMM_MEMORY_MODE_NONE = 0,
     GS_AMM_MEMORY_MODE_BACKPRESSURE,
-    GS_AMM_MEMORY_MODE_ALLOCATOR_ONLY,
-    GS_AMM_MEMORY_MODE_FEEDBACK_ONLY,
     GS_AMM_MEMORY_MODE_CACHE,
     GS_AMM_MEMORY_MODE_ONEPASS,
     GS_AMM_MEMORY_MODE_MULTIPASS
 } GsAmmMemoryMode;
+
+typedef enum GsAmmWorkloadRole {
+    GS_AMM_WORKLOAD_TP = 0,
+    GS_AMM_WORKLOAD_AP
+} GsAmmWorkloadRole;
 
 typedef struct GsAmmAdmissionResult {
     bool admitted;
@@ -156,133 +94,61 @@ typedef struct GsAmmAdmissionResult {
     int one_pass_bound_kb;
     int multi_pass_bound_kb;
     int admission_request_kb;
-    bool allocator_only_mode;
-    int allocator_only_grant_mb;
-    bool feedback_only;
     GsAmmMemoryMode memory_mode;
     char reason[GS_AMM_ADMISSION_REASON_LENGTH];
 } GsAmmAdmissionResult;
 
-typedef struct GsAmmFeedbackRecord {
-    uint64 session_id;
-    int64 model_version;
-    int64 leaf_id;
-    double raw_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double calibrated_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double observed_work_mem_kb;
-    double runtime_ms;
-    double spill_mb;
-    uint64 spill_bytes;
-    uint32 spill_files;
-    uint32 spill_events;
-    int hash_nbatch;
-    int hash_multipass_count;
-    double grant_mb;
-    double tp_drop_ratio;
-    double io_pressure;
-    bool backpressure;
-    bool error;
-    bool measurement_valid;
-    bool feedback_only;
-} GsAmmFeedbackRecord;
-
-typedef struct GsAmmDtreeCalibrationTable {
-    int64 calibration_version;
-    double calibration_scale;
-    uint64 feedback_sample_count;
-    uint64 feedback_sample_dropped;
-    uint64 calibration_update_count;
-    int rollback_count;
-    int frozen_leaf_count;
-    int leaf_count;
-    GsAmmDtreeCalibrationLeafState leaves[GS_AMM_DTREE_CALIBRATION_TABLE_SIZE];
-} GsAmmDtreeCalibrationTable;
-
 extern int gs_amm_shared_buffers_min_mb;
-extern int gs_amm_controller_horizon;
-extern int gs_amm_resize_rate_limit_mb;
-extern int gs_amm_tp_pressure_guard;
-extern int gs_amm_io_pressure_guard;
-extern int gs_amm_deadband_mb;
 extern int gs_amm_dynamic_target_mb;
-extern int gs_amm_ap_min_grant_mb;
-extern int gs_amm_ap_queue_limit;
-extern int gs_amm_ap_queue_timeout_ms;
-extern double gs_amm_tp_jitter_limit;
-extern int gs_amm_resize_observe_window_ms;
-extern int gs_amm_resize_cooldown_ms;
-extern int gs_amm_resize_batch_mb;
 extern int gs_amm_granule_size_mb;
-extern int gs_amm_tp_recovery_cooldown_ms;
 extern bool gs_amm_enabled;
-extern bool gs_amm_allocator_only_mode;
-extern int gs_amm_allocator_only_grant_mb;
-extern bool gs_amm_feedback_only_mode;
-extern int gs_amm_feedback_bootstrap_grant_mb;
-extern int gs_amm_feedback_max_grant_mb;
-extern int gs_amm_feedback_initial_ap_slots;
-extern int gs_amm_feedback_max_ap_slots;
-extern int gs_amm_feedback_stable_windows;
-extern int gs_amm_feedback_spill_threshold_mb;
-extern bool gs_amm_dtree_calibration_enabled;
-extern bool gs_amm_dtree_record_only;
-extern bool gs_amm_native_auto_mode;
-extern double gs_amm_native_ap_cost_threshold;
-
-#define GS_AMM_ADMISSION_FALLBACK 0
-#define GS_AMM_ADMISSION_ERROR 1
-
-extern int gs_amm_admission_failure_policy;
-extern int gs_amm_fallback_work_mem_kb;
+extern THR_LOCAL int gs_amm_workload_role;
+extern THR_LOCAL int gs_amm_test_ap_cache_label_kb;
+extern THR_LOCAL int gs_amm_test_ap_one_pass_label_kb;
+extern THR_LOCAL int gs_amm_test_ap_multi_pass_label_kb;
+/* Compatibility alias; a positive value applies to all three test bounds. */
+extern THR_LOCAL int gs_amm_test_ap_label_kb;
+extern int gs_amm_tp_buffer_miss_threshold_pct;
+extern int gs_amm_ap_borrow_buffer_hit_guard_pct;
+extern int gs_amm_tp_tps_decline_guard_pct;
+extern int gs_amm_tp_cpu_pressure_threshold_pct;
+/* Acceptance-test override.  Production TP recovery is CPU-pressure driven. */
+extern THR_LOCAL bool gs_amm_tp_test_mode;
+extern THR_LOCAL bool gs_amm_tp_test_worker_surge;
 
 extern Size GsAmmShmemSize(void);
 extern void GsAmmShmemInit(void);
 extern void GsAmmOnEnabledGucChange(bool enabled);
-extern void GsAmmOnRuntimeConfigGucReload(bool allocator_only_mode, int allocator_only_grant_mb,
-    bool calibration_enabled, bool record_only);
-extern void GsAmmOnFeedbackConfigGucReload(bool feedback_only_mode, int bootstrap_grant_mb,
-    int max_grant_mb, int initial_ap_slots, int max_ap_slots, int stable_windows, int spill_threshold_mb);
 extern bool GsAmmOperationBegin(void);
 extern void GsAmmOperationEnd(void);
+extern bool GsAmmApExecutorStart(QueryDesc *query_desc, int eflags);
+extern void GsAmmApExecutorEnd(QueryDesc *query_desc, bool success);
+extern bool GsAmmTpExecutorStart(QueryDesc *query_desc, int eflags);
+extern void GsAmmTpExecutorEnd(QueryDesc *query_desc, bool success);
+/* Compatibility dispatcher for callers outside the standard executor. */
 extern bool GsAmmExecutorStart(QueryDesc *query_desc, int eflags);
 /*
  * Runs after executor contexts are freed; use backend-local AMM state, not
  * query_desc->estate or query_desc->planstate.
  */
 extern void GsAmmExecutorEnd(QueryDesc *query_desc, bool success);
+extern bool GsAmmApProcessPendingReclaim(void);
+extern void GsAmmRecordTpBufferUsage(uint64 shared_blks_hit, uint64 shared_blks_read,
+    uint64 completed_queries);
+extern void GsAmmRecordApReclaimPoll(uint64 released_bytes);
+extern void GsAmmControllerTick(void);
+/* queue_timeout_ms is retained for the legacy SQL function ABI and ignored. */
 extern bool GsAmmAdmitBounds(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_bound_kb,
     int queue_timeout_ms, int prediction_mb, GsAmmAdmissionResult *result);
-extern bool GsAmmAdmitFeedbackOnly(GsAmmAdmissionResult *result);
 extern bool GsAmmEvaluateAdmission(int prediction_mb);
-extern bool GsAmmReleaseGrant(uint64 expected_generation, bool restore_work_mem);
-extern bool GsAmmReleaseGrantToken(GsAmmGrantToken expected_token, bool restore_work_mem);
+extern bool GsAmmReleaseGrant(uint64 expected_generation);
+extern bool GsAmmReleaseGrantToken(GsAmmGrantToken expected_token);
 extern uint64 GsAmmCurrentBackendGrantGeneration(void);
 extern uint64 GsAmmCurrentQueryLifecycleGeneration(void);
-extern void GsAmmReportOperatorPeak(uint64 lifecycle_generation, uint64 bytes);
-extern void GsAmmReportHashBatches(uint64 lifecycle_generation, int nbatch, int multipass_count);
-extern void GsAmmReportQuerySpill(uint64 lifecycle_generation, uint64 bytes, uint32 events);
-extern void GsAmmReportTempFileIO(uint64 lifecycle_generation, uint64 bytes, uint32 files);
-extern void GsAmmRecordFeedback(const GsAmmFeedbackRecord *feedback);
-extern void GsAmmGetFeedbackTelemetry(double *tp_drop_ratio, double *io_pressure);
-extern void GsAmmDtreeCalibrationTick(void);
 extern void GsAmmRecordNativeEligible(void);
 extern void GsAmmRecordNativeFailure(const char *reason);
 extern void GsAmmRecordNativeAdmission(const GsAmmDtreeDetail *detail, const GsAmmAdmissionResult *result);
-extern void GsAmmRecordNativeErrorCleanup(void);
-extern void GsAmmRecordTransactionCommit(void);
-extern void GsAmmRecordTransactionAbort(void);
-extern void GsAmmRecordSharedBufferReadMiss(void);
-extern void GsAmmRecordSharedBufferPhysicalRead(void);
-extern void GsAmmRecordApSpill(uint64 spill_bytes, uint32 spill_count);
-extern void GsAmmRecordApExecutionSignals(uint64 spill_bytes, uint32 spill_count, int hash_multipass_count);
-extern void GsAmmRecordPendingWritebackEnqueue(uint32 pages);
-extern void GsAmmRecordPendingWritebackRetire(uint32 pages);
-extern void GsAmmRecordWritebackFlushComplete(uint32 pages);
-extern void GsAmmRecordDirtyPageEnqueue(void);
-extern void GsAmmRecordDirtyPageDequeue(void);
-extern void GsAmmPagewriterControllerTick(void);
 extern bool GsAmmBuildWorkMemFeatures(QueryDesc *query_desc, MemTuneWorkMemFeatures *features);
-extern double GsAmmCurrentMemoryPressureScore(void);
 extern int GsAmmCurrentBackendGrantKB(void);
 extern uint64 GsAmmCurrentBackendGrantId(void);
 extern uint64 GsAmmCurrentBackendGrantBytes(void);
@@ -294,6 +160,15 @@ extern void *GsAmmGrantAllocMemory(GsAmmGrantToken token, Size size);
 extern bool GsAmmGrantReturnMemory(GsAmmGrantToken token, void *pointer, Size size);
 extern void GsAmmGrantAccountUsedMemory(GsAmmGrantToken token, void *pointer, Size size);
 extern void GsAmmGrantAccountFreedMemory(GsAmmGrantToken token, void *pointer, Size size);
+extern bool GsAmmGrantDynamicMemoryAvailable(GsAmmGrantToken token, Size size);
+extern void *GsAmmGrantAllocDynamicMemory(GsAmmGrantToken token, Size size);
+extern bool GsAmmGrantReturnDynamicMemory(GsAmmGrantToken token, void *pointer, Size size);
+extern void GsAmmGrantAccountUsedDynamicMemory(GsAmmGrantToken token, Size size);
+extern void GsAmmGrantAccountFreedDynamicMemory(GsAmmGrantToken token, Size size);
+extern bool GsAmmGrantReclaimPending(void);
+extern bool GsAmmGrantProcessPendingReclaim(void);
+/* Session-pool teardown runs without terminating the backend thread. */
+extern void GsAmmSessionCleanup(int code, Datum arg);
 extern void gs_amm_dtree_detail(
     const double raw_bounds_mb[GS_AMM_DTREE_BOUND_COUNT],
     int64 model_version,

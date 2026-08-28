@@ -17,6 +17,7 @@
 #include "access/xact.h"
 #include "executor/exec/execdesc.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "knl/knl_thread.h"
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
@@ -26,11 +27,13 @@
 #include "storage/gs_amm.h"
 #include "storage/smgr/fd.h"
 #include "utils/lsyscache.h"
+#include "utils/ammgranule.h"
 #include "utils/guc.h"
 #include "utils/memprot.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
 #include "utils/timestamp.h"
+#include "utils/tuplesort.h"
 #include "utils/workmem_dtree_model.h"
 
 extern uint64 pg_relation_perm_table_size(Relation rel);
@@ -56,8 +59,6 @@ typedef struct GsAmmNativeQueryState {
     uint64 owner_session_id;
     QueryDesc *owner_query_desc;
     bool active;
-    bool fallback;
-    bool feedback_only;
     bool xact_callback_registered;
     int executor_depth;
     GsAmmNativeExecutorFrame executor_frames[GS_AMM_NATIVE_EXECUTOR_STACK_DEPTH];
@@ -65,188 +66,72 @@ typedef struct GsAmmNativeQueryState {
     uint64 lifecycle_generation;
     int64 model_version;
     int64 leaf_id;
-    double raw_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double calibrated_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    int64 calibration_version;
-    double calibration_scale;
     uint64 grant_id;
     uint64 grant_generation;
+    bool external_grant;
     int selected_grant_kb;
     int selected_grant_mode;
-    int saved_work_mem_kb;
-    int fallback_guc_nest_level;
-    TimestampTz start_timestamp;
-    uint64 start_spill_bytes;
-    uint32 start_spill_count;
-    uint64 start_guard_count;
 } GsAmmNativeQueryState;
 
-typedef struct GsAmmQueryFeedbackAccumulator {
-    uint64 lifecycle_generation;
-    uint64 operator_peak_bytes;
-    uint64 operator_spill_bytes;
-    uint64 temp_spill_bytes;
-    uint32 operator_spill_events;
-    uint32 temp_spill_files;
-    int hash_nbatch;
-    int hash_multipass_count;
-    bool operator_reported;
-} GsAmmQueryFeedbackAccumulator;
+typedef struct GsAmmTpQueryState {
+    knl_session_context *owner_session;
+    uint64 owner_session_id;
+    QueryDesc *owner_query_desc;
+    bool active;
+    uint64 start_hit;
+    uint64 start_read;
+} GsAmmTpQueryState;
 
 #define GS_AMM_NATIVE_GRANT_MODE_NONE 0
 
 static THR_LOCAL GsAmmNativeQueryState gs_amm_native_query_state;
-static THR_LOCAL GsAmmQueryFeedbackAccumulator gs_amm_query_feedback;
+static THR_LOCAL GsAmmTpQueryState gs_amm_tp_query_state;
 
 static void gs_amm_clear_native_query_state(void);
 static void gs_amm_clear_executor_frames(void);
-static void gs_amm_restore_native_work_mem(GsAmmNativeQueryState *state);
-static void gs_amm_begin_query_feedback(uint64 lifecycle_generation);
-static void gs_amm_clear_query_feedback(uint64 lifecycle_generation);
 
-static bool gs_amm_feedback_operator_walker(Node *node, bool *eligible)
+static void gs_amm_apply_test_ap_bounds(GsAmmDtreeDetail *detail)
 {
-    if (node == NULL || eligible == NULL)
-        return false;
+    int cache_kb = gs_amm_test_ap_cache_label_kb;
+    int one_pass_kb = gs_amm_test_ap_one_pass_label_kb;
+    int multi_pass_kb = gs_amm_test_ap_multi_pass_label_kb;
 
-    switch (nodeTag(node)) {
-        case T_HashJoin:
-        case T_VecHashJoin:
-        case T_Sort:
-        case T_VecSort:
-        case T_Agg:
-        case T_VecAgg:
-        case T_WindowAgg:
-        case T_VecWindowAgg:
-            *eligible = true;
-            return true;
-        default:
-            return plan_tree_walker(node, (MethodWalker)gs_amm_feedback_operator_walker, (void *)eligible);
+    if (cache_kb == 0 && one_pass_kb == 0 && multi_pass_kb == 0 &&
+        gs_amm_test_ap_label_kb > 0) {
+        cache_kb = gs_amm_test_ap_label_kb;
+        one_pass_kb = gs_amm_test_ap_label_kb;
+        multi_pass_kb = gs_amm_test_ap_label_kb;
     }
-}
 
-static bool gs_amm_plan_has_feedback_operator(Plan *plan)
-{
-    bool eligible = false;
-
-    if (plan != NULL)
-        (void)gs_amm_feedback_operator_walker((Node *)plan, &eligible);
-    return eligible;
-}
-
-static uint64 gs_amm_current_session_spill_bytes(void)
-{
-    int64 spill_bytes = pgstat_get_session_spill_size();
-
-    return spill_bytes > 0 ? (uint64)spill_bytes : 0;
-}
-
-static uint32 gs_amm_current_session_spill_count(void)
-{
-    int spill_count = pgstat_get_session_spill_count();
-
-    return spill_count > 0 ? (uint32)spill_count : 0;
-}
-
-static void gs_amm_begin_query_feedback(uint64 lifecycle_generation)
-{
-    errno_t rc = memset_s(&gs_amm_query_feedback, sizeof(gs_amm_query_feedback), 0,
-        sizeof(gs_amm_query_feedback));
-
-    securec_check(rc, "\0", "\0");
-    gs_amm_query_feedback.lifecycle_generation = lifecycle_generation;
-}
-
-static uint64 gs_amm_saturating_add_u64(uint64 current, uint64 increment)
-{
-    const uint64 maximum = ~(uint64)0;
-
-    return increment > maximum - current ? maximum : current + increment;
-}
-
-static uint32 gs_amm_saturating_add_u32(uint32 current, uint32 increment)
-{
-    const uint32 maximum = ~(uint32)0;
-
-    return increment > maximum - current ? maximum : current + increment;
-}
-
-static void gs_amm_clear_query_feedback(uint64 lifecycle_generation)
-{
-    errno_t rc;
-
-    if (lifecycle_generation == 0 || gs_amm_query_feedback.lifecycle_generation != lifecycle_generation)
+    if (cache_kb == 0 && one_pass_kb == 0 && multi_pass_kb == 0)
         return;
-    rc = memset_s(&gs_amm_query_feedback, sizeof(gs_amm_query_feedback), 0,
-        sizeof(gs_amm_query_feedback));
-    securec_check(rc, "\0", "\0");
+    if (cache_kb <= 0 || one_pass_kb <= 0 || multi_pass_kb <= 0 ||
+        multi_pass_kb > one_pass_kb || one_pass_kb > cache_kb) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("GS AMM AP test bounds must satisfy 0 or multi_pass <= one_pass <= cache")));
+    }
+
+    detail->bounds_kb[0] = cache_kb;
+    detail->bounds_kb[1] = one_pass_kb;
+    detail->bounds_kb[2] = multi_pass_kb;
 }
 
-static bool gs_amm_query_feedback_is_current(uint64 lifecycle_generation)
+static void gs_amm_clear_tp_query_state(void)
 {
-    GsAmmNativeQueryState *state = &gs_amm_native_query_state;
-
-    return lifecycle_generation != 0 && state->active && !state->fallback &&
-        state->lifecycle_generation == lifecycle_generation &&
-        gs_amm_query_feedback.lifecycle_generation == lifecycle_generation;
+    gs_amm_tp_query_state.owner_query_desc = NULL;
+    gs_amm_tp_query_state.active = false;
+    gs_amm_tp_query_state.start_hit = 0;
+    gs_amm_tp_query_state.start_read = 0;
 }
 
 uint64 GsAmmCurrentQueryLifecycleGeneration(void)
 {
     GsAmmNativeQueryState *state = &gs_amm_native_query_state;
 
-    if (!gs_amm_enabled || !state->active || state->fallback)
+    if (!gs_amm_enabled || !state->active)
         return 0;
     return state->lifecycle_generation;
-}
-
-void GsAmmReportOperatorPeak(uint64 lifecycle_generation, uint64 bytes)
-{
-    if (!gs_amm_query_feedback_is_current(lifecycle_generation))
-        return;
-    gs_amm_query_feedback.operator_reported = true;
-    gs_amm_query_feedback.operator_peak_bytes = Max(gs_amm_query_feedback.operator_peak_bytes, bytes);
-}
-
-void GsAmmReportHashBatches(uint64 lifecycle_generation, int nbatch, int multipass_count)
-{
-    if (!gs_amm_query_feedback_is_current(lifecycle_generation))
-        return;
-    gs_amm_query_feedback.operator_reported = true;
-    gs_amm_query_feedback.hash_nbatch = Max(gs_amm_query_feedback.hash_nbatch, Max(nbatch, 0));
-    gs_amm_query_feedback.hash_multipass_count =
-        Max(gs_amm_query_feedback.hash_multipass_count, Max(multipass_count, 0));
-}
-
-void GsAmmReportQuerySpill(uint64 lifecycle_generation, uint64 bytes, uint32 events)
-{
-    if (!gs_amm_query_feedback_is_current(lifecycle_generation))
-        return;
-    gs_amm_query_feedback.operator_reported = true;
-    gs_amm_query_feedback.operator_spill_bytes =
-        gs_amm_saturating_add_u64(gs_amm_query_feedback.operator_spill_bytes, bytes);
-    gs_amm_query_feedback.operator_spill_events =
-        gs_amm_saturating_add_u32(gs_amm_query_feedback.operator_spill_events, events);
-}
-
-void GsAmmReportTempFileIO(uint64 lifecycle_generation, uint64 bytes, uint32 files)
-{
-    if (!gs_amm_query_feedback_is_current(lifecycle_generation))
-        return;
-    gs_amm_query_feedback.temp_spill_bytes =
-        gs_amm_saturating_add_u64(gs_amm_query_feedback.temp_spill_bytes, bytes);
-    gs_amm_query_feedback.temp_spill_files =
-        gs_amm_saturating_add_u32(gs_amm_query_feedback.temp_spill_files, files);
-}
-
-static bool gs_amm_snapshot_query_feedback(
-    uint64 lifecycle_generation, GsAmmQueryFeedbackAccumulator *snapshot)
-{
-    if (snapshot == NULL || !gs_amm_query_feedback_is_current(lifecycle_generation))
-        return false;
-
-    *snapshot = gs_amm_query_feedback;
-    return snapshot->operator_reported;
 }
 
 static void gs_amm_push_executor_frame(GsAmmNativeQueryState *state, QueryDesc *query_desc)
@@ -321,6 +206,10 @@ static void gs_amm_bind_native_query_session(void)
         return;
     if (state->active)
         ereport(FATAL, (errmsg("native GS AMM state crossed session ownership")));
+    /* Tuplesort reclaim registration is thread-local, while a thread-pool
+     * worker can be reassigned to another session after portal/error cleanup.
+     * Those old sort contexts are no longer safe to inspect in this session. */
+    tuplesort_clear_amm_reclaim_states();
     gs_amm_clear_native_query_state();
     gs_amm_clear_executor_frames();
     state->xact_callback_registered = false;
@@ -328,41 +217,21 @@ static void gs_amm_bind_native_query_session(void)
     state->owner_session_id = u_sess->session_id;
 }
 
-static void gs_amm_restore_native_work_mem(GsAmmNativeQueryState *state)
-{
-    int nest_level;
-
-    if (state == NULL || !state->fallback || state->fallback_guc_nest_level <= 0)
-        return;
-
-    nest_level = state->fallback_guc_nest_level;
-    state->fallback_guc_nest_level = 0;
-    AtEOXact_GUC(true, nest_level);
-}
-
-static void gs_amm_finish_native_query(bool error, bool error_cleanup, bool restore_work_mem)
+static void gs_amm_finish_native_query(bool error, bool error_cleanup)
 {
     GsAmmNativeQueryState *state = &gs_amm_native_query_state;
-    GsAmmFeedbackRecord feedback;
-    GsAmmQueryFeedbackAccumulator feedback_snapshot;
     GsAmmGrantToken expected_token;
-    uint64 end_spill_bytes;
-    uint64 session_spill_bytes;
-    uint64 spill_bytes;
-    uint32 end_spill_count;
-    uint32 session_spill_count;
-    uint32 spill_files;
-    uint32 spill_events;
-    TimestampTz now;
-    errno_t rc;
+
+    (void)error;
+    (void)error_cleanup;
 
     if (!state->active)
         return;
 
-    if (state->fallback) {
-        gs_amm_restore_native_work_mem(state);
-        if (error_cleanup)
-            GsAmmRecordNativeErrorCleanup();
+    /* A SQL caller may hold an explicit AP grant across multiple queries.
+     * Executor teardown must detach only this query; gs_amm_end_ap() owns
+     * the grant lifetime. */
+    if (state->external_grant) {
         gs_amm_clear_native_query_state();
         return;
     }
@@ -370,73 +239,28 @@ static void gs_amm_finish_native_query(bool error, bool error_cleanup, bool rest
     if (state->grant_id == 0 || state->grant_generation == 0)
         return;
 
-    rc = memset_s(&feedback_snapshot, sizeof(feedback_snapshot), 0, sizeof(feedback_snapshot));
-    securec_check(rc, "\0", "\0");
-    (void)gs_amm_snapshot_query_feedback(state->lifecycle_generation, &feedback_snapshot);
-
-    rc = memset_s(&feedback, sizeof(feedback), 0, sizeof(feedback));
-    securec_check(rc, "\0", "\0");
-    feedback.session_id = u_sess->session_id;
-    feedback.model_version = state->model_version;
-    feedback.leaf_id = state->leaf_id;
-    for (int index = 0; index < GS_AMM_DTREE_BOUND_COUNT; index++) {
-        feedback.raw_bounds_kb[index] = state->raw_bounds_kb[index];
-        feedback.calibrated_bounds_kb[index] = state->calibrated_bounds_kb[index];
-    }
-    now = GetCurrentTimestamp();
-    feedback.observed_work_mem_kb = (double)feedback_snapshot.operator_peak_bytes / 1024.0;
-    feedback.runtime_ms = state->start_timestamp > 0 && now > state->start_timestamp ?
-        (double)(now - state->start_timestamp) / 1000.0 : 0.0;
-    end_spill_bytes = gs_amm_current_session_spill_bytes();
-    session_spill_bytes = end_spill_bytes >= state->start_spill_bytes ?
-        end_spill_bytes - state->start_spill_bytes : end_spill_bytes;
-    spill_bytes = Max(Max(feedback_snapshot.operator_spill_bytes, feedback_snapshot.temp_spill_bytes),
-        session_spill_bytes);
-    end_spill_count = gs_amm_current_session_spill_count();
-    session_spill_count = end_spill_count >= state->start_spill_count ?
-        end_spill_count - state->start_spill_count : end_spill_count;
-    spill_files = feedback_snapshot.temp_spill_files;
-    spill_events = Max(feedback_snapshot.operator_spill_events, session_spill_count);
-    feedback.spill_mb = (double)spill_bytes / (1024.0 * 1024.0);
-    feedback.spill_bytes = spill_bytes;
-    feedback.spill_files = spill_files;
-    feedback.spill_events = spill_events;
-    feedback.hash_nbatch = feedback_snapshot.hash_nbatch;
-    feedback.hash_multipass_count = feedback_snapshot.hash_multipass_count;
-    feedback.grant_mb = (double)state->selected_grant_kb / 1024.0;
-    GsAmmGetFeedbackTelemetry(&feedback.tp_drop_ratio, &feedback.io_pressure);
-    feedback.backpressure = false;
-    feedback.error = error;
-    feedback.measurement_valid = feedback_snapshot.operator_reported;
-    feedback.feedback_only = state->feedback_only;
-
     expected_token.grant_id = state->grant_id;
     expected_token.grant_generation = state->grant_generation;
-    /* Revoke query ownership before work_mem restoration can raise an error. */
+    /* Revoke query ownership before releasing its AMM grant. */
     gs_amm_clear_native_query_state();
-    GsAmmRecordApExecutionSignals(
-        feedback.spill_bytes, feedback.spill_events, feedback.hash_multipass_count);
-    GsAmmRecordFeedback(&feedback);
-    if (error_cleanup)
-        GsAmmRecordNativeErrorCleanup();
-    (void)GsAmmReleaseGrantToken(expected_token, restore_work_mem);
+    (void)GsAmmReleaseGrantToken(expected_token);
 }
 
-static void gs_amm_finish_native_query_noexcept(bool error, bool restore_work_mem)
+static void gs_amm_finish_native_query_noexcept(bool error)
 {
     GsAmmNativeQueryState *state = &gs_amm_native_query_state;
     GsAmmGrantToken expected_token = {state->grant_id, state->grant_generation};
 
     PG_TRY();
     {
-        gs_amm_finish_native_query(error, true, restore_work_mem);
+        gs_amm_finish_native_query(error, true);
     }
     PG_CATCH();
     {
         FlushErrorState();
         PG_TRY();
         {
-            (void)GsAmmReleaseGrantToken(expected_token, false);
+            (void)GsAmmReleaseGrantToken(expected_token);
         }
         PG_CATCH();
         {
@@ -457,7 +281,7 @@ static void gs_amm_xact_callback(XactEvent event, void *arg)
     (void)arg;
     if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT) {
         if (state->active)
-            gs_amm_finish_native_query_noexcept(event == XACT_EVENT_ABORT, true);
+            gs_amm_finish_native_query_noexcept(event == XACT_EVENT_ABORT);
         gs_amm_clear_native_query_state();
         gs_amm_clear_executor_frames();
     }
@@ -475,7 +299,7 @@ static void gs_amm_subxact_callback(
         owner_aborted = state->active && state->owner_subxid == my_subid;
         gs_amm_remove_subxact_executor_frames(state, my_subid);
         if (owner_aborted) {
-            gs_amm_finish_native_query_noexcept(true, true);
+            gs_amm_finish_native_query_noexcept(true);
         } else if (!state->active && state->executor_depth == 0) {
             gs_amm_clear_native_query_state();
         }
@@ -663,7 +487,7 @@ static void gs_amm_collect_runtime_features(MemTuneWorkMemFeatures &features)
     if (transaction_start > 0 && now > transaction_start)
         features.current_transaction_age_sec = (double)(now - transaction_start) / 1000000.0;
     gs_amm_collect_system_memory(features);
-    features.memory_pressure_score = GsAmmCurrentMemoryPressureScore();
+    features.memory_pressure_score = 0.0;
 }
 
 static void gs_amm_release_feature_context(GsAmmWorkMemFeatureContext *ctx)
@@ -734,30 +558,16 @@ static void gs_amm_clear_native_query_state(void)
 {
     GsAmmNativeQueryState *state = &gs_amm_native_query_state;
 
-    gs_amm_clear_query_feedback(state->lifecycle_generation);
     state->owner_query_desc = NULL;
     state->active = false;
-    state->fallback = false;
-    state->feedback_only = false;
     state->owner_subxid = InvalidSubTransactionId;
     state->model_version = 0;
     state->leaf_id = 0;
-    for (int index = 0; index < GS_AMM_DTREE_BOUND_COUNT; index++) {
-        state->raw_bounds_kb[index] = 0.0;
-        state->calibrated_bounds_kb[index] = 0.0;
-    }
-    state->calibration_version = 0;
-    state->calibration_scale = 1.0;
     state->grant_id = 0;
     state->grant_generation = 0;
+    state->external_grant = false;
     state->selected_grant_kb = 0;
     state->selected_grant_mode = GS_AMM_NATIVE_GRANT_MODE_NONE;
-    state->saved_work_mem_kb = 0;
-    state->fallback_guc_nest_level = 0;
-    state->start_timestamp = 0;
-    state->start_spill_bytes = gs_amm_current_session_spill_bytes();
-    state->start_spill_count = gs_amm_current_session_spill_count();
-    state->start_guard_count = 0;
 }
 
 static int gs_amm_native_bound_kb(double bound_kb)
@@ -769,53 +579,10 @@ static int gs_amm_native_bound_kb(double bound_kb)
     return (int)ceil(bound_kb);
 }
 
-static void gs_amm_native_fail_closed(const char *reason)
+static bool gs_amm_fail_open(const char *reason)
 {
     GsAmmRecordNativeFailure(reason);
-    ereport(ERROR,
-        (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-            errmsg("native GS AMM admission failed: %s", reason == NULL ? "unknown" : reason)));
-}
-
-static bool gs_amm_begin_native_fallback(
-    GsAmmNativeQueryState *state, QueryDesc *query_desc, const char *reason)
-{
-    char value[32];
-    int effective_work_mem_kb;
-    int rc;
-
-    if (gs_amm_admission_failure_policy == GS_AMM_ADMISSION_ERROR)
-        gs_amm_native_fail_closed(reason);
-    GsAmmRecordNativeFailure(reason);
-    if (state == NULL || query_desc == NULL || state->active)
-        ereport(ERROR,
-            (errcode(ERRCODE_INTERNAL_ERROR), errmsg("invalid native GS AMM fallback lifecycle state")));
-
-    state->saved_work_mem_kb = u_sess->attr.attr_memory.work_mem;
-    effective_work_mem_kb = Min(state->saved_work_mem_kb, Max(gs_amm_fallback_work_mem_kb, 1));
-    state->fallback_guc_nest_level = NewGUCNestLevel();
-    rc = snprintf_s(value, sizeof(value), sizeof(value) - 1, "%dkB", effective_work_mem_kb);
-    securec_check_ss(rc, "\0", "\0");
-    if (set_config_option("work_mem", value, PGC_USERSET, PGC_S_SESSION,
-            GUC_ACTION_SAVE, true, ERROR) <= 0) {
-        AtEOXact_GUC(true, state->fallback_guc_nest_level);
-        state->fallback_guc_nest_level = 0;
-        ereport(ERROR,
-            (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-                errmsg("native GS AMM fallback could not apply capped work_mem")));
-    }
-
-    state->owner_query_desc = query_desc;
-    state->active = true;
-    state->fallback = true;
-    state->lifecycle_generation++;
-    state->selected_grant_kb = effective_work_mem_kb;
-    state->selected_grant_mode = GS_AMM_NATIVE_GRANT_MODE_NONE;
-    state->start_timestamp = GetCurrentTimestamp();
-    state->start_spill_bytes = gs_amm_current_session_spill_bytes();
-    state->start_spill_count = gs_amm_current_session_spill_count();
-    state->start_guard_count = 0;
-    return true;
+    return false;
 }
 
 static void gs_amm_release_native_grant_noexcept(void)
@@ -827,7 +594,7 @@ static void gs_amm_release_native_grant_noexcept(void)
 
     PG_TRY();
     {
-        (void)GsAmmReleaseGrantToken(token, true);
+        (void)GsAmmReleaseGrantToken(token);
     }
     PG_CATCH();
     {
@@ -836,7 +603,26 @@ static void gs_amm_release_native_grant_noexcept(void)
     PG_END_TRY();
 }
 
-bool GsAmmExecutorStart(QueryDesc *query_desc, int eflags)
+static bool gs_amm_bind_external_grant_query(GsAmmNativeQueryState *state, QueryDesc *query_desc)
+{
+    GsAmmGrantToken token = {GsAmmCurrentBackendGrantId(), GsAmmCurrentBackendGrantGeneration()};
+
+    if (state == NULL || query_desc == NULL || token.grant_id == 0 || token.grant_generation == 0 ||
+        !GsAmmGrantTokenIsValid(token))
+        return false;
+
+    state->owner_query_desc = query_desc;
+    state->active = true;
+    state->lifecycle_generation++;
+    state->grant_id = token.grant_id;
+    state->grant_generation = token.grant_generation;
+    state->external_grant = true;
+    state->selected_grant_kb = GsAmmCurrentBackendGrantKB();
+    state->selected_grant_mode = GS_AMM_NATIVE_GRANT_MODE_NONE;
+    return true;
+}
+
+bool GsAmmApExecutorStart(QueryDesc *query_desc, int eflags)
 {
     if (!gs_amm_enabled)
         return false;
@@ -846,9 +632,9 @@ bool GsAmmExecutorStart(QueryDesc *query_desc, int eflags)
     double feature_values[MEMTUNE_WORKMEM_FEATURE_COUNT];
     GsAmmDtreeDetail detail;
     GsAmmAdmissionResult admission;
-    Plan *root_plan;
     int prediction_mb;
     bool top_level_executor;
+    bool operation_held = false;
     volatile bool native_started = false;
     volatile bool fallback_needed = false;
     const char *volatile fallback_reason = NULL;
@@ -859,56 +645,27 @@ bool GsAmmExecutorStart(QueryDesc *query_desc, int eflags)
     gs_amm_push_executor_frame(state, query_desc);
     if (top_level_executor)
         state->owner_subxid = GetCurrentSubTransactionId();
-    if (!gs_amm_native_auto_mode || !top_level_executor)
+    if (!top_level_executor)
+        return false;
+    if (gs_amm_workload_role != GS_AMM_WORKLOAD_AP)
         return false;
     if (query_desc == NULL || query_desc->operation != CMD_SELECT ||
         query_desc->plannedstmt == NULL || query_desc->plannedstmt->planTree == NULL)
         return false;
     if (StreamThreadAmI() || (eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
         return false;
-    if (GsAmmCurrentBackendGrantId() != 0)
-        return false;
+    if (GsAmmCurrentBackendGrantId() != 0) {
+        native_started = gs_amm_bind_external_grant_query(state, query_desc);
+        return native_started;
+    }
 
-    root_plan = query_desc->plannedstmt->planTree;
-    if (root_plan->total_cost < gs_amm_native_ap_cost_threshold)
-        return false;
     if (!GsAmmOperationBegin())
-        return gs_amm_begin_native_fallback(state, query_desc, "operation_unavailable");
+        return gs_amm_fail_open("operation_unavailable");
+    operation_held = true;
 
     PG_TRY();
     {
-        if (gs_amm_feedback_only_mode) {
-            if (gs_amm_plan_has_feedback_operator(root_plan)) {
-                errno_t detail_rc;
-
-                GsAmmRecordNativeEligible();
-                detail_rc = memset_s(&detail, sizeof(detail), 0, sizeof(detail));
-                securec_check(detail_rc, "\0", "\0");
-                if (!GsAmmAdmitFeedbackOnly(&admission)) {
-                    fallback_needed = true;
-                    fallback_reason = "feedback_admission_api";
-                } else if (!admission.admitted) {
-                    fallback_needed = true;
-                    fallback_reason = admission.reason;
-                } else {
-                    GsAmmRecordNativeAdmission(&detail, &admission);
-                    state->owner_query_desc = query_desc;
-                    state->active = true;
-                    state->feedback_only = true;
-                    state->lifecycle_generation++;
-                    state->grant_id = admission.grant_id;
-                    state->grant_generation = admission.grant_generation;
-                    state->selected_grant_kb = admission.granted_kb;
-                    state->selected_grant_mode = (int)admission.memory_mode;
-                    state->start_timestamp = GetCurrentTimestamp();
-                    state->start_spill_bytes = gs_amm_current_session_spill_bytes();
-                    state->start_spill_count = gs_amm_current_session_spill_count();
-                    state->start_guard_count = 0;
-                    gs_amm_begin_query_feedback(state->lifecycle_generation);
-                    native_started = true;
-                }
-            }
-        } else if (!GsAmmBuildWorkMemFeatures(query_desc, &features)) {
+        if (!GsAmmBuildWorkMemFeatures(query_desc, &features)) {
             fallback_needed = true;
             fallback_reason = "feature_collection";
         } else if (features.hash_join_nodes > 0.0 || features.sort_nodes > 0.0 ||
@@ -920,11 +677,15 @@ bool GsAmmExecutorStart(QueryDesc *query_desc, int eflags)
                 fallback_needed = true;
                 fallback_reason = "dtree_prediction";
             } else {
-                prediction_mb = Max((gs_amm_native_bound_kb(detail.calibrated_bounds_kb[0]) + 1023) / 1024, 1);
-                (void)GsAmmEvaluateAdmission(prediction_mb);
-                if (!GsAmmAdmitBounds(gs_amm_native_bound_kb(detail.calibrated_bounds_kb[0]),
-                    gs_amm_native_bound_kb(detail.calibrated_bounds_kb[1]),
-                    gs_amm_native_bound_kb(detail.calibrated_bounds_kb[2]), gs_amm_ap_queue_timeout_ms,
+                gs_amm_apply_test_ap_bounds(&detail);
+                prediction_mb = Max((gs_amm_native_bound_kb(detail.bounds_kb[0]) + 1023) / 1024, 1);
+                /* Admission may wait indefinitely.  Do not hold an AMM
+                 * operation reference while this backend sleeps in FIFO. */
+                GsAmmOperationEnd();
+                operation_held = false;
+                if (!GsAmmAdmitBounds(gs_amm_native_bound_kb(detail.bounds_kb[0]),
+                    gs_amm_native_bound_kb(detail.bounds_kb[1]),
+                    gs_amm_native_bound_kb(detail.bounds_kb[2]), 0,
                     prediction_mb, &admission)) {
                     fallback_needed = true;
                     fallback_reason = "admission_api";
@@ -939,21 +700,11 @@ bool GsAmmExecutorStart(QueryDesc *query_desc, int eflags)
                         state->lifecycle_generation++;
                         state->model_version = detail.model_version;
                         state->leaf_id = detail.leaf_id;
-                        for (int index = 0; index < GS_AMM_DTREE_BOUND_COUNT; index++) {
-                            state->raw_bounds_kb[index] = detail.raw_bounds_kb[index];
-                            state->calibrated_bounds_kb[index] = detail.calibrated_bounds_kb[index];
-                        }
-                        state->calibration_version = detail.calibration_version;
-                        state->calibration_scale = detail.calibration_scale;
                         state->grant_id = admission.grant_id;
                         state->grant_generation = admission.grant_generation;
+                        state->external_grant = false;
                         state->selected_grant_kb = admission.granted_kb;
                         state->selected_grant_mode = (int)admission.memory_mode;
-                        state->start_timestamp = GetCurrentTimestamp();
-                        state->start_spill_bytes = gs_amm_current_session_spill_bytes();
-                        state->start_spill_count = gs_amm_current_session_spill_count();
-                        state->start_guard_count = 0;
-                        gs_amm_begin_query_feedback(state->lifecycle_generation);
                         native_started = true;
                     }
                 }
@@ -964,33 +715,103 @@ bool GsAmmExecutorStart(QueryDesc *query_desc, int eflags)
     {
         int error_code = geterrcode();
 
-        GsAmmOperationEnd();
+        if (operation_held)
+            GsAmmOperationEnd();
         gs_amm_release_native_grant_noexcept();
         if (error_code == ERRCODE_QUERY_CANCELED)
             PG_RE_THROW();
         FlushErrorState();
-        return gs_amm_begin_native_fallback(state, query_desc, "admission_exception");
+        return gs_amm_fail_open("admission_exception");
     }
     PG_END_TRY();
 
-    GsAmmOperationEnd();
+    if (operation_held)
+        GsAmmOperationEnd();
     if (fallback_needed)
-        return gs_amm_begin_native_fallback(state, query_desc,
-            fallback_reason == NULL ? "admission_failure" : fallback_reason);
+        return gs_amm_fail_open(fallback_reason == NULL ? "admission_failure" : fallback_reason);
     return native_started;
 }
 
-void GsAmmExecutorEnd(QueryDesc *query_desc, bool success)
+void GsAmmApExecutorEnd(QueryDesc *query_desc, bool success)
 {
     GsAmmNativeQueryState *state = &gs_amm_native_query_state;
     bool owner_finished = state->active && state->owner_query_desc == query_desc;
 
     (void)gs_amm_pop_executor_frame(state, query_desc);
     if (owner_finished && state->executor_depth == 0) {
-        gs_amm_finish_native_query(!success, false, true);
+        gs_amm_finish_native_query(!success, false);
         gs_amm_clear_native_query_state();
         gs_amm_clear_executor_frames();
     } else if (!state->active && state->executor_depth == 0) {
         gs_amm_clear_native_query_state();
     }
+}
+
+bool GsAmmApProcessPendingReclaim(void)
+{
+    /* Reclaim belongs to the backend grant, not to whichever QueryDesc is
+     * currently at the executor boundary.  A cursor can yield, sleep, or run
+     * nested SQL while its original grant still owns registered sort/hash
+     * state, so do not use the native QueryDesc owner as a reclamation gate. */
+    if (!gs_amm_enabled || gs_amm_workload_role != GS_AMM_WORKLOAD_AP ||
+        GsAmmCurrentBackendGrantId() == 0)
+        return false;
+
+    /* Spill live sort results before returning free tuple extents.  The
+     * controller only releases an entire physical granule after all live
+     * allocations are gone. */
+    if (GsAmmGrantReclaimPending())
+        (void)tuplesort_process_amm_reclaim();
+
+    return GsAmmGrantProcessPendingReclaim();
+}
+
+bool GsAmmTpExecutorStart(QueryDesc *query_desc, int eflags)
+{
+    GsAmmTpQueryState *state = &gs_amm_tp_query_state;
+
+    (void)eflags;
+    if (!gs_amm_enabled || gs_amm_workload_role != GS_AMM_WORKLOAD_TP || query_desc == NULL)
+        return false;
+    state->owner_session = u_sess;
+    state->owner_session_id = u_sess->session_id;
+    state->owner_query_desc = query_desc;
+    state->active = u_sess->instr_cxt.pg_buffer_usage != NULL;
+    if (state->active) {
+        state->start_hit = u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit;
+        state->start_read = u_sess->instr_cxt.pg_buffer_usage->shared_blks_read;
+    }
+    return false;
+}
+
+void GsAmmTpExecutorEnd(QueryDesc *query_desc, bool success)
+{
+    GsAmmTpQueryState *state = &gs_amm_tp_query_state;
+    uint64 hit;
+    uint64 read;
+
+    (void)success;
+    if (!state->active || state->owner_query_desc != query_desc ||
+        u_sess->instr_cxt.pg_buffer_usage == NULL)
+        return;
+    hit = u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit;
+    read = u_sess->instr_cxt.pg_buffer_usage->shared_blks_read;
+    GsAmmRecordTpBufferUsage(hit >= state->start_hit ? hit - state->start_hit : 0,
+        read >= state->start_read ? read - state->start_read : 0, 1);
+    gs_amm_clear_tp_query_state();
+}
+
+bool GsAmmExecutorStart(QueryDesc *query_desc, int eflags)
+{
+    if (gs_amm_workload_role == GS_AMM_WORKLOAD_AP)
+        return GsAmmApExecutorStart(query_desc, eflags);
+    return GsAmmTpExecutorStart(query_desc, eflags);
+}
+
+void GsAmmExecutorEnd(QueryDesc *query_desc, bool success)
+{
+    if (gs_amm_workload_role == GS_AMM_WORKLOAD_AP)
+        GsAmmApExecutorEnd(query_desc, success);
+    else
+        GsAmmTpExecutorEnd(query_desc, success);
 }

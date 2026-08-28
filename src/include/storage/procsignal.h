@@ -56,6 +56,9 @@ typedef enum {
     PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK,
     PROCSIG_EXECUTOR_FLAG,
 
+    /* AMM asks an AP backend to cancel its current query for TP recovery. */
+    PROCSIG_AMM_AP_STOP,
+
     /* close active session socket */
     PROCSIG_COMM_CLOSE_ACTIVE_SESSION_SOCKET,
 

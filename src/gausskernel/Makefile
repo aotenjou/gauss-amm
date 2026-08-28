@@ -296,7 +296,7 @@ endif
 
 ##########################################################################
 
-all: submake-libpgport submake-schemapg libgstrace submake-libalarmclient gaussdb $(POSTGRES_IMP)
+all: submake-libpgport submake-schemapg submake-libalarmclient gaussdb $(POSTGRES_IMP)
 
 ifneq ($(PORTNAME), cygwin)
 ifneq ($(PORTNAME), win32)

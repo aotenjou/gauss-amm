@@ -79,7 +79,6 @@ static void gs_amm_retire_pending_writeback_batch(void)
 {
     if (gs_amm_pending_writeback_batch_pages == 0)
         return;
-    GsAmmRecordPendingWritebackRetire(gs_amm_pending_writeback_batch_pages);
     gs_amm_pending_writeback_batch_pages = 0;
 }
 
@@ -503,7 +502,6 @@ bool push_pending_flush_queue(Buffer buffer)
     pg_memory_barrier();
     pg_atomic_write_u32(&g_instance.ckpt_cxt_ctl->dirty_page_queue[actual_loc].slot_state, (SLOT_VALID));
     (void)pg_atomic_fetch_add_u32(&g_instance.ckpt_cxt_ctl->actual_dirty_page_num, 1);
-    GsAmmRecordDirtyPageEnqueue();
     return true;
 }
 
@@ -514,7 +512,6 @@ void remove_dirty_page_from_queue(BufferDesc* buf)
     pg_atomic_write_u64(&buf->extra->rec_lsn, InvalidXLogRecPtr);
     buf->extra->dirty_queue_loc = PG_UINT64_MAX;
     (void)pg_atomic_fetch_sub_u32(&g_instance.ckpt_cxt_ctl->actual_dirty_page_num, 1);
-    GsAmmRecordDirtyPageDequeue();
 }
 
 uint64 get_dirty_page_queue_tail()
@@ -773,7 +770,6 @@ static void ckpt_pagewriter_main_thread_flush_dirty_page()
 
     /* Step 1: set up atomic state for dirty page appiled. */
     prepare_dirty_page_applied_state(requested_flush_num, is_new_relfilenode);
-    GsAmmRecordPendingWritebackEnqueue(requested_flush_num);
 
     /* Step 2: wake up all subthreads and main thread sleep. */
     wakeup_sub_thread();
@@ -1280,7 +1276,7 @@ static void ckpt_pagewriter_main_thread_loop(void)
     uint32 candidate_num = 0;
 
     HandlePageWriterMainInterrupts();
-    GsAmmPagewriterControllerTick();
+    GsAmmControllerTick();
 
     candidate_num = get_curr_candidate_nums(CAND_LIST_NORMAL) + get_curr_candidate_nums(CAND_LIST_NVM) +
         get_curr_candidate_nums(CAND_LIST_SEG);
@@ -1295,7 +1291,7 @@ static void ckpt_pagewriter_main_thread_loop(void)
         }
 
         HandlePageWriterMainInterrupts();
-        GsAmmPagewriterControllerTick();
+        GsAmmControllerTick();
 
         candidate_num = get_curr_candidate_nums(CAND_LIST_NORMAL) + get_curr_candidate_nums(CAND_LIST_NVM) +
             get_curr_candidate_nums(CAND_LIST_SEG);
@@ -1315,7 +1311,7 @@ static void ckpt_pagewriter_main_thread_loop(void)
         sleep_time = get_pagewriter_sleep_time();
         while (sleep_time > 0 && !t_thrd.pagewriter_cxt.shutdown_requested && !FULL_CKPT) {
             HandlePageWriterMainInterrupts();
-            GsAmmPagewriterControllerTick();
+            GsAmmControllerTick();
             /* sleep 1ms check whether a full checkpoint is triggered */
             pg_usleep(MILLISECOND_TO_MICROSECOND);
             sleep_time -= 1;
@@ -1442,7 +1438,6 @@ static void ckpt_pagewriter_sub_thread_loop()
             ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
             gs_amm_pending_writeback_batch_pages = pgwr->need_flush_num;
             flushed_pages = incre_ckpt_pgwr_flush_dirty_queue(&wb_context);
-            GsAmmRecordWritebackFlushComplete(flushed_pages);
             gs_amm_retire_pending_writeback_batch();
 
             /* add up completed pages */
@@ -2133,7 +2128,6 @@ static void incre_ckpt_pgwr_flush_dirty_list(WritebackContext *wb_context, uint3
     qsort(dirty_buf_list, need_flush_num, sizeof(CkptSortItem), ckpt_buforder_comparator);
     ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
     gs_amm_pending_writeback_batch_pages = need_flush_num;
-    GsAmmRecordPendingWritebackEnqueue(need_flush_num);
 
     if (ENABLE_DMS) {
         pgwr->thrd_dw_cxt.is_new_relfilenode = is_new_relfilenode;
@@ -2158,8 +2152,6 @@ static void incre_ckpt_pgwr_flush_dirty_list(WritebackContext *wb_context, uint3
     }
     (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->page_writer_actual_flush, num_actual_flush);
     (void)pg_atomic_fetch_add_u32(&g_instance.ckpt_cxt_ctl->page_writer_last_flush, num_actual_flush);
-    GsAmmRecordWritebackFlushComplete(num_actual_flush);
-    GsAmmRecordPendingWritebackRetire(need_flush_num);
     gs_amm_pending_writeback_batch_pages = 0;
 
     for (uint32 i = 0; i < need_flush_num; i++) {

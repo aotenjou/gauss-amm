@@ -100,13 +100,11 @@ static void GsAmmApplyHashEffectiveGrant(HashJoinTable hashtable)
     if (grant_kb <= 0)
         return;
 
-    grant_bytes = (int64)grant_kb * 1024L;
-    if (grant_bytes < hashtable->spaceAllowed) {
-        hashtable->spaceAllowed = grant_bytes;
-        hashtable->spaceAllowedSkew = hashtable->spaceAllowed * SKEW_WORK_MEM_PERCENT / 100;
-    }
-    if (hashtable->maxMem > 0 && grant_bytes < hashtable->maxMem)
-        hashtable->maxMem = grant_bytes;
+    grant_bytes = (int64)Max(GsAmmCurrentBackendGrantPoolBytes(), (uint64)grant_kb * 1024);
+    hashtable->spaceAllowed = Max(grant_bytes, hashtable->spaceUsed);
+    hashtable->spaceAllowedSkew = hashtable->spaceAllowed * SKEW_WORK_MEM_PERCENT / 100;
+    if (hashtable->maxMem > 0)
+        hashtable->maxMem = Max(hashtable->maxMem, grant_bytes);
 }
 
 static void ExecHashTupleGrantError(HashJoinTable hashtable, Size tupleBytes, int sqlState)
@@ -602,7 +600,7 @@ HashJoinTable ExecHashTableCreate(Hash* node, List* hashOperators, bool keepNull
     uint64 amm_grant_id = GsAmmCurrentBackendGrantId();
 
     if (amm_grant_kb > 0)
-        local_work_mem = Min(local_work_mem, (int64)amm_grant_kb);
+        local_work_mem = Max((int64)(GsAmmCurrentBackendGrantPoolBytes() / 1024), (int64)64);
 
     /*
      * Get information about the size of the relation to be hashed (it's the
@@ -1290,14 +1288,6 @@ void ExecChooseSonicHashTableSize(Path* inner_path, List* hashclauses, int* inne
 void ExecHashTableDestroy(HashJoinTable hashtable)
 {
     int i;
-    uint64 lifecycle_generation = GsAmmCurrentQueryLifecycleGeneration();
-
-    GsAmmReportOperatorPeak(lifecycle_generation, hashtable->spacePeak > 0 ? (uint64)hashtable->spacePeak : 0);
-    GsAmmReportQuerySpill(lifecycle_generation,
-        hashtable->spill_size != NULL && *hashtable->spill_size > 0 ? (uint64)*hashtable->spill_size : 0,
-        hashtable->spill_count > UINT_MAX ? UINT_MAX : (uint32)hashtable->spill_count);
-    GsAmmReportHashBatches(lifecycle_generation, hashtable->nbatch, gs_amm_hash_multipass_count(hashtable));
-
     /*
      * Make sure all the temp files are closed.  We skip batch 0, since it
      * can't have any temp files (and the arrays might not even exist if
@@ -1639,6 +1629,8 @@ static void ExecHashIncreaseNumBatches(HashJoinTable hashtable)
 
     if (IsA(hashtable->batchCxt, AmmGranuleContext)) {
         ExecHashRebatchAmmChunks(hashtable, oldchunks, curbatch, &ninmemory, &nfreed);
+        (void)AmmGranuleContextReleaseFreeMemory(hashtable->batchCxt);
+        (void)AmmGranuleContextReleaseFreeMemory(hashtable->hashCxt);
     } else {
         /* Preserve the native copy/rebuild behavior outside AMM. */
         while (oldchunks != NULL) {

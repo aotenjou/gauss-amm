@@ -35,6 +35,7 @@
 #include "storage/smgr/fd.h"
 #include "storage/latch.h"
 #include "storage/procarray.h"
+#include "storage/gs_amm.h"
 #include "gssignal/gs_signal.h"
 #include "storage/pmsignal.h"
 #include "access/gtm.h"
@@ -83,6 +84,7 @@ static void MOTCleanupSession(int code, Datum arg)
 #endif
 
 static const pg_on_exit_callback on_sess_exit_list[] = {
+    GsAmmSessionCleanup,
     ShutdownPostgres,
     PGXCNodeCleanAndRelease,
     PlDebugerCleanUp,
@@ -717,4 +719,3 @@ bool IsCalledInSessExit(pg_on_exit_callback func)
     }
     return false;
 }
-

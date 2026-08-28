@@ -2061,7 +2061,6 @@ static bool ReadBuffer_common_ReadBlock(SMgrRelation smgr, char relpersistence, 
             }
 
             if (count_shared_physical_read && rdStatus == SMGR_RD_OK)
-                GsAmmRecordSharedBufferPhysicalRead();
 
             if (u_sess->attr.attr_common.track_io_timing) {
                 INSTR_TIME_SET_CURRENT(io_time);
@@ -2347,7 +2346,6 @@ static Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumb
             u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit++;
         } else {
             u_sess->instr_cxt.pg_buffer_usage->shared_blks_read++;
-            GsAmmRecordSharedBufferReadMiss();
             pgstatCountSharedBlocksRead4SessionLevel();
         }
     }

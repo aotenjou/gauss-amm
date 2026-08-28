@@ -192,7 +192,6 @@ static void extendBufFile(BufFile* file)
     file->files[file->numFiles] = pfile;
     file->offsets[file->numFiles] = 0L;
     file->numFiles++;
-    GsAmmReportTempFileIO(GsAmmCurrentQueryLifecycleGeneration(), 0, 1);
 }
 
 /*
@@ -218,7 +217,6 @@ static BufFile* CreateTempBufFile(bool interXact)
     file = makeBufFile(pfile);
     file->isTemp = true;
     file->isInterXact = interXact;
-    GsAmmReportTempFileIO(GsAmmCurrentQueryLifecycleGeneration(), 0, 1);
 
     return file;
 }
@@ -279,7 +277,6 @@ BufFile *BufFileCreateShared(SharedFileSet *fileset, const char *name)
     file->numFiles = 1;
     file->files = (File *)palloc(sizeof(File));
     file->files[0] = MakeNewSharedSegment(file, 0);
-    GsAmmReportTempFileIO(GsAmmCurrentQueryLifecycleGeneration(), 0, 1);
     file->offsets = (off_t *)palloc(sizeof(off_t));
     file->offsets[0] = 0L;
     file->isInterXact = false;
@@ -540,9 +537,6 @@ static void BufFileDumpBuffer(BufFile* file)
         if (bytestowrite <= 0) {
             return; /* failed to write */
         }
-        if (file->isTemp)
-            GsAmmReportTempFileIO(GsAmmCurrentQueryLifecycleGeneration(), (uint64)bytestowrite, 0);
-
         file->offsets[file->curFile] += bytestowrite;
         file->curOffset += bytestowrite;
         wpos += bytestowrite;

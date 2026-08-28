@@ -41,6 +41,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/file/fio_device.h"
+#include "storage/gs_amm.h"
 #include "utils/lsyscache.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"

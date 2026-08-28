@@ -9,7 +9,7 @@
 #include "knl/knl_variable.h"
 
 #include <sys/mman.h>
-#include <unistd.h>
+#include <stdlib.h>
 
 #include "fmgr.h"
 #include "catalog/pg_type.h"
@@ -18,142 +18,133 @@
 #include "storage/buf/buf_internals.h"
 #include "storage/buf/bufmgr.h"
 #include "storage/gs_amm.h"
-#include "storage/gs_amm_io.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/proc.h"
+#include "storage/procsignal.h"
 #include "storage/shmem.h"
 #include "postmaster/pagewriter.h"
 #include "utils/builtins.h"
-#include "utils/array.h"
 #include "utils/guc.h"
 #include "utils/timestamp.h"
+#include "utils/tuplesort.h"
 #include "ddes/dms/ss_dms_bufmgr.h"
 
 extern bool superuser(void);
 
 int gs_amm_shared_buffers_min_mb = 64;
-int gs_amm_controller_horizon = 3;
-int gs_amm_resize_rate_limit_mb = 64;
-int gs_amm_tp_pressure_guard = 80;
-int gs_amm_io_pressure_guard = 80;
-int gs_amm_deadband_mb = 32;
 int gs_amm_dynamic_target_mb = 512;
-int gs_amm_ap_min_grant_mb = 4;
-int gs_amm_ap_queue_limit = 16;
-int gs_amm_ap_queue_timeout_ms = 5000;
-double gs_amm_tp_jitter_limit = 0.03;
-int gs_amm_resize_observe_window_ms = 5000;
-int gs_amm_resize_cooldown_ms = 8000;
-int gs_amm_resize_batch_mb = 64;
 int gs_amm_granule_size_mb = 64;
-int gs_amm_tp_recovery_cooldown_ms = 8000;
 bool gs_amm_enabled = false;
-bool gs_amm_allocator_only_mode = false;
-int gs_amm_allocator_only_grant_mb = 128;
-bool gs_amm_feedback_only_mode = false;
-int gs_amm_feedback_bootstrap_grant_mb = 64;
-int gs_amm_feedback_max_grant_mb = 256;
-int gs_amm_feedback_initial_ap_slots = 1;
-int gs_amm_feedback_max_ap_slots = 4;
-int gs_amm_feedback_stable_windows = 2;
-int gs_amm_feedback_spill_threshold_mb = 32;
-bool gs_amm_dtree_calibration_enabled = false;
-bool gs_amm_dtree_record_only = true;
-bool gs_amm_native_auto_mode = false;
-double gs_amm_native_ap_cost_threshold = 10000.0;
-int gs_amm_admission_failure_policy = GS_AMM_ADMISSION_FALLBACK;
-int gs_amm_fallback_work_mem_kb = 65536;
+THR_LOCAL int gs_amm_workload_role = GS_AMM_WORKLOAD_TP;
+THR_LOCAL int gs_amm_test_ap_cache_label_kb = 0;
+THR_LOCAL int gs_amm_test_ap_one_pass_label_kb = 0;
+THR_LOCAL int gs_amm_test_ap_multi_pass_label_kb = 0;
+THR_LOCAL int gs_amm_test_ap_label_kb = 0;
+int gs_amm_tp_buffer_miss_threshold_pct = 5;
+int gs_amm_ap_borrow_buffer_hit_guard_pct = 3;
+int gs_amm_tp_tps_decline_guard_pct = 3;
+int gs_amm_tp_cpu_pressure_threshold_pct = 60;
+/* A worker-rate surge is retained exclusively to make acceptance tests
+ * deterministic on a shared host.  Production recovery uses host CPU. */
+THR_LOCAL bool gs_amm_tp_test_mode = false;
+THR_LOCAL bool gs_amm_tp_test_worker_surge = false;
+#define GS_AMM_TP_TPS_SURGE_GUARD_PCT 50
+
+#define gs_amm_ap_min_grant_mb 1
 
 typedef enum GsAmmAction {
     GS_AMM_OBSERVE = 0,
     GS_AMM_AP_EXPAND,
     GS_AMM_BORROW_FROM_BUFFER,
-    GS_AMM_AP_SHRINK,
     GS_AMM_BACKPRESSURE,
-    GS_AMM_TP_RECOVERY,
     GS_AMM_FAIL_CLOSED,
+    GS_AMM_TP_RECOVERY_FREE,
+    GS_AMM_TP_RECOVERY_IDLE_AP,
+    GS_AMM_TP_DOWNGRADE_PENDING,
+    GS_AMM_TP_RECOVERY_DONE,
+    GS_AMM_TP_RECOVERY_DEFERRED,
+    GS_AMM_TP_BUFFER_BASELINE_DRAIN,
     GS_AMM_ACTION_COUNT
 } GsAmmAction;
 
-#define GS_AMM_MAX_HORIZON 8
-#define GS_AMM_MAX_BEAM 8
-#define GS_AMM_SELECTABLE_ACTIONS 6
-#define GS_AMM_QUEUE_RING_SIZE 128
-#define GS_AMM_QUEUE_WAITING 1
-#define GS_AMM_QUEUE_CANCELLED 2
-#define GS_AMM_TP_WINDOW_SAMPLE_COUNT 128
 #define GS_AMM_MIN_GRANULE_MB 1
-#define GS_AMM_NATIVE_TP_WINDOW_MS 30000
-#define GS_AMM_TP_BASELINE_REBASE_IDLE_MS 30000
-#define GS_AMM_TP_BASELINE_REBASE_ALPHA 0.10
-/* A 30s window below this rate cannot distinguish a 3% drop from commit noise. */
-#define GS_AMM_TP_GUARD_MIN_BASELINE_TPS 10.0
-#define GS_AMM_DTREE_SPILL_MEMORY_EQUIVALENT 0.50
-#define GS_AMM_DTREE_CALIBRATION_TICK_MS 1000
-#define GS_AMM_DTREE_CALIBRATION_MAX_SAMPLES 32
 #define GS_AMM_RECLAIM_RETRY_INTERVAL_MS 1000
+#define GS_AMM_MAX_AP_REGISTRY 128
+#define GS_AMM_AP_QUEUE_CAPACITY GS_AMM_MAX_AP_REGISTRY
+#define GS_AMM_TP_WINDOW_MS 1000
+#define GS_AMM_TP_LOW_WINDOWS_BEFORE_DRAIN 3
+#define GS_AMM_TP_HOT_CLEAR_WINDOWS 3
+#define GS_AMM_TP_TEST_SURGE_LEASE_WINDOWS 3
+#define GS_AMM_TP_TEST_MODE_LEASE_WINDOWS 10
 
-static void gs_amm_require_legacy_control(void)
-{
-    if (!u_sess->attr.attr_storage.gs_amm_legacy_control_enabled)
-        ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("external GS AMM control is disabled"),
-                errhint("Set gs_amm_legacy_control_enabled and use gs_guc reload only for legacy or debug experiments.")));
-}
+typedef enum GsAmmStage {
+    GS_AMM_STAGE_CACHE = 0,
+    GS_AMM_STAGE_CACHE_ONEPASS,
+    GS_AMM_STAGE_FORCE_ONEPASS
+} GsAmmStage;
 
-static void gs_amm_require_admin_legacy_control(void)
-{
-    if (!superuser())
-        ereport(ERROR,
-            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                errmsg("must be superuser to control GS AMM")));
-    gs_amm_require_legacy_control();
-}
+typedef enum GsAmmTpPressureState {
+    GS_AMM_TP_PRESSURE_UNKNOWN = 0,
+    GS_AMM_TP_PRESSURE_LOW_FLOW,
+    GS_AMM_TP_PRESSURE_HOT_RECOVERY,
+    GS_AMM_TP_PRESSURE_RECOVERY_WAIT
+} GsAmmTpPressureState;
 
-typedef struct GsAmmConfig {
-    int shared_buffers_min_mb;
-    int controller_horizon;
-    int resize_rate_limit_mb;
-    int tp_pressure_guard;
-    int io_pressure_guard;
-    int deadband_mb;
-    int hysteresis_enter_delta;
-    double w_ap_benefit;
-    double w_tp_recovery_benefit;
-    double w_io_risk_penalty;
-    double w_resize_cost;
-    double w_grant_debt_risk;
-    int beam_width;
-} GsAmmConfig;
+typedef enum GsAmmTpRecoveryPhase {
+    GS_AMM_TP_RECOVERY_IDLE = 0,
+    GS_AMM_TP_RECOVERY_STOP_AP,
+    GS_AMM_TP_RECOVERY_WAIT_AP,
+    GS_AMM_TP_RECOVERY_RESTORE_SB,
+    GS_AMM_TP_RECOVERY_MULTIPASS
+} GsAmmTpRecoveryPhase;
 
-typedef struct GsAmmSimState {
-    int active_mb;
-    int max_mb;
-    int min_mb;
-    int grant_debt_mb;
-    bool tail_reclaimable;
-    int ap_demand_mb;
-    int tp_pressure;
-    int io_pressure;
-} GsAmmSimState;
+typedef struct GsAmmApRecord {
+    bool active;
+    uint64 grant_id;
+    uint64 grant_generation;
+    uint64 lifecycle_generation;
+    int cache_bound_kb;
+    int one_pass_bound_kb;
+    int multi_pass_bound_kb;
+    int granted_kb;
+    int effective_grant_kb;
+    uint64 dynamic_granted_bytes;
+    uint64 dynamic_used_bytes;
+    uint64 used_bytes;
+    GsAmmMemoryMode mode;
+    GsAmmMemoryMode target_mode;
+    uint64 revoke_epoch;
+    bool reclaim_pending;
+    int reclaim_granule_id;
+    ThreadId backend_pid;
+    BackendId backend_id;
+    bool stop_requested;
+} GsAmmApRecord;
 
-typedef struct GsAmmObservation {
-    int ap_demand_mb;
-    int tp_pressure;
-    int io_pressure;
-    bool tail_reclaimable;
-    bool telemetry_ok;
-} GsAmmObservation;
+typedef enum GsAmmApQueueState {
+    GS_AMM_AP_QUEUE_FREE = 0,
+    GS_AMM_AP_QUEUE_WAITING,
+    GS_AMM_AP_QUEUE_GRANTED
+} GsAmmApQueueState;
 
-typedef struct GsAmmPlanResult {
-    GsAmmAction chosen_action;
-    GsAmmAction best_sequence[GS_AMM_MAX_HORIZON];
-    int sequence_len;
-    double score;
-    int candidate_count;
-    int rejected_count;
-    const char *binding_constraint;
-} GsAmmPlanResult;
+/* A slot is owned by its waiting backend until it claims or cancels its grant. */
+typedef struct GsAmmApQueueSlot {
+    GsAmmApQueueState state;
+    uint64 ticket;
+    TimestampTz queued_at;
+    int cache_bound_kb;
+    int one_pass_bound_kb;
+    int multi_pass_bound_kb;
+    int prediction_mb;
+    int pgprocno;
+    ThreadId waiter_pid;
+    uint64 waiter_sessionid;
+    GsAmmGrantToken grant_token;
+    int granted_kb;
+    int grant_granules;
+    GsAmmMemoryMode memory_mode;
+} GsAmmApQueueSlot;
 
 typedef struct GsAmmResizeOutcome {
     const char *decision;
@@ -189,18 +180,6 @@ typedef struct GsAmmGranuleSummary {
 typedef struct GsAmmRuntimeConfig {
     uint64 config_version;
     bool amm_enabled;
-    bool runtime_override_active;
-    bool allocator_only_mode;
-    int allocator_only_grant_mb;
-    bool feedback_only;
-    int feedback_bootstrap_grant_mb;
-    int feedback_max_grant_mb;
-    int feedback_initial_ap_slots;
-    int feedback_max_ap_slots;
-    int feedback_stable_windows;
-    int feedback_spill_threshold_mb;
-    bool dtree_calibration_enabled;
-    bool dtree_record_only;
 } GsAmmRuntimeConfig;
 
 typedef struct GsAmmSharedState {
@@ -210,100 +189,74 @@ typedef struct GsAmmSharedState {
     uint64 operation_inflight;
     bool reclaim_syscall_inflight;
     uint64 reclaim_syscall_attempt;
-    pg_atomic_uint64 tp_commit_count;
-    pg_atomic_uint64 shared_buffer_read_miss_count;
-    pg_atomic_uint64 shared_buffer_physical_read_count;
-    pg_atomic_uint64 dirty_page_count;
-    pg_atomic_uint64 pending_writeback_page_count;
-    pg_atomic_uint64 writeback_flush_completed_pages;
-    pg_atomic_uint64 pending_writeback_retire_underflow_count;
-    pg_atomic_uint64 ap_temp_spill_bytes;
-    pg_atomic_uint64 ap_temp_spill_events;
-    pg_atomic_uint64 ap_hash_multipass_count;
-    TimestampTz native_telemetry_last_tick;
-    uint64 native_telemetry_last_commit_count;
-    uint64 native_telemetry_last_physical_read_count;
-    uint64 native_telemetry_last_temp_spill_bytes;
-    uint64 native_telemetry_last_hash_multipass_count;
-    uint64 native_telemetry_tick_count;
     int dynamic_target_mb;
     int dynamic_used_mb;
+    uint64 dynamic_reserved_bytes;
+    uint64 dynamic_allocated_bytes;
     int active_ap_count;
-    int feedback_current_grant_mb;
-    int feedback_ap_slot_limit;
-    int feedback_stable_windows;
-    uint64 feedback_completed_count;
-    uint64 feedback_admit_count;
-    uint64 feedback_growth_count;
-    uint64 feedback_backoff_count;
-    uint64 feedback_slot_block_count;
-    double feedback_ewma_runtime_ms;
-    double feedback_ewma_spill_mb;
-    double feedback_ewma_peak_mb;
-    char feedback_last_action[32];
-    int ap_queue_len;
-    uint64 ap_queue_head;
-    uint64 ap_queue_tail;
-    int ap_queue_admit_count;
-    int ap_queue_timeout_count;
-    int last_queue_wait_ms;
-    unsigned char ap_queue_slots[GS_AMM_QUEUE_RING_SIZE];
+    GsAmmStage stage;
+    int ap_registry_count;
+    uint64 ap_granted_bytes_total;
+    uint64 ap_used_bytes_total;
+    uint64 ap_reclaimable_bytes_total;
+    int active_target_demand_mb;
+    int queued_ap_count;
+    int queued_target_demand_mb;
+    uint64 next_queue_ticket;
+    uint64 ap_queue_admit_count;
+    uint64 ap_queue_cancel_count;
+    GsAmmApQueueSlot ap_queue[GS_AMM_AP_QUEUE_CAPACITY];
+    int pending_demand_mb;
+    int last_current_target_mb;
+    int last_aggregate_target_mb;
+    int last_dynamic_deficit_mb;
+    uint64 ap_borrow_count;
+    char last_supply_source[24];
+    uint64 tp_window_shared_blks_hit;
+    uint64 tp_window_shared_blks_read;
+    uint64 tp_window_completed_queries;
+    uint64 tp_cpu_last_total_jiffies;
+    uint64 tp_cpu_last_idle_jiffies;
+    int tp_cpu_util_pct;
+    bool tp_cpu_util_valid;
+    bool tp_cpu_guarded;
+    TimestampTz tp_test_mode_until;
+    TimestampTz tp_test_worker_surge_until;
+    int tp_pressure_pct;
+    bool tp_pressure_hot;
+    GsAmmTpPressureState tp_pressure_state;
+    bool tp_pressure_valid;
+    uint64 tp_buffer_hit_baseline_hits;
+    uint64 tp_buffer_hit_baseline_accesses;
+    int tp_buffer_hit_pct;
+    bool tp_buffer_hit_baseline_valid;
+    uint64 tp_baseline_tps;
+    uint64 tp_recent_tps;
+    bool tp_tps_baseline_valid;
+    bool tp_tps_guarded;
+    bool ap_borrow_buffer_hit_guarded;
+    int baseline_active_mb;
+    int tp_low_pressure_windows;
+    int tp_hot_clear_windows;
+    GsAmmTpRecoveryPhase tp_recovery_phase;
+    bool ap_multipass_only;
+    uint64 tp_ap_stop_requested;
+    uint64 tp_ap_stop_completed;
+    uint64 tp_sb_restore_granules;
+    TimestampTz tp_last_window_at;
+    TimestampTz last_ap_borrow_at;
+    uint64 tp_recovery_requested_granules;
+    uint64 tp_recovered_granules;
+    uint64 tp_recovery_deferred_count;
+    int ap_downgrade_pending;
+    uint64 ap_reclaim_poll_count;
+    uint64 ap_reclaim_operator_release_bytes;
+    GsAmmApRecord ap_registry[GS_AMM_MAX_AP_REGISTRY];
     int backpressure_count;
-    int new_ap_guard_block_count;
-    int grant_shrink_count;
-    int grant_debt_mb;
-    int effective_grant_kb;
-    int effective_downgrade_count;
-    double tp_baseline_tps;
-    double tp_recent_tps;
-    double tp_p95_latency_ms;
-    double tp_raw_drop_ratio;
-    int tp_window_ms;
-    int tp_sample_count;
-    int tp_baseline_rebase_count;
-    double physical_read_rate;
-    uint64 pending_writeback_pages;
-    double dirty_page_ratio;
-    int device_io_in_flight;
-    double device_io_ms_rate;
-    bool device_io_available;
-    double temp_spill_mb_rate;
-    double hash_multipass_rate;
-    bool io_guard_latched;
-    int io_recovery_stable_windows;
-    TimestampTz io_recovery_last_window;
-    int io_pressure_observed;
-    int io_window_ms;
-    int tp_sample_next;
-    uint64 tp_sample_generation;
-    bool tp_generation_exhausted;
-    TimestampTz tp_sample_time[GS_AMM_TP_WINDOW_SAMPLE_COUNT];
-    double tp_sample_tps[GS_AMM_TP_WINDOW_SAMPLE_COUNT];
-    double tp_sample_p95_latency_ms[GS_AMM_TP_WINDOW_SAMPLE_COUNT];
-    TimestampTz last_resize_time;
-    TimestampTz resize_observe_until;
-    TimestampTz cooldown_until;
-    TimestampTz recovery_cooldown_until;
-    int guard_block_count;
-    int rollback_count;
-    int recovery_action_count;
-    int recovery_cooldown_block_count;
-    int last_rollback_target_mb;
     int last_prediction_mb;
-    int last_tp_pressure;
-    int last_io_pressure;
     int last_grant_mb;
-    int last_effective_grant_kb;
     char last_backpressure_reason[32];
     GsAmmAction last_action;
-    uint64 next_pool_event_id;
-    uint64 last_pool_event_id;
-    TimestampTz last_pool_event_time;
-    GsAmmAction last_pool_event_action;
-    int last_pool_event_duration_ms;
-    GsAmmGranuleSummary last_pool_event_before;
-    GsAmmGranuleSummary last_pool_event_after;
-    char last_pool_event_reason[64];
     int granule_mb;
     int granule_blocks;
     int total_granules;
@@ -336,7 +289,6 @@ typedef struct GsAmmSharedState {
     int reclaim_fail_count;
     int ap_idle_reclaim_count;
     int ap_idle_reclaim_mb;
-    int auto_controller_step_count;
     uint64 native_eligible_count;
     uint64 native_admit_count;
     uint64 native_reject_count;
@@ -350,13 +302,7 @@ typedef struct GsAmmSharedState {
     GsAmmMemoryMode native_current_memory_mode;
     int64 native_current_model_version;
     int64 native_current_leaf_id;
-    int64 native_current_calibration_version;
-    double native_current_calibration_scale;
-    double native_current_raw_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double native_current_calibrated_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
     char native_last_reason[GS_AMM_ADMISSION_REASON_LENGTH];
-    GsAmmDtreeFeedbackRing dtree_feedback_ring;
-    GsAmmDtreeCalibrationTable dtree_calibration_table;
     uint64 next_drain_attempt;
     uint64 next_reclaim_attempt;
     uint64 next_grant_id;
@@ -364,39 +310,213 @@ typedef struct GsAmmSharedState {
     GsAmmGranuleMeta granules[1];
 } GsAmmSharedState;
 
-typedef struct GsAmmBeamEntry {
-    GsAmmSimState chain[GS_AMM_MAX_HORIZON + 1];
-    GsAmmAction seq[GS_AMM_MAX_HORIZON];
-    int len;
-    double score;
-} GsAmmBeamEntry;
+static const char *gs_amm_stage_name(GsAmmStage stage)
+{
+    switch (stage) {
+        case GS_AMM_STAGE_CACHE:
+            return "cache";
+        case GS_AMM_STAGE_CACHE_ONEPASS:
+            return "cache_onepass";
+        case GS_AMM_STAGE_FORCE_ONEPASS:
+            return "force_onepass";
+        default:
+            return "unknown";
+    }
+}
+
+static GsAmmApRecord *gs_amm_find_ap_record_locked(
+    GsAmmSharedState *state, GsAmmGrantToken token)
+{
+    for (int index = 0; index < GS_AMM_MAX_AP_REGISTRY; index++) {
+        GsAmmApRecord *record = &state->ap_registry[index];
+
+        if (record->active && record->grant_id == token.grant_id &&
+            record->grant_generation == token.grant_generation)
+            return record;
+    }
+    return NULL;
+}
+
+static void gs_amm_refresh_ap_totals_locked(GsAmmSharedState *state)
+{
+    uint64 granted = 0;
+    uint64 used = 0;
+    uint64 dynamic_reserved = 0;
+    uint64 dynamic_used = 0;
+
+    state->ap_reclaimable_bytes_total = 0;
+
+    for (int index = 0; index < GS_AMM_MAX_AP_REGISTRY; index++) {
+        GsAmmApRecord *record = &state->ap_registry[index];
+        uint64 shared_granted = 0;
+        uint64 shared_used = 0;
+
+        if (!record->active)
+            continue;
+        dynamic_reserved += record->dynamic_granted_bytes;
+        dynamic_used += record->dynamic_used_bytes;
+        for (int granule_index = 0; granule_index < state->total_granules; granule_index++) {
+            GsAmmGranuleMeta *granule = &state->granules[granule_index];
+            uint64 capacity;
+
+            if (granule->grant_id != record->grant_id ||
+                granule->grant_generation != record->grant_generation ||
+                (granule->state != GS_AMM_GRANULE_AP_ACTIVE &&
+                    granule->state != GS_AMM_GRANULE_AP_RESERVED &&
+                    granule->state != GS_AMM_GRANULE_RECLAIMING))
+                continue;
+            capacity = granule->active_grant_bytes != 0 ? granule->active_grant_bytes :
+                (uint64)granule->buffer_count * BLCKSZ;
+            shared_granted += capacity;
+            shared_used += granule->used_bytes;
+        }
+        uint64 record_granted = record->dynamic_granted_bytes + shared_granted;
+        uint64 record_used = record->dynamic_used_bytes + shared_used;
+        record->granted_kb = (int)Min(record_granted / 1024, (uint64)INT_MAX);
+        record->used_bytes = record_used;
+        granted += record_granted;
+        used += record_used;
+        /* Dynamic quota is backend-local malloc and is not reclaimable from SB. */
+        if (shared_granted > shared_used)
+            state->ap_reclaimable_bytes_total += shared_granted - shared_used;
+    }
+    state->ap_granted_bytes_total = granted;
+    state->ap_used_bytes_total = used;
+    state->dynamic_reserved_bytes = dynamic_reserved;
+    state->dynamic_allocated_bytes = dynamic_used;
+    state->dynamic_used_mb = (int)Min((dynamic_reserved + 1024 * 1024 - 1) / (1024 * 1024),
+        (uint64)INT_MAX);
+}
+
+static int gs_amm_ap_target_bound_kb(const GsAmmApRecord *record)
+{
+    if (record == NULL)
+        return 0;
+    switch (record->target_mode) {
+        case GS_AMM_MEMORY_MODE_CACHE:
+            return record->cache_bound_kb;
+        case GS_AMM_MEMORY_MODE_ONEPASS:
+            return record->one_pass_bound_kb;
+        case GS_AMM_MEMORY_MODE_MULTIPASS:
+        case GS_AMM_MEMORY_MODE_BACKPRESSURE:
+        case GS_AMM_MEMORY_MODE_NONE:
+        default:
+            return record->multi_pass_bound_kb;
+    }
+}
+
+static void gs_amm_refresh_ap_target_totals_locked(GsAmmSharedState *state)
+{
+    int active_target_mb = 0;
+
+    if (state == NULL)
+        return;
+    for (int index = 0; index < GS_AMM_MAX_AP_REGISTRY; index++) {
+        GsAmmApRecord *record = &state->ap_registry[index];
+
+        if (record->active)
+            active_target_mb += (gs_amm_ap_target_bound_kb(record) + 1023) / 1024;
+    }
+    state->active_target_demand_mb = active_target_mb;
+    state->last_aggregate_target_mb = active_target_mb + state->last_current_target_mb;
+}
+
+static bool gs_amm_register_ap_locked(GsAmmSharedState *state, GsAmmGrantToken token,
+    int cache_bound_kb, int one_pass_bound_kb, int multi_pass_bound_kb, int granted_kb,
+    uint64 dynamic_granted_bytes, GsAmmMemoryMode mode, GsAmmMemoryMode target_mode,
+    ThreadId backend_pid, BackendId backend_id)
+{
+    GsAmmApRecord *record = gs_amm_find_ap_record_locked(state, token);
+
+    if (record == NULL) {
+        for (int index = 0; index < GS_AMM_MAX_AP_REGISTRY; index++) {
+            if (!state->ap_registry[index].active) {
+                record = &state->ap_registry[index];
+                state->ap_registry_count++;
+                break;
+            }
+        }
+    }
+    if (record == NULL)
+        return false;
+
+    record->active = true;
+    record->grant_id = token.grant_id;
+    record->grant_generation = token.grant_generation;
+    record->lifecycle_generation = 0;
+    record->cache_bound_kb = cache_bound_kb;
+    record->one_pass_bound_kb = one_pass_bound_kb;
+    record->multi_pass_bound_kb = multi_pass_bound_kb;
+    record->granted_kb = granted_kb;
+    record->effective_grant_kb = granted_kb;
+    record->dynamic_granted_bytes = dynamic_granted_bytes;
+    record->dynamic_used_bytes = 0;
+    record->used_bytes = 0;
+    record->mode = mode;
+    record->target_mode = target_mode;
+    record->revoke_epoch = 0;
+    record->reclaim_pending = false;
+    record->reclaim_granule_id = -1;
+    record->backend_pid = backend_pid;
+    record->backend_id = backend_id;
+    record->stop_requested = false;
+    gs_amm_refresh_ap_totals_locked(state);
+    gs_amm_refresh_ap_target_totals_locked(state);
+    return true;
+}
+
+static void gs_amm_unregister_ap_locked(GsAmmSharedState *state, GsAmmGrantToken token)
+{
+    GsAmmApRecord *record = gs_amm_find_ap_record_locked(state, token);
+
+    if (record == NULL)
+        return;
+    if (record->stop_requested)
+        state->tp_ap_stop_completed++;
+    if (record->reclaim_pending && state->ap_downgrade_pending > 0)
+        state->ap_downgrade_pending--;
+    (void)memset(record, 0, sizeof(*record));
+    if (state->ap_registry_count > 0)
+        state->ap_registry_count--;
+    gs_amm_refresh_ap_totals_locked(state);
+    gs_amm_refresh_ap_target_totals_locked(state);
+}
+
+static void gs_amm_update_ap_used_locked(GsAmmSharedState *state, GsAmmGrantToken token)
+{
+    GsAmmApRecord *record = gs_amm_find_ap_record_locked(state, token);
+    uint64 used = 0;
+
+    if (record == NULL)
+        return;
+    for (int index = 0; index < state->total_granules; index++) {
+        GsAmmGranuleMeta *granule = &state->granules[index];
+
+        if (granule->grant_id == token.grant_id && granule->grant_generation == token.grant_generation &&
+            (granule->state == GS_AMM_GRANULE_AP_ACTIVE || granule->state == GS_AMM_GRANULE_AP_RESERVED))
+            used += granule->used_bytes;
+    }
+    record->used_bytes = used;
+    gs_amm_refresh_ap_totals_locked(state);
+}
 
 static const char *const GS_AMM_ACTION_NAMES[GS_AMM_ACTION_COUNT] = {
     "OBSERVE",
     "AP_EXPAND",
     "BORROW_FROM_BUFFER",
-    "AP_SHRINK",
     "BACKPRESSURE",
-    "TP_RECOVERY",
-    "FAIL_CLOSED"
-};
-
-static const GsAmmAction GS_AMM_SELECTABLE[GS_AMM_SELECTABLE_ACTIONS] = {
-    GS_AMM_OBSERVE,
-    GS_AMM_AP_EXPAND,
-    GS_AMM_BORROW_FROM_BUFFER,
-    GS_AMM_AP_SHRINK,
-    GS_AMM_BACKPRESSURE,
-    GS_AMM_TP_RECOVERY
+    "FAIL_CLOSED",
+    "TP_RECOVERY_FREE",
+    "TP_RECOVERY_IDLE_AP",
+    "TP_DOWNGRADE_PENDING",
+    "TP_RECOVERY_DONE",
+    "TP_RECOVERY_DEFERRED",
+    "TP_BUFFER_BASELINE_DRAIN"
 };
 
 static const char *gs_amm_memory_mode_name(GsAmmMemoryMode mode)
 {
     switch (mode) {
-        case GS_AMM_MEMORY_MODE_ALLOCATOR_ONLY:
-            return "allocator_only";
-        case GS_AMM_MEMORY_MODE_FEEDBACK_ONLY:
-            return "feedback_only";
         case GS_AMM_MEMORY_MODE_CACHE:
             return "cache";
         case GS_AMM_MEMORY_MODE_ONEPASS:
@@ -429,9 +549,9 @@ static THR_LOCAL uint64 MyGsAmmGrantId = 0;
 static THR_LOCAL uint64 MyGsAmmGrantGeneration = 0;
 static THR_LOCAL int MyGsAmmGrantGranules = 0;
 static THR_LOCAL bool MyGsAmmGrantNative = false;
-static THR_LOCAL int MyGsAmmSavedWorkMemKb = 0;
 static THR_LOCAL bool MyGsAmmCleanupRegistered = false;
 static THR_LOCAL bool MyGsAmmTransactionHasNativeAP = false;
+static THR_LOCAL uint64 MyGsAmmQueueTicket = 0;
 
 typedef struct GsAmmGrantFreeExtent {
     struct GsAmmGrantFreeExtent *next;
@@ -444,20 +564,48 @@ typedef struct GsAmmBackendGrantArena {
     GsAmmGrantFreeExtent *free_extents;
 } GsAmmBackendGrantArena;
 
+typedef struct GsAmmDynamicAllocation {
+    struct GsAmmDynamicAllocation *next;
+    void *pointer;
+    Size size;
+} GsAmmDynamicAllocation;
+
 static THR_LOCAL GsAmmBackendGrantArena MyGsAmmGrantArena = {{0, 0}, NULL};
+static THR_LOCAL GsAmmDynamicAllocation *MyGsAmmDynamicAllocations = NULL;
 
 static void gs_amm_backend_cleanup(int code, Datum arg);
 static void gs_amm_register_backend_cleanup(void);
-static void gs_amm_release_backend_grant(bool restore_work_mem);
+static void gs_amm_release_backend_grant(void);
 static void gs_amm_set_backpressure_reason_locked(GsAmmSharedState *state, const char *reason);
-static void gs_amm_controller_step_internal(
-    int ap_demand_mb, int tp_pressure, int io_pressure, char *status, Size status_size);
-static bool gs_amm_tp_drop_guard_hot_locked(GsAmmSharedState *state);
-static bool gs_amm_io_guard_hot_locked(GsAmmSharedState *state);
-static bool gs_amm_recovery_cooldown_hot_locked(GsAmmSharedState *state, TimestampTz now);
+static int64 gs_amm_blocks_to_mb(int blocks);
+static int gs_amm_effective_dynamic_target_mb(void);
+static bool gs_amm_prepare_dynamic_capacity(int ap_demand_mb);
+static void gs_amm_supply_ap_demand(void);
+static void gs_amm_process_ap_queue(void);
+static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_kb,
+    int one_pass_bound_kb, int multi_pass_bound_kb, int prediction_mb,
+    GsAmmGrantToken *grant_token, int *granted_kb, int *grant_granules);
+static void gs_amm_request_ap_stop_locked(GsAmmSharedState *state);
+static void gs_amm_restore_shared_buffer_after_ap_stop(GsAmmSharedState *state);
 static int gs_amm_current_active_buffer_blocks(GsAmmSharedState *state);
+static void gs_amm_resize_core(int target_blocks, GsAmmResizeOutcome *out);
+static void gs_amm_rebalance_ap_limits_locked(GsAmmSharedState *state);
+static int gs_amm_record_target_kb_locked(const GsAmmSharedState *state, const GsAmmApRecord *record);
+static GsAmmApRecord *gs_amm_select_ap_growth_candidate_locked(GsAmmSharedState *state);
+static bool gs_amm_active_ap_growth_pending_locked(GsAmmSharedState *state);
+static int gs_amm_grow_ap_dynamic_locked(GsAmmSharedState *state, GsAmmApRecord *record, int requested_mb);
+static int gs_amm_grow_ap_granule_locked(GsAmmSharedState *state, GsAmmApRecord *record, int requested_mb);
+static bool gs_amm_granule_owned_by_grant(const GsAmmGranuleMeta *granule, GsAmmGrantToken token);
+static uint64 gs_amm_granule_active_capacity_bytes(const GsAmmGranuleMeta *granule);
+static int gs_amm_reclaim_unused_ap_granules_locked(
+    GsAmmSharedState *state, int requested_mb, int required_granule_id, uint64 required_grant_id,
+    uint64 required_grant_generation);
 static bool gs_amm_pointer_in_granule(
     const GsAmmGranuleMeta *granule, const char *buffer_blocks, const char *pointer, uint64 size);
+static GsAmmApRecord *gs_amm_find_ap_record_locked(GsAmmSharedState *state, GsAmmGrantToken token);
+static void gs_amm_release_dynamic_allocations(GsAmmGrantToken token);
+static void gs_amm_cancel_waiting_request(void);
+static void gs_amm_release_unclaimed_queue_grant(GsAmmGrantToken token);
 
 static int gs_amm_configured_granule_mb(void)
 {
@@ -683,57 +831,9 @@ static void gs_amm_init_granule_table(GsAmmSharedState *state)
     gs_amm_refresh_granule_counts_locked(state);
 }
 
-static void gs_amm_reinitialize_granule_table_locked(GsAmmSharedState *state)
-{
-    int granule_blocks = state->granule_blocks;
-
-    for (int i = 0; i < state->total_granules; i++) {
-        GsAmmGranuleMeta *granule = &state->granules[i];
-        int first_buffer_id = i * granule_blocks;
-        int buffer_count = Min(granule_blocks, NORMAL_SHARED_BUFFER_NUM - first_buffer_id);
-
-        Assert(GsAmmGranuleCountersCanAdvance(granule->generation, granule->owner_epoch, true));
-        granule->state = GS_AMM_GRANULE_BUFFER_ACTIVE;
-        granule->generation++;
-        granule->owner_epoch++;
-        granule->drain_attempt = 0;
-        granule->scan_lease_attempt = 0;
-        granule->scan_inflight = false;
-        granule->reclaim_attempt = 0;
-        granule->reclaim_inflight = false;
-        granule->reclaim_retry_after = 0;
-        granule->grant_id = 0;
-        granule->grant_generation = 0;
-        granule->first_buffer_id = first_buffer_id;
-        granule->buffer_count = Max(buffer_count, 0);
-        granule->dirty_count = 0;
-        granule->pinned_count = 0;
-        granule->io_count = 0;
-        granule->hash_count = 0;
-        granule->reserved_granules = 0;
-        granule->active_grant_bytes = 0;
-        granule->used_bytes = 0;
-        granule->alloc_cursor_bytes = 0;
-        pg_atomic_write_u64(&granule->packed_state_epoch,
-            gs_amm_pack_granule_token(granule->state, granule->owner_epoch));
-    }
-    gs_amm_refresh_granule_counts_locked(state);
-}
-
 static double gs_amm_dtree_min_bound_kb(void)
 {
     return 64.0;
-}
-
-static double gs_amm_dtree_clamp_scale(double scale)
-{
-    if (!(scale > 0.0))
-        return 1.0;
-    if (scale < GS_AMM_DTREE_SCALE_MIN)
-        return GS_AMM_DTREE_SCALE_MIN;
-    if (scale > GS_AMM_DTREE_SCALE_MAX)
-        return GS_AMM_DTREE_SCALE_MAX;
-    return scale;
 }
 
 static double gs_amm_dtree_bound_kb(double value_mb)
@@ -746,148 +846,10 @@ static double gs_amm_dtree_bound_kb(double value_mb)
     return Max(value_kb, gs_amm_dtree_min_bound_kb());
 }
 
-static int gs_amm_dtree_leaf_slot_index(int64 model_version, int64 leaf_id)
-{
-    uint64 hash = (uint64)model_version * 1315423911ULL ^ (uint64)leaf_id;
-
-    return (int)(hash % GS_AMM_DTREE_CALIBRATION_TABLE_SIZE);
-}
-
-static GsAmmDtreeCalibrationLeafState *gs_amm_dtree_leaf_state_locked(
-    GsAmmSharedState *state, int64 model_version, int64 leaf_id, bool allow_replace)
-{
-    GsAmmDtreeCalibrationTable *table = &state->dtree_calibration_table;
-    GsAmmDtreeCalibrationLeafState *leaf = &table->leaves[gs_amm_dtree_leaf_slot_index(model_version, leaf_id)];
-    bool occupied = leaf->initialized;
-
-    if (!allow_replace && (!occupied || leaf->model_version != model_version || leaf->leaf_id != leaf_id))
-        return NULL;
-
-    if (occupied && (leaf->model_version != model_version || leaf->leaf_id != leaf_id)) {
-        if (!allow_replace)
-            return NULL;
-        table->feedback_sample_dropped++;
-        leaf->feedback_sample_dropped++;
-    }
-
-    if (!occupied || leaf->model_version != model_version || leaf->leaf_id != leaf_id) {
-        if (!occupied)
-            table->leaf_count++;
-        leaf->initialized = true;
-        leaf->model_version = model_version;
-        leaf->leaf_id = leaf_id;
-        leaf->calibration_version = table->calibration_version;
-        leaf->calibration_scale = table->calibration_scale > 0.0 ? table->calibration_scale : 1.0;
-        leaf->feedback_sample_count = 0;
-        leaf->feedback_sample_dropped = 0;
-        leaf->ewma_qerror = 0.0;
-        leaf->ewma_underpredict_rate = 0.0;
-        leaf->ewma_spill_mb = 0.0;
-        leaf->ewma_runtime_ms = 0.0;
-        leaf->last_observed_work_mem_kb = 0.0;
-        leaf->bad_update_count = 0;
-        leaf->rollback_count = 0;
-        leaf->frozen = false;
-        leaf->last_update_time = 0;
-        for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
-            leaf->last_raw_bounds_kb[i] = 0.0;
-            leaf->last_calibrated_bounds_kb[i] = 0.0;
-        }
-    }
-
-    return leaf;
-}
-
-static void gs_amm_init_dtree_state(GsAmmSharedState *state)
-{
-    errno_t rc;
-
-    rc = memset_s(&state->dtree_feedback_ring, sizeof(state->dtree_feedback_ring), 0,
-        sizeof(state->dtree_feedback_ring));
-    securec_check(rc, "\0", "\0");
-    rc = memset_s(&state->dtree_calibration_table, sizeof(state->dtree_calibration_table), 0,
-        sizeof(state->dtree_calibration_table));
-    securec_check(rc, "\0", "\0");
-    state->dtree_calibration_table.calibration_version = 1;
-    state->dtree_calibration_table.calibration_scale = 1.0;
-    state->dtree_calibration_table.calibration_update_count = 0;
-    state->dtree_calibration_table.rollback_count = 0;
-    state->dtree_calibration_table.frozen_leaf_count = 0;
-    state->dtree_calibration_table.leaf_count = 0;
-}
-
 static void gs_amm_init_runtime_config(GsAmmSharedState *state)
 {
     state->runtime_config.config_version = 1;
     state->runtime_config.amm_enabled = gs_amm_enabled;
-    state->runtime_config.runtime_override_active = false;
-    state->runtime_config.allocator_only_mode = gs_amm_allocator_only_mode;
-    state->runtime_config.allocator_only_grant_mb = gs_amm_allocator_only_grant_mb;
-    state->runtime_config.feedback_only = gs_amm_feedback_only_mode;
-    state->runtime_config.feedback_bootstrap_grant_mb = gs_amm_feedback_bootstrap_grant_mb;
-    state->runtime_config.feedback_max_grant_mb = gs_amm_feedback_max_grant_mb;
-    state->runtime_config.feedback_initial_ap_slots = gs_amm_feedback_initial_ap_slots;
-    state->runtime_config.feedback_max_ap_slots = gs_amm_feedback_max_ap_slots;
-    state->runtime_config.feedback_stable_windows = gs_amm_feedback_stable_windows;
-    state->runtime_config.feedback_spill_threshold_mb = gs_amm_feedback_spill_threshold_mb;
-    state->runtime_config.dtree_calibration_enabled = gs_amm_dtree_calibration_enabled;
-    state->runtime_config.dtree_record_only = gs_amm_dtree_record_only;
-}
-
-static void gs_amm_runtime_config_snapshot_locked(GsAmmSharedState *state, GsAmmRuntimeConfig *config)
-{
-    *config = state->runtime_config;
-    if (!config->runtime_override_active) {
-        config->allocator_only_mode = gs_amm_allocator_only_mode;
-        config->allocator_only_grant_mb = gs_amm_allocator_only_grant_mb;
-        config->feedback_only = gs_amm_feedback_only_mode;
-        config->feedback_bootstrap_grant_mb = gs_amm_feedback_bootstrap_grant_mb;
-        config->feedback_max_grant_mb = gs_amm_feedback_max_grant_mb;
-        config->feedback_initial_ap_slots = gs_amm_feedback_initial_ap_slots;
-        config->feedback_max_ap_slots = gs_amm_feedback_max_ap_slots;
-        config->feedback_stable_windows = gs_amm_feedback_stable_windows;
-        config->feedback_spill_threshold_mb = gs_amm_feedback_spill_threshold_mb;
-        config->dtree_calibration_enabled = gs_amm_dtree_calibration_enabled;
-        config->dtree_record_only = gs_amm_dtree_record_only;
-    }
-}
-
-static void gs_amm_runtime_config_snapshot(GsAmmSharedState *state, GsAmmRuntimeConfig *config)
-{
-    SpinLockAcquire(&state->mutex);
-    gs_amm_runtime_config_snapshot_locked(state, config);
-    SpinLockRelease(&state->mutex);
-}
-
-static bool gs_amm_update_runtime_override_locked(GsAmmSharedState *state, bool allocator_only_mode,
-    int allocator_only_grant_mb, bool calibration_enabled, bool record_only)
-{
-    if (state->runtime_config.config_version == PG_UINT64_MAX)
-        return false;
-
-    state->runtime_config.runtime_override_active = true;
-    state->runtime_config.allocator_only_mode = allocator_only_mode;
-    state->runtime_config.allocator_only_grant_mb = allocator_only_grant_mb;
-    state->runtime_config.dtree_calibration_enabled = calibration_enabled;
-    state->runtime_config.dtree_record_only = record_only;
-    state->runtime_config.config_version++;
-    return true;
-}
-
-static void gs_amm_copy_feedback_action_locked(GsAmmSharedState *state, const char *action)
-{
-    int rc = snprintf_s(state->feedback_last_action, sizeof(state->feedback_last_action),
-        sizeof(state->feedback_last_action) - 1, "%s", action == NULL ? "none" : action);
-
-    securec_check_ss(rc, "\0", "\0");
-}
-
-static void gs_amm_reset_feedback_controller_locked(GsAmmSharedState *state, const GsAmmRuntimeConfig *config)
-{
-    state->feedback_current_grant_mb = Max(config->feedback_bootstrap_grant_mb, 1);
-    state->feedback_ap_slot_limit = Max(config->feedback_initial_ap_slots, 1);
-    state->feedback_stable_windows = 0;
-    gs_amm_copy_feedback_action_locked(state, "config_reset");
 }
 
 void GsAmmShmemInit(void)
@@ -899,24 +861,18 @@ void GsAmmShmemInit(void)
         errno_t rc = memset_s(GsAmmState, GsAmmShmemSize(), 0, GsAmmShmemSize());
         securec_check(rc, "\0", "\0");
         SpinLockInit(&GsAmmState->mutex);
-        pg_atomic_init_u64(&GsAmmState->tp_commit_count, 0);
-        pg_atomic_init_u64(&GsAmmState->shared_buffer_read_miss_count, 0);
-        pg_atomic_init_u64(&GsAmmState->shared_buffer_physical_read_count, 0);
-        pg_atomic_init_u64(&GsAmmState->dirty_page_count, 0);
-        pg_atomic_init_u64(&GsAmmState->pending_writeback_page_count, 0);
-        pg_atomic_init_u64(&GsAmmState->writeback_flush_completed_pages, 0);
-        pg_atomic_init_u64(&GsAmmState->pending_writeback_retire_underflow_count, 0);
-        pg_atomic_init_u64(&GsAmmState->ap_temp_spill_bytes, 0);
-        pg_atomic_init_u64(&GsAmmState->ap_temp_spill_events, 0);
-        pg_atomic_init_u64(&GsAmmState->ap_hash_multipass_count, 0);
-        GsAmmState->dynamic_target_mb = gs_amm_dynamic_target_mb;
+        GsAmmState->dynamic_target_mb = gs_amm_effective_dynamic_target_mb();
+        GsAmmState->stage = GS_AMM_STAGE_CACHE;
         GsAmmState->last_action = GS_AMM_OBSERVE;
         gs_amm_init_runtime_config(GsAmmState);
-        GsAmmState->feedback_current_grant_mb = Max(gs_amm_feedback_bootstrap_grant_mb, 1);
-        GsAmmState->feedback_ap_slot_limit = Max(gs_amm_feedback_initial_ap_slots, 1);
-        GsAmmState->feedback_last_action[0] = '\0';
-        gs_amm_init_dtree_state(GsAmmState);
         gs_amm_init_granule_table(GsAmmState);
+        GsAmmState->baseline_active_mb = (int)gs_amm_blocks_to_mb(StrategyActiveBufferCount());
+        GsAmmState->tp_pressure_state = GS_AMM_TP_PRESSURE_UNKNOWN;
+        GsAmmState->tp_pressure_valid = false;
+        GsAmmState->tp_recovery_phase = GS_AMM_TP_RECOVERY_IDLE;
+        GsAmmState->ap_multipass_only = false;
+        (void)snprintf_s(GsAmmState->last_supply_source, sizeof(GsAmmState->last_supply_source),
+            sizeof(GsAmmState->last_supply_source) - 1, "%s", "none");
     }
 }
 
@@ -925,63 +881,6 @@ static GsAmmSharedState *gs_amm_get_state(void)
     if (GsAmmState == NULL)
         GsAmmShmemInit();
     return GsAmmState;
-}
-
-void GsAmmOnRuntimeConfigGucReload(bool allocator_only_mode, int allocator_only_grant_mb,
-    bool calibration_enabled, bool record_only)
-{
-    GsAmmSharedState *state = GsAmmState;
-
-    if (state == NULL)
-        return;
-
-    SpinLockAcquire(&state->mutex);
-    state->runtime_config.runtime_override_active = false;
-    state->runtime_config.allocator_only_mode = allocator_only_mode;
-    state->runtime_config.allocator_only_grant_mb = allocator_only_grant_mb;
-    state->runtime_config.dtree_calibration_enabled = calibration_enabled;
-    state->runtime_config.dtree_record_only = record_only;
-    if (state->runtime_config.config_version != PG_UINT64_MAX)
-        state->runtime_config.config_version++;
-    else
-        state->illegal_transition_count++;
-    SpinLockRelease(&state->mutex);
-}
-
-void GsAmmOnFeedbackConfigGucReload(bool feedback_only_mode, int bootstrap_grant_mb,
-    int max_grant_mb, int initial_ap_slots, int max_ap_slots, int stable_windows, int spill_threshold_mb)
-{
-    GsAmmSharedState *state = GsAmmState;
-    bool reset_controller;
-
-    if (state == NULL)
-        return;
-
-    SpinLockAcquire(&state->mutex);
-    reset_controller = state->runtime_config.feedback_only != feedback_only_mode ||
-        state->runtime_config.feedback_bootstrap_grant_mb != bootstrap_grant_mb ||
-        state->runtime_config.feedback_initial_ap_slots != initial_ap_slots;
-    state->runtime_config.runtime_override_active = false;
-    state->runtime_config.feedback_only = feedback_only_mode;
-    state->runtime_config.feedback_bootstrap_grant_mb = bootstrap_grant_mb;
-    state->runtime_config.feedback_max_grant_mb = Max(max_grant_mb, bootstrap_grant_mb);
-    state->runtime_config.feedback_initial_ap_slots = initial_ap_slots;
-    state->runtime_config.feedback_max_ap_slots = Max(max_ap_slots, initial_ap_slots);
-    state->runtime_config.feedback_stable_windows = stable_windows;
-    state->runtime_config.feedback_spill_threshold_mb = spill_threshold_mb;
-    if (reset_controller)
-        gs_amm_reset_feedback_controller_locked(state, &state->runtime_config);
-    else {
-        state->feedback_current_grant_mb = Min(state->runtime_config.feedback_max_grant_mb,
-            Max(state->runtime_config.feedback_bootstrap_grant_mb, state->feedback_current_grant_mb));
-        state->feedback_ap_slot_limit = Min(state->runtime_config.feedback_max_ap_slots,
-            Max(1, state->feedback_ap_slot_limit));
-    }
-    if (state->runtime_config.config_version != PG_UINT64_MAX)
-        state->runtime_config.config_version++;
-    else
-        state->illegal_transition_count++;
-    SpinLockRelease(&state->mutex);
 }
 
 bool GsAmmOperationBegin(void)
@@ -1016,58 +915,15 @@ void gs_amm_dtree_detail(
     int64 leaf_id,
     GsAmmDtreeDetail *detail)
 {
-    GsAmmSharedState *state = gs_amm_get_state();
     double raw_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double calibrated_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double scale = 1.0;
-    int64 calibration_version = 0;
-    bool calibration_enabled;
-    bool record_only;
-    bool apply_calibration;
-    GsAmmRuntimeConfig runtime_config;
-    GsAmmDtreeCalibrationLeafState *leaf = NULL;
 
     for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++)
         raw_bounds_kb[i] = gs_amm_dtree_bound_kb(raw_bounds_mb[i]);
 
-    SpinLockAcquire(&state->mutex);
-    gs_amm_runtime_config_snapshot_locked(state, &runtime_config);
-    calibration_enabled = runtime_config.dtree_calibration_enabled;
-    record_only = runtime_config.dtree_record_only;
-    apply_calibration = calibration_enabled && !record_only;
-    if (apply_calibration) {
-        scale = gs_amm_dtree_clamp_scale(state->dtree_calibration_table.calibration_scale);
-        calibration_version = state->dtree_calibration_table.calibration_version;
-        leaf = gs_amm_dtree_leaf_state_locked(state, model_version, leaf_id, false);
-        if (leaf != NULL && leaf->calibration_scale > 0.0) {
-            scale = gs_amm_dtree_clamp_scale(leaf->calibration_scale);
-            calibration_version = leaf->calibration_version;
-        }
-    }
-    SpinLockRelease(&state->mutex);
-
-    if (!apply_calibration) {
-        scale = 1.0;
-        calibration_version = 0;
-    }
-
     detail->model_version = model_version;
     detail->leaf_id = leaf_id;
-    detail->calibration_version = calibration_version;
-    detail->calibration_scale = scale;
-
-    if (!apply_calibration) {
-        for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++)
-            calibrated_bounds_kb[i] = raw_bounds_kb[i];
-    } else {
-        calibrated_bounds_kb[2] = Max(raw_bounds_kb[2] * scale, gs_amm_dtree_min_bound_kb());
-        calibrated_bounds_kb[1] = Max(raw_bounds_kb[1] * scale, calibrated_bounds_kb[2]);
-        calibrated_bounds_kb[0] = Max(raw_bounds_kb[0] * scale, calibrated_bounds_kb[1]);
-    }
-
     for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
-        detail->raw_bounds_kb[i] = raw_bounds_kb[i];
-        detail->calibrated_bounds_kb[i] = calibrated_bounds_kb[i];
+        detail->bounds_kb[i] = raw_bounds_kb[i];
     }
 }
 
@@ -1162,303 +1018,6 @@ bool GsAmmBufferNumberIsActive(Buffer buffer)
     return buffer != InvalidBuffer && GsAmmBufferIdIsActive((int)buffer - 1);
 }
 
-static void gs_amm_enqueue_dtree_feedback_locked(
-    GsAmmSharedState *state,
-    const double raw_bounds_kb[GS_AMM_DTREE_BOUND_COUNT],
-    const double calibrated_bounds_kb[GS_AMM_DTREE_BOUND_COUNT],
-    uint64 session_id,
-    int64 model_version,
-    int64 leaf_id,
-    double observed_work_mem_kb,
-    double runtime_ms,
-    double spill_mb,
-    uint64 spill_bytes,
-    uint32 spill_files,
-    uint32 spill_events,
-    int hash_nbatch,
-    int hash_multipass_count,
-    double grant_mb,
-    double tp_drop_ratio,
-    double io_pressure,
-    bool backpressure,
-    bool error,
-    bool measurement_valid,
-    int64 sample_time)
-{
-    GsAmmDtreeFeedbackRing *ring = &state->dtree_feedback_ring;
-    GsAmmDtreeCalibrationTable *table = &state->dtree_calibration_table;
-    GsAmmDtreeCalibrationLeafState *leaf;
-    GsAmmDtreeFeedbackSample *sample;
-    int slot;
-
-    slot = (int)(ring->next_sample_id % GS_AMM_DTREE_FEEDBACK_RING_SIZE);
-    if (ring->feedback_sample_count >= GS_AMM_DTREE_FEEDBACK_RING_SIZE)
-        ring->feedback_sample_dropped++;
-
-    sample = &ring->samples[slot];
-    sample->sample_id = ring->next_sample_id++;
-    sample->session_id = session_id;
-    sample->model_version = model_version;
-    sample->leaf_id = leaf_id;
-    leaf = gs_amm_dtree_leaf_state_locked(state, model_version, leaf_id, false);
-    sample->calibration_version = leaf != NULL ? leaf->calibration_version : table->calibration_version;
-    sample->calibration_scale = leaf != NULL ? leaf->calibration_scale : table->calibration_scale;
-    for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
-        sample->raw_bounds_kb[i] = raw_bounds_kb[i];
-        sample->calibrated_bounds_kb[i] = calibrated_bounds_kb[i];
-    }
-    sample->observed_work_mem_kb = observed_work_mem_kb;
-    sample->runtime_ms = runtime_ms;
-    sample->spill_mb = spill_mb;
-    sample->spill_bytes = spill_bytes;
-    sample->spill_files = spill_files;
-    sample->spill_events = spill_events;
-    sample->hash_nbatch = hash_nbatch;
-    sample->hash_multipass_count = hash_multipass_count;
-    sample->grant_mb = grant_mb;
-    sample->tp_drop_ratio = tp_drop_ratio;
-    sample->io_pressure = io_pressure;
-    sample->backpressure = backpressure;
-    sample->error = error;
-    sample->measurement_valid = measurement_valid;
-    sample->sample_time = sample_time;
-    ring->feedback_sample_count++;
-    table->feedback_sample_count++;
-}
-
-static void gs_amm_apply_dtree_feedback_locked(
-    GsAmmSharedState *state, const GsAmmDtreeFeedbackSample *sample)
-{
-    GsAmmDtreeCalibrationTable *table = &state->dtree_calibration_table;
-    GsAmmDtreeCalibrationLeafState *leaf;
-    double target_scale;
-    double current_scale;
-    double next_scale;
-    double spill_target_scale;
-    double qerror;
-    double underpredict_rate;
-    bool tp_guard_hot;
-    bool io_guard_hot;
-    GsAmmRuntimeConfig runtime_config;
-
-    leaf = gs_amm_dtree_leaf_state_locked(state, sample->model_version, sample->leaf_id, true);
-    if (leaf == NULL)
-        return;
-
-    if (sample->error || sample->backpressure || !sample->measurement_valid) {
-        leaf->bad_update_count++;
-        if (sample->error)
-            leaf->rollback_count++;
-        return;
-    }
-
-    leaf->feedback_sample_count++;
-    leaf->last_observed_work_mem_kb = sample->observed_work_mem_kb;
-    leaf->ewma_runtime_ms = leaf->ewma_runtime_ms > 0.0 ?
-        leaf->ewma_runtime_ms * 0.8 + sample->runtime_ms * 0.2 : sample->runtime_ms;
-    leaf->ewma_spill_mb = leaf->ewma_spill_mb > 0.0 ?
-        leaf->ewma_spill_mb * 0.8 + sample->spill_mb * 0.2 : sample->spill_mb;
-    qerror = 1.0;
-    if (sample->observed_work_mem_kb > 0.0 && sample->raw_bounds_kb[0] > 0.0) {
-        double under = sample->observed_work_mem_kb / sample->raw_bounds_kb[0];
-        double over = sample->raw_bounds_kb[0] / Max(sample->observed_work_mem_kb, 1.0);
-
-        qerror = Max(under, over);
-    }
-    leaf->ewma_qerror = leaf->ewma_qerror > 0.0 ? leaf->ewma_qerror * 0.8 + qerror * 0.2 : qerror;
-    underpredict_rate = (sample->spill_mb > 0.0 ||
-        sample->observed_work_mem_kb > sample->calibrated_bounds_kb[0]) ? 1.0 : 0.0;
-    leaf->ewma_underpredict_rate = leaf->ewma_underpredict_rate > 0.0 ?
-        leaf->ewma_underpredict_rate * 0.8 + underpredict_rate * 0.2 : underpredict_rate;
-    for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
-        leaf->last_raw_bounds_kb[i] = sample->raw_bounds_kb[i];
-        leaf->last_calibrated_bounds_kb[i] = sample->calibrated_bounds_kb[i];
-    }
-    leaf->last_update_time = sample->sample_time;
-
-    gs_amm_runtime_config_snapshot_locked(state, &runtime_config);
-    if (!runtime_config.dtree_calibration_enabled || runtime_config.dtree_record_only)
-        return;
-    tp_guard_hot = gs_amm_tp_drop_guard_hot_locked(state);
-    io_guard_hot = gs_amm_io_guard_hot_locked(state);
-    if (sample->tp_drop_ratio >= gs_amm_tp_jitter_limit || tp_guard_hot) {
-        table->rollback_count++;
-        if (!leaf->frozen) {
-            leaf->frozen = true;
-            table->frozen_leaf_count++;
-        }
-        leaf->rollback_count++;
-        return;
-    }
-    if (!(sample->observed_work_mem_kb > 0.0) || !(sample->raw_bounds_kb[0] > 0.0))
-        return;
-    if (leaf->frozen || leaf->feedback_sample_count < GS_AMM_DTREE_MIN_CALIBRATION_SAMPLES)
-        return;
-
-    target_scale = gs_amm_dtree_clamp_scale(sample->observed_work_mem_kb / sample->raw_bounds_kb[0]);
-    spill_target_scale = gs_amm_dtree_clamp_scale(
-        (sample->observed_work_mem_kb + sample->spill_mb * 1024.0 * GS_AMM_DTREE_SPILL_MEMORY_EQUIVALENT) /
-            sample->raw_bounds_kb[0]);
-    if (sample->spill_mb > 0.0)
-        target_scale = Max(target_scale, spill_target_scale);
-    current_scale = gs_amm_dtree_clamp_scale(leaf->calibration_scale);
-    if (sample->spill_mb > 0.0 || sample->observed_work_mem_kb > sample->calibrated_bounds_kb[0])
-        target_scale = Max(current_scale, target_scale);
-    else
-        target_scale = Min(current_scale, target_scale);
-    if (sample->io_pressure >= (double)gs_amm_io_pressure_guard || io_guard_hot)
-        target_scale = Max(target_scale, current_scale);
-    if (sample->grant_mb > 0.0 && sample->observed_work_mem_kb < sample->grant_mb * 1024.0 * 0.5)
-        target_scale = Min(target_scale, current_scale);
-
-    next_scale = gs_amm_dtree_clamp_scale(current_scale * 0.8 + target_scale * 0.2);
-    if (next_scale != current_scale) {
-        table->calibration_version++;
-        table->calibration_update_count++;
-        leaf->calibration_scale = next_scale;
-        leaf->calibration_version = table->calibration_version;
-    }
-}
-
-void GsAmmDtreeCalibrationTick(void)
-{
-    if (!gs_amm_enabled)
-        return;
-
-    GsAmmSharedState *state = gs_amm_get_state();
-    GsAmmDtreeFeedbackRing *ring;
-    TimestampTz now = GetCurrentTimestamp();
-    uint64 oldest_sample_id;
-    int processed = 0;
-
-    SpinLockAcquire(&state->mutex);
-    ring = &state->dtree_feedback_ring;
-    if (ring->last_calibration_tick > 0 &&
-        now - ring->last_calibration_tick < (TimestampTz)GS_AMM_DTREE_CALIBRATION_TICK_MS * 1000) {
-        SpinLockRelease(&state->mutex);
-        return;
-    }
-    ring->last_calibration_tick = now;
-    oldest_sample_id = ring->next_sample_id > GS_AMM_DTREE_FEEDBACK_RING_SIZE ?
-        ring->next_sample_id - GS_AMM_DTREE_FEEDBACK_RING_SIZE : 0;
-    if (ring->next_calibration_sample_id < oldest_sample_id) {
-        ring->calibration_sample_dropped += oldest_sample_id - ring->next_calibration_sample_id;
-        ring->next_calibration_sample_id = oldest_sample_id;
-    }
-    while (ring->next_calibration_sample_id < ring->next_sample_id &&
-        processed < GS_AMM_DTREE_CALIBRATION_MAX_SAMPLES) {
-        GsAmmDtreeFeedbackSample *sample =
-            &ring->samples[ring->next_calibration_sample_id % GS_AMM_DTREE_FEEDBACK_RING_SIZE];
-
-        if (sample->sample_id != ring->next_calibration_sample_id) {
-            ring->calibration_sample_dropped++;
-            ring->next_calibration_sample_id++;
-            continue;
-        }
-        ring->next_calibration_sample_id++;
-        gs_amm_apply_dtree_feedback_locked(state, sample);
-        processed++;
-    }
-    SpinLockRelease(&state->mutex);
-}
-
-static void gs_amm_apply_feedback_only_completion_locked(GsAmmSharedState *state,
-    const GsAmmFeedbackRecord *feedback)
-{
-    GsAmmRuntimeConfig runtime_config;
-    bool hard_pressure;
-    int granule_mb;
-
-    gs_amm_runtime_config_snapshot_locked(state, &runtime_config);
-    if (!runtime_config.feedback_only || !feedback->feedback_only)
-        return;
-
-    state->feedback_completed_count++;
-    state->feedback_ewma_runtime_ms = state->feedback_ewma_runtime_ms > 0.0 ?
-        state->feedback_ewma_runtime_ms * 0.8 + feedback->runtime_ms * 0.2 : feedback->runtime_ms;
-    state->feedback_ewma_spill_mb = state->feedback_ewma_spill_mb > 0.0 ?
-        state->feedback_ewma_spill_mb * 0.8 + feedback->spill_mb * 0.2 : feedback->spill_mb;
-    state->feedback_ewma_peak_mb = state->feedback_ewma_peak_mb > 0.0 ?
-        state->feedback_ewma_peak_mb * 0.8 + feedback->observed_work_mem_kb / 1024.0 * 0.2 :
-        feedback->observed_work_mem_kb / 1024.0;
-    if (!feedback->measurement_valid || feedback->backpressure) {
-        gs_amm_copy_feedback_action_locked(state, "ignored");
-        return;
-    }
-
-    hard_pressure = feedback->error || feedback->spill_mb >= runtime_config.feedback_spill_threshold_mb ||
-        feedback->tp_drop_ratio >= gs_amm_tp_jitter_limit || gs_amm_tp_drop_guard_hot_locked(state) ||
-        gs_amm_io_guard_hot_locked(state);
-    granule_mb = Max(state->granule_mb, 1);
-    if (hard_pressure) {
-        state->feedback_ap_slot_limit = Max(1, state->feedback_ap_slot_limit / 2);
-        state->feedback_current_grant_mb = Max(runtime_config.feedback_bootstrap_grant_mb,
-            ((Max(state->feedback_current_grant_mb / 2, 1) + granule_mb - 1) / granule_mb) * granule_mb);
-        state->feedback_stable_windows = 0;
-        state->feedback_backoff_count++;
-        gs_amm_copy_feedback_action_locked(state, "backoff");
-        return;
-    }
-
-    state->feedback_stable_windows++;
-    if (state->feedback_stable_windows < Max(runtime_config.feedback_stable_windows, 1)) {
-        gs_amm_copy_feedback_action_locked(state, "stable");
-        return;
-    }
-
-    state->feedback_stable_windows = 0;
-    state->feedback_ap_slot_limit = Min(runtime_config.feedback_max_ap_slots,
-        state->feedback_ap_slot_limit + 1);
-    state->feedback_current_grant_mb = Min(runtime_config.feedback_max_grant_mb,
-        state->feedback_current_grant_mb + granule_mb);
-    state->feedback_growth_count++;
-    gs_amm_copy_feedback_action_locked(state, "grow");
-}
-
-void GsAmmRecordFeedback(const GsAmmFeedbackRecord *feedback)
-{
-    GsAmmFeedbackRecord normalized;
-    GsAmmSharedState *state;
-
-    if (!gs_amm_enabled || feedback == NULL)
-        return;
-
-    normalized = *feedback;
-    for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
-        if (!(normalized.raw_bounds_kb[i] > 0.0))
-            normalized.raw_bounds_kb[i] = 0.0;
-        if (!(normalized.calibrated_bounds_kb[i] > 0.0))
-            normalized.calibrated_bounds_kb[i] = 0.0;
-    }
-    if (!(normalized.observed_work_mem_kb > 0.0))
-        normalized.observed_work_mem_kb = 0.0;
-    if (!(normalized.runtime_ms > 0.0))
-        normalized.runtime_ms = 0.0;
-    if (!(normalized.spill_mb > 0.0))
-        normalized.spill_mb = 0.0;
-    if (!(normalized.grant_mb > 0.0))
-        normalized.grant_mb = 0.0;
-    if (!(normalized.tp_drop_ratio > 0.0))
-        normalized.tp_drop_ratio = 0.0;
-    normalized.tp_drop_ratio = Min(normalized.tp_drop_ratio, 1.0);
-    if (!(normalized.io_pressure > 0.0))
-        normalized.io_pressure = 0.0;
-    normalized.io_pressure = Min(normalized.io_pressure, 100.0);
-
-    state = gs_amm_get_state();
-    SpinLockAcquire(&state->mutex);
-    gs_amm_apply_feedback_only_completion_locked(state, &normalized);
-    if (!normalized.feedback_only) {
-        gs_amm_enqueue_dtree_feedback_locked(state, normalized.raw_bounds_kb, normalized.calibrated_bounds_kb,
-            normalized.session_id, normalized.model_version, normalized.leaf_id, normalized.observed_work_mem_kb,
-            normalized.runtime_ms,
-            normalized.spill_mb, normalized.spill_bytes, normalized.spill_files, normalized.spill_events,
-            normalized.hash_nbatch,
-            normalized.hash_multipass_count, normalized.grant_mb, normalized.tp_drop_ratio, normalized.io_pressure,
-            normalized.backpressure, normalized.error, normalized.measurement_valid, (int64)GetCurrentTimestamp());
-    }
-    SpinLockRelease(&state->mutex);
-}
 
 void GsAmmRecordNativeEligible(void)
 {
@@ -1513,155 +1072,8 @@ void GsAmmRecordNativeAdmission(const GsAmmDtreeDetail *detail, const GsAmmAdmis
     state->native_current_memory_mode = result->memory_mode;
     state->native_current_model_version = detail->model_version;
     state->native_current_leaf_id = detail->leaf_id;
-    state->native_current_calibration_version = detail->calibration_version;
-    state->native_current_calibration_scale = detail->calibration_scale;
-    for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
-        state->native_current_raw_bounds_kb[i] = detail->raw_bounds_kb[i];
-        state->native_current_calibrated_bounds_kb[i] = detail->calibrated_bounds_kb[i];
-    }
     gs_amm_copy_admission_reason(state->native_last_reason, result->reason);
     SpinLockRelease(&state->mutex);
-}
-
-void GsAmmRecordNativeErrorCleanup(void)
-{
-    GsAmmSharedState *state = gs_amm_get_state();
-
-    SpinLockAcquire(&state->mutex);
-    state->native_error_cleanup_count++;
-    SpinLockRelease(&state->mutex);
-}
-
-void GsAmmRecordTransactionCommit(void)
-{
-    if (!gs_amm_enabled) {
-        MyGsAmmTransactionHasNativeAP = false;
-        return;
-    }
-
-    GsAmmSharedState *state;
-
-    if (MyGsAmmTransactionHasNativeAP) {
-        MyGsAmmTransactionHasNativeAP = false;
-        return;
-    }
-
-    state = gs_amm_get_state();
-    pg_atomic_fetch_add_u64(&state->tp_commit_count, 1);
-}
-
-void GsAmmRecordTransactionAbort(void)
-{
-    MyGsAmmTransactionHasNativeAP = false;
-}
-
-void GsAmmRecordSharedBufferReadMiss(void)
-{
-    if (!gs_amm_enabled)
-        return;
-
-    GsAmmSharedState *state = gs_amm_get_state();
-
-    pg_atomic_fetch_add_u64(&state->shared_buffer_read_miss_count, 1);
-}
-
-void GsAmmRecordSharedBufferPhysicalRead(void)
-{
-    if (!gs_amm_enabled)
-        return;
-
-    GsAmmSharedState *state = gs_amm_get_state();
-
-    pg_atomic_fetch_add_u64(&state->shared_buffer_physical_read_count, 1);
-}
-
-static void gs_amm_saturating_subtract_u64(
-    pg_atomic_uint64 *counter, uint64 amount, pg_atomic_uint64 *underflow_counter)
-{
-    uint64 previous = pg_atomic_read_u64(counter);
-
-    while (previous > 0) {
-        uint64 next = previous > amount ? previous - amount : 0;
-
-        if (pg_atomic_compare_exchange_u64(counter, &previous, next)) {
-            if (previous < amount)
-                pg_atomic_fetch_add_u64(underflow_counter, 1);
-            return;
-        }
-    }
-    if (amount > 0)
-        pg_atomic_fetch_add_u64(underflow_counter, 1);
-}
-
-void GsAmmRecordApSpill(uint64 spill_bytes, uint32 spill_count)
-{
-    if (!gs_amm_enabled)
-        return;
-
-    GsAmmSharedState *state = gs_amm_get_state();
-
-    if (spill_bytes > 0)
-        pg_atomic_fetch_add_u64(&state->ap_temp_spill_bytes, spill_bytes);
-    if (spill_count > 0)
-        pg_atomic_fetch_add_u64(&state->ap_temp_spill_events, spill_count);
-}
-
-void GsAmmRecordApExecutionSignals(uint64 spill_bytes, uint32 spill_count, int hash_multipass_count)
-{
-    if (!gs_amm_enabled)
-        return;
-
-    GsAmmRecordApSpill(spill_bytes, spill_count);
-    if (hash_multipass_count > 0) {
-        GsAmmSharedState *state = gs_amm_get_state();
-
-        pg_atomic_fetch_add_u64(&state->ap_hash_multipass_count, (uint64)hash_multipass_count);
-    }
-}
-
-void GsAmmRecordPendingWritebackEnqueue(uint32 pages)
-{
-    if (!gs_amm_enabled || pages == 0)
-        return;
-
-    pg_atomic_fetch_add_u64(&gs_amm_get_state()->pending_writeback_page_count, pages);
-}
-
-void GsAmmRecordPendingWritebackRetire(uint32 pages)
-{
-    if (!gs_amm_enabled || pages == 0)
-        return;
-
-    GsAmmSharedState *state = gs_amm_get_state();
-
-    gs_amm_saturating_subtract_u64(
-        &state->pending_writeback_page_count, pages, &state->pending_writeback_retire_underflow_count);
-}
-
-void GsAmmRecordWritebackFlushComplete(uint32 pages)
-{
-    if (!gs_amm_enabled || pages == 0)
-        return;
-
-    pg_atomic_fetch_add_u64(&gs_amm_get_state()->writeback_flush_completed_pages, pages);
-}
-
-void GsAmmRecordDirtyPageEnqueue(void)
-{
-    if (!gs_amm_enabled)
-        return;
-
-    pg_atomic_fetch_add_u64(&gs_amm_get_state()->dirty_page_count, 1);
-}
-
-void GsAmmRecordDirtyPageDequeue(void)
-{
-    if (!gs_amm_enabled)
-        return;
-
-    GsAmmSharedState *state = gs_amm_get_state();
-
-    gs_amm_saturating_subtract_u64(&state->dirty_page_count, 1, &state->pending_writeback_retire_underflow_count);
 }
 
 static void gs_amm_summarize_granules_locked(GsAmmSharedState *state, GsAmmGranuleSummary *summary)
@@ -1703,103 +1115,6 @@ static void gs_amm_summarize_granules_locked(GsAmmSharedState *state, GsAmmGranu
                 break;
         }
     }
-}
-
-static uint64 gs_amm_check_granule_invariants_locked(GsAmmSharedState *state)
-{
-    uint64 violations = 0;
-
-    for (int i = 0; i < state->total_granules; i++) {
-        int first_buffer_id;
-        int buffer_count;
-        uint32 owner_epoch;
-        GsAmmGranuleState granule_state;
-        bool verify;
-        uint64 granule_violations = 0;
-
-        SpinLockAcquire(&state->mutex);
-        const GsAmmGranuleMeta *granule = &state->granules[i];
-        granule_state = granule->state;
-        owner_epoch = granule->owner_epoch;
-        first_buffer_id = granule->first_buffer_id;
-        buffer_count = granule->buffer_count;
-        verify = granule_state == GS_AMM_GRANULE_FREE ||
-            granule_state == GS_AMM_GRANULE_AP_RESERVED ||
-            granule_state == GS_AMM_GRANULE_AP_ACTIVE;
-        SpinLockRelease(&state->mutex);
-        if (!verify)
-            continue;
-
-        for (int offset = 0; offset < buffer_count; offset++) {
-            BufferDesc *buf = GetBufferDescriptor(first_buffer_id + offset);
-            uint64 buf_state = pg_atomic_read_u64(&buf->state);
-
-            if (buf_state & (BM_VALID | BM_TAG_VALID))
-                granule_violations++;
-        }
-
-        SpinLockAcquire(&state->mutex);
-        granule = &state->granules[i];
-        if (granule->state == granule_state && granule->owner_epoch == owner_epoch)
-            violations += granule_violations;
-        SpinLockRelease(&state->mutex);
-    }
-    return violations;
-}
-
-static void gs_amm_record_pool_event_locked(GsAmmSharedState *state, GsAmmAction action,
-    const char *reason, const GsAmmGranuleSummary *before, TimestampTz started)
-{
-    GsAmmGranuleSummary after;
-    TimestampTz now;
-    int64 elapsed_us;
-    int reason_rc;
-
-    if (state == NULL || before == NULL)
-        return;
-    if (state->next_pool_event_id == PG_UINT64_MAX) {
-        state->illegal_transition_count++;
-        return;
-    }
-
-    now = GetCurrentTimestamp();
-    gs_amm_summarize_granules_locked(state, &after);
-    state->next_pool_event_id++;
-    state->last_pool_event_id = state->next_pool_event_id;
-    state->last_pool_event_time = now;
-    state->last_pool_event_action = action;
-    elapsed_us = now > started ? now - started : 0;
-    state->last_pool_event_duration_ms =
-        elapsed_us / 1000 > INT_MAX ? INT_MAX : (int)(elapsed_us / 1000);
-    state->last_pool_event_before = *before;
-    state->last_pool_event_after = after;
-    reason_rc = snprintf_s(state->last_pool_event_reason, sizeof(state->last_pool_event_reason),
-        sizeof(state->last_pool_event_reason) - 1, "%s", reason == NULL ? "none" : reason);
-    securec_check_ss(reason_rc, "\0", "\0");
-}
-
-static bool gs_amm_state_can_reset_locked(const GsAmmSharedState *state)
-{
-    if (state->active_ap_count > 0 || state->dynamic_used_mb > 0 || state->ap_queue_len > 0 ||
-        state->native_active_grant_count > 0 || state->native_current_active ||
-        state->native_current_grant_id != 0 || state->native_current_grant_generation != 0 ||
-        state->reclaim_syscall_inflight)
-        return false;
-
-    for (int i = 0; i < state->total_granules; i++) {
-        const GsAmmGranuleMeta *granule = &state->granules[i];
-
-        if (granule->state == GS_AMM_GRANULE_BUFFER_DRAINING ||
-            granule->state == GS_AMM_GRANULE_RECLAIMING ||
-            granule->state == GS_AMM_GRANULE_AP_ACTIVE ||
-            granule->state == GS_AMM_GRANULE_AP_RESERVED ||
-            granule->scan_inflight || granule->reclaim_inflight ||
-            granule->grant_id != 0 || granule->grant_generation != 0)
-            return false;
-        if (!GsAmmGranuleCountersCanAdvance(granule->generation, granule->owner_epoch, true))
-            return false;
-    }
-    return true;
 }
 
 static TimestampTz gs_amm_timestamp_after_ms(TimestampTz start, int ms)
@@ -1854,446 +1169,42 @@ static int gs_amm_dynamic_target_default_mb(void)
     return Max(gs_amm_dynamic_target_mb, gs_amm_ap_min_grant_mb);
 }
 
-static int gs_amm_allocator_only_grant_target_mb(const GsAmmRuntimeConfig *runtime_config)
+static int gs_amm_effective_dynamic_target_mb(void)
 {
-    return Max(runtime_config->allocator_only_grant_mb, gs_amm_ap_min_grant_mb);
+    return gs_amm_dynamic_target_default_mb();
 }
 
-static int gs_amm_effective_controller_demand_mb(int prediction_mb, const GsAmmRuntimeConfig *runtime_config)
+static const char *gs_amm_tp_pressure_state_name(GsAmmTpPressureState state)
 {
-    prediction_mb = Max(prediction_mb, 0);
-    if (!runtime_config->allocator_only_mode)
-        return prediction_mb;
-    return gs_amm_allocator_only_grant_target_mb(runtime_config);
-}
-
-static int gs_amm_effective_ap_request_mb(
-    int prediction_mb, int min_mb, int max_mb, const GsAmmRuntimeConfig *runtime_config)
-{
-    int request_mb = Max(prediction_mb, 0);
-
-    if (runtime_config->allocator_only_mode)
-        request_mb = Max(gs_amm_allocator_only_grant_target_mb(runtime_config), min_mb);
-    return Min(request_mb, max_mb);
-}
-
-static int gs_amm_effective_ap_request_kb(const GsAmmRuntimeConfig *runtime_config)
-{
-    int target_mb = gs_amm_allocator_only_grant_target_mb(runtime_config);
-
-    if (target_mb > INT_MAX / 1024)
-        target_mb = INT_MAX / 1024;
-    return target_mb * 1024;
-}
-
-static int gs_amm_queue_limit(void)
-{
-    return Min(Max(gs_amm_ap_queue_limit, 0), GS_AMM_QUEUE_RING_SIZE - 1);
-}
-
-static int gs_amm_queue_slot(uint64 ticket)
-{
-    return (int)(ticket % GS_AMM_QUEUE_RING_SIZE);
-}
-
-static void gs_amm_queue_advance_head_locked(GsAmmSharedState *state)
-{
-    while (state->ap_queue_head < state->ap_queue_tail) {
-        uint64 next_ticket = state->ap_queue_head + 1;
-        int slot = gs_amm_queue_slot(next_ticket);
-
-        if (state->ap_queue_slots[slot] == GS_AMM_QUEUE_WAITING)
-            break;
-        state->ap_queue_slots[slot] = 0;
-        state->ap_queue_head = next_ticket;
+    switch (state) {
+        case GS_AMM_TP_PRESSURE_LOW_FLOW:
+            return "low_flow";
+        case GS_AMM_TP_PRESSURE_HOT_RECOVERY:
+            return "hot_recovery";
+        case GS_AMM_TP_PRESSURE_RECOVERY_WAIT:
+            return "recovery_wait";
+        case GS_AMM_TP_PRESSURE_UNKNOWN:
+        default:
+            return "unknown";
     }
 }
 
-static bool gs_amm_queue_register_locked(GsAmmSharedState *state, uint64 *ticket)
+static const char *gs_amm_tp_recovery_phase_name(GsAmmTpRecoveryPhase phase)
 {
-    int slot;
-
-    gs_amm_queue_advance_head_locked(state);
-    if (state->ap_queue_len >= gs_amm_queue_limit())
-        return false;
-    if (state->ap_queue_tail - state->ap_queue_head >= GS_AMM_QUEUE_RING_SIZE - 1)
-        return false;
-
-    state->ap_queue_tail++;
-    slot = gs_amm_queue_slot(state->ap_queue_tail);
-    state->ap_queue_slots[slot] = GS_AMM_QUEUE_WAITING;
-    state->ap_queue_len++;
-    *ticket = state->ap_queue_tail;
-    return true;
-}
-
-static bool gs_amm_queue_is_head_locked(GsAmmSharedState *state, uint64 ticket)
-{
-    gs_amm_queue_advance_head_locked(state);
-    if (ticket != state->ap_queue_head + 1)
-        return false;
-    return state->ap_queue_slots[gs_amm_queue_slot(ticket)] == GS_AMM_QUEUE_WAITING;
-}
-
-static void gs_amm_queue_finish_locked(GsAmmSharedState *state, uint64 ticket, bool admitted, int wait_ms)
-{
-    int slot;
-
-    if (ticket == 0)
-        return;
-
-    slot = gs_amm_queue_slot(ticket);
-    if (state->ap_queue_slots[slot] == GS_AMM_QUEUE_WAITING && state->ap_queue_len > 0)
-        state->ap_queue_len--;
-    if (admitted) {
-        state->ap_queue_slots[slot] = 0;
-        if (ticket >= state->ap_queue_head)
-            state->ap_queue_head = ticket;
-        state->ap_queue_admit_count++;
-    } else {
-        state->ap_queue_slots[slot] = GS_AMM_QUEUE_CANCELLED;
-        state->ap_queue_timeout_count++;
+    switch (phase) {
+        case GS_AMM_TP_RECOVERY_IDLE:
+            return "idle";
+        case GS_AMM_TP_RECOVERY_STOP_AP:
+            return "stop_ap";
+        case GS_AMM_TP_RECOVERY_WAIT_AP:
+            return "wait_ap_release";
+        case GS_AMM_TP_RECOVERY_RESTORE_SB:
+            return "restore_sb";
+        case GS_AMM_TP_RECOVERY_MULTIPASS:
+            return "multipass_admission";
+        default:
+            return "unknown";
     }
-    state->last_queue_wait_ms = wait_ms;
-    gs_amm_queue_advance_head_locked(state);
-}
-
-typedef struct GsAmmTpWindowSnapshot {
-    uint64 generation;
-    int sample_next;
-    int sample_count;
-    TimestampTz sample_time[GS_AMM_TP_WINDOW_SAMPLE_COUNT];
-    double sample_tps[GS_AMM_TP_WINDOW_SAMPLE_COUNT];
-    double sample_p95_latency_ms[GS_AMM_TP_WINDOW_SAMPLE_COUNT];
-    double baseline_tps;
-    int active_ap_count;
-    int dynamic_used_mb;
-    int ap_queue_len;
-    TimestampTz recovery_cooldown_until;
-    TimestampTz last_resize_time;
-} GsAmmTpWindowSnapshot;
-
-static void gs_amm_snapshot_tp_window_locked(GsAmmSharedState *state, GsAmmTpWindowSnapshot *snapshot)
-{
-    snapshot->generation = state->tp_sample_generation;
-    snapshot->sample_next = state->tp_sample_next;
-    snapshot->sample_count = state->tp_sample_count;
-    snapshot->baseline_tps = state->tp_baseline_tps;
-    snapshot->active_ap_count = state->active_ap_count;
-    snapshot->dynamic_used_mb = state->dynamic_used_mb;
-    snapshot->ap_queue_len = state->ap_queue_len;
-    snapshot->recovery_cooldown_until = state->recovery_cooldown_until;
-    snapshot->last_resize_time = state->last_resize_time;
-    for (int index = 0; index < GS_AMM_TP_WINDOW_SAMPLE_COUNT; index++) {
-        snapshot->sample_time[index] = state->tp_sample_time[index];
-        snapshot->sample_tps[index] = state->tp_sample_tps[index];
-        snapshot->sample_p95_latency_ms[index] = state->tp_sample_p95_latency_ms[index];
-    }
-}
-
-static void gs_amm_append_tp_window_snapshot(
-    GsAmmTpWindowSnapshot *snapshot, TimestampTz now, double tps, double p95_latency_ms)
-{
-    int slot = snapshot->sample_next;
-
-    snapshot->sample_time[slot] = now;
-    snapshot->sample_tps[slot] = tps;
-    snapshot->sample_p95_latency_ms[slot] = p95_latency_ms;
-    snapshot->sample_next = (snapshot->sample_next + 1) % GS_AMM_TP_WINDOW_SAMPLE_COUNT;
-    if (snapshot->sample_count < GS_AMM_TP_WINDOW_SAMPLE_COUNT)
-        snapshot->sample_count++;
-}
-
-static void gs_amm_compute_tp_window_snapshot(const GsAmmTpWindowSnapshot *snapshot, TimestampTz now, int window_ms,
-    double *window_tps, double *window_p95_latency_ms)
-{
-    TimestampTz cutoff = window_ms > 0 ? now - (TimestampTz)window_ms * 1000 : now;
-    double tps_sum = 0.0;
-    double p95_max = 0.0;
-    int count = 0;
-
-    for (int index = 0; index < snapshot->sample_count; index++) {
-        TimestampTz sample_time = snapshot->sample_time[index];
-
-        if (sample_time <= 0 || (window_ms > 0 && sample_time < cutoff))
-            continue;
-        tps_sum += snapshot->sample_tps[index];
-        p95_max = Max(p95_max, snapshot->sample_p95_latency_ms[index]);
-        count++;
-    }
-    if (count <= 0) {
-        int latest_slot = (snapshot->sample_next + GS_AMM_TP_WINDOW_SAMPLE_COUNT - 1) %
-            GS_AMM_TP_WINDOW_SAMPLE_COUNT;
-
-        *window_tps = snapshot->sample_tps[latest_slot];
-        *window_p95_latency_ms = snapshot->sample_p95_latency_ms[latest_slot];
-        return;
-    }
-    *window_tps = tps_sum / (double)count;
-    *window_p95_latency_ms = p95_max;
-}
-
-static bool gs_amm_tp_window_snapshot_mature(const GsAmmTpWindowSnapshot *snapshot, TimestampTz now, int window_ms)
-{
-    TimestampTz cutoff;
-    TimestampTz oldest = 0;
-    TimestampTz newest = 0;
-    TimestampTz required_span;
-    int count = 0;
-
-    if (window_ms <= 0)
-        return true;
-    cutoff = now - (TimestampTz)window_ms * 1000;
-    for (int index = 0; index < snapshot->sample_count; index++) {
-        TimestampTz sample_time = snapshot->sample_time[index];
-
-        if (sample_time <= 0 || sample_time < cutoff)
-            continue;
-        if (oldest == 0 || sample_time < oldest)
-            oldest = sample_time;
-        if (newest == 0 || sample_time > newest)
-            newest = sample_time;
-        count++;
-    }
-    if (count <= 1 || oldest == 0 || newest == 0)
-        return false;
-
-    required_span = (TimestampTz)Max(window_ms - 1000, window_ms / 2) * 1000;
-    return newest - oldest >= required_span;
-}
-
-static double gs_amm_tp_baseline_candidate(const GsAmmTpWindowSnapshot *snapshot, TimestampTz now,
-    bool tp_window_mature, double tp_recent_tps, bool *rebased)
-{
-    double baseline_tps = snapshot->baseline_tps;
-
-    *rebased = false;
-    if (tp_window_mature && (baseline_tps <= 0.0 || tp_recent_tps > baseline_tps))
-        baseline_tps = tp_recent_tps;
-    if (!tp_window_mature || !(tp_recent_tps > 0.0) || !(baseline_tps > tp_recent_tps))
-        return baseline_tps;
-    if (snapshot->active_ap_count != 0 || snapshot->dynamic_used_mb != 0 || snapshot->ap_queue_len != 0 ||
-        snapshot->recovery_cooldown_until > now)
-        return baseline_tps;
-    if (snapshot->last_resize_time > 0 &&
-        now < gs_amm_timestamp_after_ms(snapshot->last_resize_time, GS_AMM_TP_BASELINE_REBASE_IDLE_MS))
-        return baseline_tps;
-
-    *rebased = true;
-    return Max(tp_recent_tps, baseline_tps * (1.0 - GS_AMM_TP_BASELINE_REBASE_ALPHA) +
-        tp_recent_tps * GS_AMM_TP_BASELINE_REBASE_ALPHA);
-}
-
-static bool gs_amm_tp_drop_guard_hot_locked(GsAmmSharedState *state)
-{
-    if (gs_amm_tp_jitter_limit <= 0.0)
-        return false;
-    if (state->tp_baseline_tps < GS_AMM_TP_GUARD_MIN_BASELINE_TPS)
-        return false;
-    return state->tp_raw_drop_ratio >= gs_amm_tp_jitter_limit;
-}
-
-static bool gs_amm_io_guard_hot_locked(GsAmmSharedState *state)
-{
-    return state->io_pressure_observed >= gs_amm_io_pressure_guard || state->io_guard_latched;
-}
-
-static bool gs_amm_advance_tp_sample_generation_locked(GsAmmSharedState *state)
-{
-    if (state->tp_sample_generation == PG_UINT64_MAX) {
-        state->tp_generation_exhausted = true;
-        return false;
-    }
-    state->tp_sample_generation++;
-    return true;
-}
-
-static void gs_amm_update_io_recovery_locked(
-    GsAmmSharedState *state, TimestampTz now, bool recovery_sample_complete)
-{
-    if (state->io_pressure_observed >= gs_amm_io_pressure_guard) {
-        bool was_latched = state->io_guard_latched;
-        GsAmmGranuleSummary event_before;
-
-        if (!was_latched)
-            gs_amm_summarize_granules_locked(state, &event_before);
-        state->io_guard_latched = true;
-        state->io_recovery_stable_windows = 0;
-        state->io_recovery_last_window = now;
-        if (!was_latched)
-            gs_amm_record_pool_event_locked(state, GS_AMM_FAIL_CLOSED, "io_guard_activated", &event_before, now);
-        return;
-    }
-    if (!state->io_guard_latched)
-        return;
-    if (!recovery_sample_complete) {
-        state->io_recovery_stable_windows = 0;
-        state->io_recovery_last_window = now;
-        return;
-    }
-    if (state->io_recovery_last_window > 0 &&
-        now - state->io_recovery_last_window < GS_AMM_NATIVE_TP_WINDOW_MS * 1000)
-        return;
-
-    state->io_recovery_last_window = now;
-    state->io_recovery_stable_windows++;
-    if (state->io_recovery_stable_windows >= 2) {
-        GsAmmGranuleSummary event_before;
-
-        gs_amm_summarize_granules_locked(state, &event_before);
-        state->io_guard_latched = false;
-        state->recovery_cooldown_until =
-            gs_amm_timestamp_after_ms(now, Max(gs_amm_tp_recovery_cooldown_ms, gs_amm_resize_cooldown_ms));
-        gs_amm_record_pool_event_locked(state, GS_AMM_OBSERVE, "io_guard_released", &event_before, now);
-    }
-}
-
-void GsAmmGetFeedbackTelemetry(double *tp_drop_ratio, double *io_pressure)
-{
-    GsAmmSharedState *state = gs_amm_get_state();
-
-    if (tp_drop_ratio == NULL || io_pressure == NULL)
-        return;
-
-    SpinLockAcquire(&state->mutex);
-    *tp_drop_ratio = Max(0.0, Min(state->tp_raw_drop_ratio, 1.0));
-    *io_pressure = Max(0.0, Min((double)state->io_pressure_observed, 100.0));
-    SpinLockRelease(&state->mutex);
-}
-
-double GsAmmCurrentMemoryPressureScore(void)
-{
-    GsAmmSharedState *state = gs_amm_get_state();
-    double dynamic_pressure = 0.0;
-    double tp_pressure = 0.0;
-    double io_pressure = 0.0;
-    double score;
-
-    SpinLockAcquire(&state->mutex);
-    if (state->tp_generation_exhausted) {
-        SpinLockRelease(&state->mutex);
-        return 1.0;
-    }
-    if (state->dynamic_target_mb > 0)
-        dynamic_pressure = (double)Max(state->dynamic_used_mb, 0) / (double)state->dynamic_target_mb;
-    else if (state->dynamic_used_mb > 0)
-        dynamic_pressure = 1.0;
-
-    tp_pressure = (double)Max(state->last_tp_pressure, 0) / 100.0;
-    if (gs_amm_tp_drop_guard_hot_locked(state))
-        tp_pressure = 1.0;
-
-    io_pressure = (double)Max(Max(state->last_io_pressure, state->io_pressure_observed), 0) / 100.0;
-    if (gs_amm_io_guard_hot_locked(state))
-        io_pressure = 1.0;
-    score = Max(dynamic_pressure, Max(tp_pressure, io_pressure));
-    SpinLockRelease(&state->mutex);
-
-    return Max(0.0, Min(score, 1.0));
-}
-
-static bool gs_amm_recent_tps_drop_blocks_resize_locked(GsAmmSharedState *state, TimestampTz now)
-{
-    if (state->tp_generation_exhausted)
-        return true;
-    if (state->cooldown_until > now)
-        return true;
-    if (gs_amm_recovery_cooldown_hot_locked(state, now))
-        return true;
-    return gs_amm_tp_drop_guard_hot_locked(state) || gs_amm_io_guard_hot_locked(state);
-}
-
-static bool gs_amm_recovery_cooldown_hot_locked(GsAmmSharedState *state, TimestampTz now)
-{
-    return gs_amm_tp_recovery_cooldown_ms > 0 && state->recovery_cooldown_until > now;
-}
-
-static const char *gs_amm_new_ap_block_reason_locked(GsAmmSharedState *state, TimestampTz now)
-{
-    if (state->tp_generation_exhausted)
-        return "telemetry_generation_exhausted";
-    if (state->cooldown_until > now)
-        return "resize_cooldown";
-    if (gs_amm_tp_drop_guard_hot_locked(state))
-        return "tps_guard";
-    if (gs_amm_io_guard_hot_locked(state))
-        return "io_pressure";
-    if (gs_amm_recovery_cooldown_hot_locked(state, now))
-        return "recovery_cooldown";
-    if (state->last_tp_pressure >= gs_amm_tp_pressure_guard)
-        return "tp_pressure";
-    if (state->last_io_pressure >= gs_amm_io_pressure_guard)
-        return "io_pressure";
-    return "";
-}
-
-bool GsAmmEvaluateAdmission(int prediction_mb)
-{
-    if (!gs_amm_enabled)
-        return false;
-
-    GsAmmSharedState *state = gs_amm_get_state();
-    const char *block_reason;
-    bool allowed;
-
-    SpinLockAcquire(&state->mutex);
-    state->last_prediction_mb = Max(prediction_mb, 0);
-    block_reason = gs_amm_new_ap_block_reason_locked(state, GetCurrentTimestamp());
-    allowed = block_reason[0] == '\0';
-    if (!allowed) {
-        state->last_action = GS_AMM_BACKPRESSURE;
-        gs_amm_set_backpressure_reason_locked(state, block_reason);
-    }
-    SpinLockRelease(&state->mutex);
-    return allowed;
-}
-
-static const char *gs_amm_resize_guard_state(GsAmmSharedState *state, TimestampTz now)
-{
-    if (state->tp_generation_exhausted)
-        return "telemetry_generation_exhausted";
-    if (state->cooldown_until > now)
-        return "cooldown";
-    if (gs_amm_recovery_cooldown_hot_locked(state, now))
-        return "recovery_cooldown";
-    if (gs_amm_tp_drop_guard_hot_locked(state))
-        return "hot";
-    if (gs_amm_io_guard_hot_locked(state))
-        return "io_hot";
-    if (state->resize_observe_until >= now)
-        return "observing";
-    return "ready";
-}
-
-static int gs_amm_compute_io_pressure(double physical_read_rate, uint64 pending_writeback_pages, double dirty_page_ratio,
-    int device_io_in_flight, double device_io_ms_rate, double temp_spill_mb_rate, double hash_multipass_rate)
-{
-    double read_score;
-    double spill_score;
-    double writeback_score;
-    double dirty_score;
-    double device_queue_score;
-    double device_busy_score;
-    double operator_score;
-    double score;
-
-    physical_read_rate = Max(physical_read_rate, 0.0);
-    pending_writeback_pages = Max(pending_writeback_pages, (uint64)0);
-    dirty_page_ratio = Max(dirty_page_ratio, 0.0);
-    device_io_in_flight = Max(device_io_in_flight, 0);
-    device_io_ms_rate = Max(device_io_ms_rate, 0.0);
-    temp_spill_mb_rate = Max(temp_spill_mb_rate, 0.0);
-    hash_multipass_rate = Max(hash_multipass_rate, 0.0);
-
-    read_score = Min(25.0, physical_read_rate / 100.0 * 25.0);
-    writeback_score = Min(20.0, (double)pending_writeback_pages / 1024.0 * 20.0);
-    dirty_score = Min(15.0, dirty_page_ratio / 0.20 * 15.0);
-    device_queue_score = Min(15.0, (double)device_io_in_flight / 4.0 * 15.0);
-    device_busy_score = Min(15.0, device_io_ms_rate / 1000.0 * 15.0);
-    spill_score = Min(15.0, temp_spill_mb_rate / 20.0 * 15.0);
-    operator_score = Min(15.0, hash_multipass_rate * 15.0);
-    score = read_score + writeback_score + dirty_score + device_queue_score + device_busy_score + spill_score + operator_score;
-    return Max(0, Min(100, (int)(score + 0.5)));
 }
 
 static void gs_amm_set_backpressure_reason_locked(GsAmmSharedState *state, const char *reason)
@@ -2307,58 +1218,309 @@ static void gs_amm_set_backpressure_reason_locked(GsAmmSharedState *state, const
     securec_check_ss(rc, "\0", "\0");
 }
 
-static int gs_amm_clamp_grant_mb(int requested_mb, int free_mb)
+static int gs_amm_queue_demand_mb(const GsAmmApQueueSlot *slot)
 {
+    uint64 one_pass_kb;
+
+    if (slot == NULL)
+        return 0;
+    one_pass_kb = (uint64)Max(slot->one_pass_bound_kb, 1);
+    return (int)Min(Max((one_pass_kb + 1023) / 1024, (uint64)gs_amm_ap_min_grant_mb),
+        (uint64)INT_MAX);
+}
+
+static void gs_amm_refresh_ap_queue_totals_locked(GsAmmSharedState *state)
+{
+    int queue_count = 0;
+    int queue_demand_mb = 0;
+
+    if (state == NULL)
+        return;
+    for (int index = 0; index < GS_AMM_AP_QUEUE_CAPACITY; index++) {
+        GsAmmApQueueSlot *slot = &state->ap_queue[index];
+        int demand_mb;
+
+        if (slot->state != GS_AMM_AP_QUEUE_WAITING)
+            continue;
+        demand_mb = gs_amm_queue_demand_mb(slot);
+        if (queue_count < INT_MAX)
+            queue_count++;
+        queue_demand_mb = queue_demand_mb <= INT_MAX - demand_mb ?
+            queue_demand_mb + demand_mb : INT_MAX;
+    }
+    state->queued_ap_count = queue_count;
+    state->queued_target_demand_mb = queue_demand_mb;
+}
+
+static GsAmmApQueueSlot *gs_amm_find_queue_slot_locked(GsAmmSharedState *state, uint64 ticket)
+{
+    if (state == NULL || ticket == 0)
+        return NULL;
+    for (int index = 0; index < GS_AMM_AP_QUEUE_CAPACITY; index++) {
+        GsAmmApQueueSlot *slot = &state->ap_queue[index];
+
+        if (slot->state != GS_AMM_AP_QUEUE_FREE && slot->ticket == ticket)
+            return slot;
+    }
+    return NULL;
+}
+
+static GsAmmApQueueSlot *gs_amm_queue_head_locked(GsAmmSharedState *state)
+{
+    GsAmmApQueueSlot *head = NULL;
+
+    if (state == NULL)
+        return NULL;
+    for (int index = 0; index < GS_AMM_AP_QUEUE_CAPACITY; index++) {
+        GsAmmApQueueSlot *slot = &state->ap_queue[index];
+
+        if (slot->state != GS_AMM_AP_QUEUE_WAITING)
+            continue;
+        if (head == NULL || slot->ticket < head->ticket)
+            head = slot;
+    }
+    return head;
+}
+
+static bool gs_amm_queue_has_entries_locked(const GsAmmSharedState *state)
+{
+    if (state == NULL)
+        return false;
+    for (int index = 0; index < GS_AMM_AP_QUEUE_CAPACITY; index++) {
+        if (state->ap_queue[index].state != GS_AMM_AP_QUEUE_FREE)
+            return true;
+    }
+    return false;
+}
+
+static bool gs_amm_queue_slot_belongs_to_current_backend(const GsAmmApQueueSlot *slot)
+{
+    if (slot == NULL || t_thrd.proc == NULL)
+        return false;
+    return slot->pgprocno == t_thrd.proc->pgprocno &&
+        slot->waiter_pid == t_thrd.proc->pid &&
+        slot->waiter_sessionid == t_thrd.proc->sessionid;
+}
+
+static bool gs_amm_enqueue_ap_request_locked(GsAmmSharedState *state, int cache_bound_kb,
+    int one_pass_bound_kb, int multi_pass_bound_kb, int prediction_mb, uint64 *ticket)
+{
+    GsAmmApQueueSlot *slot = NULL;
+    errno_t rc;
+
+    if (ticket != NULL)
+        *ticket = 0;
+    if (state == NULL || t_thrd.proc == NULL || state->next_queue_ticket == PG_UINT64_MAX)
+        return false;
+    for (int index = 0; index < GS_AMM_AP_QUEUE_CAPACITY; index++) {
+        if (state->ap_queue[index].state == GS_AMM_AP_QUEUE_FREE) {
+            slot = &state->ap_queue[index];
+            break;
+        }
+    }
+    if (slot == NULL)
+        return false;
+
+    rc = memset_s(slot, sizeof(*slot), 0, sizeof(*slot));
+    securec_check(rc, "\0", "\0");
+    state->next_queue_ticket++;
+    slot->state = GS_AMM_AP_QUEUE_WAITING;
+    slot->ticket = state->next_queue_ticket;
+    slot->queued_at = GetCurrentTimestamp();
+    slot->cache_bound_kb = cache_bound_kb;
+    slot->one_pass_bound_kb = one_pass_bound_kb;
+    slot->multi_pass_bound_kb = multi_pass_bound_kb;
+    slot->prediction_mb = prediction_mb;
+    slot->pgprocno = t_thrd.proc->pgprocno;
+    slot->waiter_pid = t_thrd.proc->pid;
+    slot->waiter_sessionid = t_thrd.proc->sessionid;
+    gs_amm_refresh_ap_queue_totals_locked(state);
+    gs_amm_refresh_ap_target_totals_locked(state);
+    if (ticket != NULL)
+        *ticket = slot->ticket;
+    return true;
+}
+
+static void gs_amm_wake_queue_waiter(const GsAmmApQueueSlot *slot)
+{
+    PGPROC *proc;
+
+    if (slot == NULL || slot->pgprocno < 0 || slot->pgprocno >= GLOBAL_ALL_PROCS)
+        return;
+    proc = g_instance.proc_base_all_procs[slot->pgprocno];
+    if (proc != NULL && proc->pid == slot->waiter_pid && proc->sessionid == slot->waiter_sessionid)
+        SetLatch(&proc->procLatch);
+}
+
+static int gs_amm_record_target_kb_locked(const GsAmmSharedState *state, const GsAmmApRecord *record)
+{
+    int target_kb;
+
+    if (state == NULL || record == NULL)
+        return 0;
+    target_kb = gs_amm_ap_target_bound_kb(record);
+    if (state->ap_multipass_only)
+        target_kb = record->multi_pass_bound_kb;
+    if (state->stage == GS_AMM_STAGE_FORCE_ONEPASS ||
+        (state->stage == GS_AMM_STAGE_CACHE_ONEPASS &&
+            target_kb > record->one_pass_bound_kb))
+        target_kb = record->one_pass_bound_kb;
+    return Max(target_kb, record->multi_pass_bound_kb);
+}
+
+static void gs_amm_rebalance_ap_limits_locked(GsAmmSharedState *state)
+{
+    gs_amm_refresh_ap_totals_locked(state);
+    for (int index = 0; index < GS_AMM_MAX_AP_REGISTRY; index++) {
+        GsAmmApRecord *record = &state->ap_registry[index];
+        int target_kb;
+        int used_kb;
+
+        if (!record->active)
+            continue;
+        used_kb = (int)Min((uint64)INT_MAX, (record->used_bytes + 1023) / 1024);
+        if (record->reclaim_pending) {
+            /* A TP revoke must be visible below current use so the operator spills. */
+            target_kb = record->multi_pass_bound_kb;
+            record->target_mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+        } else {
+            target_kb = gs_amm_record_target_kb_locked(state, record);
+            target_kb = Max(target_kb, used_kb);
+        }
+        record->effective_grant_kb = Max(Min(target_kb, Max(record->granted_kb, used_kb)), 1);
+        if (record->reclaim_pending)
+            record->mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+        else if (record->effective_grant_kb <= record->one_pass_bound_kb)
+            record->mode = GS_AMM_MEMORY_MODE_ONEPASS;
+    }
+    gs_amm_refresh_ap_totals_locked(state);
+    gs_amm_refresh_ap_target_totals_locked(state);
+}
+
+static int gs_amm_free_granule_mb_locked(GsAmmSharedState *state);
+
+static int gs_amm_dynamic_free_mb_locked(const GsAmmSharedState *state)
+{
+    uint64 target_bytes;
+
+    if (state == NULL)
+        return 0;
+    target_bytes = (uint64)Max(state->dynamic_target_mb, gs_amm_ap_min_grant_mb) * 1024 * 1024;
+    if (state->dynamic_reserved_bytes >= target_bytes)
+        return 0;
+    return (int)Min((target_bytes - state->dynamic_reserved_bytes) / (1024 * 1024),
+        (uint64)INT_MAX);
+}
+
+static GsAmmApRecord *gs_amm_select_ap_growth_candidate_locked(GsAmmSharedState *state)
+{
+    GsAmmApRecord *best = NULL;
+    int best_deficit_kb = 0;
+
+    if (state == NULL)
+        return NULL;
+    gs_amm_refresh_ap_totals_locked(state);
+    for (int index = 0; index < GS_AMM_MAX_AP_REGISTRY; index++) {
+        GsAmmApRecord *record = &state->ap_registry[index];
+        int deficit_kb;
+
+        if (!record->active || record->reclaim_pending)
+            continue;
+        deficit_kb = gs_amm_record_target_kb_locked(state, record) - record->granted_kb;
+        if (deficit_kb <= 0)
+            continue;
+        if (best == NULL || deficit_kb > best_deficit_kb ||
+            (deficit_kb == best_deficit_kb && record->grant_id < best->grant_id)) {
+            best = record;
+            best_deficit_kb = deficit_kb;
+        }
+    }
+    return best;
+}
+
+static bool gs_amm_active_ap_growth_pending_locked(GsAmmSharedState *state)
+{
+    return gs_amm_select_ap_growth_candidate_locked(state) != NULL;
+}
+
+static int gs_amm_grow_ap_dynamic_locked(GsAmmSharedState *state, GsAmmApRecord *record, int requested_mb)
+{
+    int deficit_mb;
+    int available_mb;
     int grant_mb;
 
-    requested_mb = Max(requested_mb, gs_amm_ap_min_grant_mb);
-    grant_mb = Min(requested_mb, Max(free_mb, 0));
-    if (grant_mb < gs_amm_ap_min_grant_mb)
-        grant_mb = 0;
+    if (state == NULL || record == NULL || requested_mb <= 0)
+        return 0;
+    deficit_mb = Max((gs_amm_record_target_kb_locked(state, record) - record->granted_kb + 1023) / 1024, 0);
+    available_mb = gs_amm_dynamic_free_mb_locked(state);
+    grant_mb = Min(requested_mb, Min(deficit_mb, available_mb));
+    if (grant_mb <= 0)
+        return 0;
+
+    record->dynamic_granted_bytes += (uint64)grant_mb * 1024 * 1024;
+    gs_amm_refresh_ap_totals_locked(state);
+    gs_amm_rebalance_ap_limits_locked(state);
     return grant_mb;
 }
 
-static void gs_amm_apply_backend_work_mem(int grant_kb)
+static int gs_amm_grow_ap_granule_locked(GsAmmSharedState *state, GsAmmApRecord *record, int requested_mb)
 {
-    char value[32];
-    int rc;
+    GsAmmGrantToken token;
+    int deficit_mb;
+    int granule_id = -1;
+    int assign_mb;
+    GsAmmGranuleMeta *granule = NULL;
 
-    if (grant_kb <= 0)
-        return;
+    if (state == NULL || record == NULL || requested_mb <= 0)
+        return 0;
+    deficit_mb = Max((gs_amm_record_target_kb_locked(state, record) - record->granted_kb + 1023) / 1024, 0);
+    assign_mb = Min(requested_mb, deficit_mb);
+    if (assign_mb <= 0)
+        return 0;
 
-    gs_amm_register_backend_cleanup();
-    if (MyGsAmmSavedWorkMemKb <= 0)
-        MyGsAmmSavedWorkMemKb = u_sess->attr.attr_memory.work_mem;
-    rc = snprintf_s(value, sizeof(value), sizeof(value) - 1, "%dkB", grant_kb);
-    securec_check_ss(rc, "\0", "\0");
-    (void)set_config_option("work_mem", value, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SET, true, ERROR);
-}
+    for (int index = state->total_granules - 1; index >= 0; index--) {
+        GsAmmGranuleMeta *candidate = &state->granules[index];
+        if (candidate->state == GS_AMM_GRANULE_FREE && !candidate->scan_inflight &&
+            !candidate->reclaim_inflight &&
+            GsAmmGranuleCanCompleteApLifecycle(candidate->generation, candidate->owner_epoch)) {
+            granule = candidate;
+            granule_id = index;
+            break;
+        }
+    }
+    if (granule == NULL)
+        return 0;
 
-static void gs_amm_apply_backend_grant(int grant_mb)
-{
-    MyGsAmmGrantMb = Max(grant_mb, 0);
-    MyGsAmmGrantKb = MyGsAmmGrantMb * 1024;
-    gs_amm_apply_backend_work_mem(MyGsAmmGrantKb);
+    token.grant_id = record->grant_id;
+    token.grant_generation = record->grant_generation;
+    if (!gs_amm_publish_granule_state_locked(state, granule, GS_AMM_GRANULE_AP_RESERVED))
+        return 0;
+    granule->grant_id = token.grant_id;
+    granule->grant_generation = token.grant_generation;
+    granule->reserved_granules = 1;
+    granule->active_grant_bytes = (uint64)assign_mb * 1024 * 1024;
+    granule->used_bytes = 0;
+    granule->alloc_cursor_bytes = 0;
+    if (!gs_amm_publish_granule_state_locked(state, granule, GS_AMM_GRANULE_AP_ACTIVE)) {
+        granule->grant_id = 0;
+        granule->grant_generation = 0;
+        granule->reserved_granules = 0;
+        granule->active_grant_bytes = 0;
+        (void)gs_amm_publish_granule_state_locked(state, granule, GS_AMM_GRANULE_FREE);
+        return 0;
+    }
+    gs_amm_refresh_granule_counts_locked(state);
+    gs_amm_refresh_ap_totals_locked(state);
+    gs_amm_rebalance_ap_limits_locked(state);
+    (void)granule_id;
+    return assign_mb;
 }
 
 static void gs_amm_apply_backend_grant_kb(int grant_kb)
 {
     MyGsAmmGrantKb = Max(grant_kb, 0);
     MyGsAmmGrantMb = MyGsAmmGrantKb > 0 ? (MyGsAmmGrantKb + 1023) / 1024 : 0;
-    gs_amm_apply_backend_work_mem(MyGsAmmGrantKb);
-}
-
-static void gs_amm_restore_backend_work_mem(int saved_work_mem_kb)
-{
-    char value[32];
-    int rc;
-
-    if (saved_work_mem_kb <= 0)
-        return;
-
-    rc = snprintf_s(value, sizeof(value), sizeof(value) - 1, "%dkB", saved_work_mem_kb);
-    securec_check_ss(rc, "\0", "\0");
-    (void)set_config_option("work_mem", value, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SET, true, ERROR);
+    gs_amm_register_backend_cleanup();
 }
 
 static void gs_amm_clear_backend_grant_state(void)
@@ -2369,25 +1531,26 @@ static void gs_amm_clear_backend_grant_state(void)
     MyGsAmmGrantGeneration = 0;
     MyGsAmmGrantGranules = 0;
     MyGsAmmGrantNative = false;
-    MyGsAmmSavedWorkMemKb = 0;
 }
 
 int GsAmmCurrentBackendGrantKB(void)
 {
     GsAmmSharedState *state;
-    int effective_grant_kb;
+    int effective_grant_kb = 0;
+    GsAmmGrantToken token = {MyGsAmmGrantId, MyGsAmmGrantGeneration};
 
-    if (MyGsAmmGrantKb <= 0)
+    if (MyGsAmmGrantId == 0 || MyGsAmmGrantGeneration == 0)
         return 0;
 
     state = gs_amm_get_state();
     SpinLockAcquire(&state->mutex);
-    effective_grant_kb = state->effective_grant_kb;
+    GsAmmApRecord *record = gs_amm_find_ap_record_locked(state, token);
+
+    if (record != NULL)
+        effective_grant_kb = record->effective_grant_kb;
     SpinLockRelease(&state->mutex);
 
-    if (effective_grant_kb > 0)
-        return Min(MyGsAmmGrantKb, effective_grant_kb);
-    return MyGsAmmGrantKb;
+    return effective_grant_kb > 0 ? effective_grant_kb : MyGsAmmGrantKb;
 }
 
 uint64 GsAmmCurrentBackendGrantId(void)
@@ -2409,16 +1572,33 @@ uint64 GsAmmCurrentBackendGrantBytes(void)
 
 uint64 GsAmmCurrentBackendGrantPoolBytes(void)
 {
-    if (MyGsAmmGrantId == 0 || MyGsAmmGrantMb <= 0)
+    GsAmmSharedState *state;
+    GsAmmGrantToken token = {MyGsAmmGrantId, MyGsAmmGrantGeneration};
+    uint64 pool_bytes = 0;
+
+    if (!GsAmmGrantTokenIsValid(token))
         return 0;
 
-    return (uint64)MyGsAmmGrantMb * 1024 * 1024;
+    state = gs_amm_get_state();
+    SpinLockAcquire(&state->mutex);
+    GsAmmApRecord *record = gs_amm_find_ap_record_locked(state, token);
+    if (record != NULL) {
+        pool_bytes = record->dynamic_granted_bytes;
+        for (int index = 0; index < state->total_granules; index++) {
+            GsAmmGranuleMeta *granule = &state->granules[index];
+            if (gs_amm_granule_owned_by_grant(granule, token))
+                pool_bytes += gs_amm_granule_active_capacity_bytes(granule);
+        }
+    }
+    SpinLockRelease(&state->mutex);
+    return pool_bytes;
 }
 
 uint64 GsAmmGrantEffectiveMemoryLimit(uint64 grant_id, uint64 requested_max_bytes)
 {
     GsAmmSharedState *state;
-    int effective_grant_kb;
+    int effective_grant_kb = 0;
+    GsAmmGrantToken token = {grant_id, MyGsAmmGrantGeneration};
     uint64 effective_bytes;
 
     if (grant_id == 0 || requested_max_bytes == 0)
@@ -2426,7 +1606,12 @@ uint64 GsAmmGrantEffectiveMemoryLimit(uint64 grant_id, uint64 requested_max_byte
 
     state = gs_amm_get_state();
     SpinLockAcquire(&state->mutex);
-    effective_grant_kb = state->effective_grant_kb;
+    if (MyGsAmmGrantId == grant_id) {
+        GsAmmApRecord *record = gs_amm_find_ap_record_locked(state, token);
+
+        if (record != NULL)
+            effective_grant_kb = record->effective_grant_kb;
+    }
     SpinLockRelease(&state->mutex);
 
     if (effective_grant_kb <= 0)
@@ -2475,6 +1660,141 @@ bool GsAmmGrantTokenIsValid(GsAmmGrantToken token)
         SpinLockRelease(&state->mutex);
     }
     return false;
+}
+
+bool GsAmmGrantDynamicMemoryAvailable(GsAmmGrantToken token, Size size)
+{
+    GsAmmSharedState *state;
+    GsAmmApRecord *record;
+    bool available = false;
+
+    if (size == 0 || !gs_amm_grant_token_is_current(token))
+        return false;
+    state = gs_amm_get_state();
+    SpinLockAcquire(&state->mutex);
+    record = gs_amm_find_ap_record_locked(state, token);
+    if (record != NULL && record->dynamic_granted_bytes >= record->dynamic_used_bytes &&
+        size <= record->dynamic_granted_bytes - record->dynamic_used_bytes)
+        available = true;
+    SpinLockRelease(&state->mutex);
+    return available;
+}
+
+void *GsAmmGrantAllocDynamicMemory(GsAmmGrantToken token, Size size)
+{
+    GsAmmSharedState *state;
+    GsAmmApRecord *record;
+    GsAmmDynamicAllocation *allocation;
+    void *pointer;
+
+    if (size == 0 || !gs_amm_grant_token_is_current(token))
+        return NULL;
+    pointer = malloc(size);
+    if (pointer == NULL)
+        return NULL;
+
+    allocation = (GsAmmDynamicAllocation *)malloc(sizeof(GsAmmDynamicAllocation));
+    if (allocation == NULL) {
+        free(pointer);
+        return NULL;
+    }
+
+    state = gs_amm_get_state();
+    SpinLockAcquire(&state->mutex);
+    record = gs_amm_find_ap_record_locked(state, token);
+    if (record == NULL || record->dynamic_granted_bytes < record->dynamic_used_bytes ||
+        size > record->dynamic_granted_bytes - record->dynamic_used_bytes) {
+        SpinLockRelease(&state->mutex);
+        free(allocation);
+        free(pointer);
+        return NULL;
+    }
+    record->dynamic_used_bytes += size;
+    allocation->pointer = pointer;
+    allocation->size = size;
+    allocation->next = MyGsAmmDynamicAllocations;
+    MyGsAmmDynamicAllocations = allocation;
+    gs_amm_refresh_ap_totals_locked(state);
+    SpinLockRelease(&state->mutex);
+    return pointer;
+}
+
+bool GsAmmGrantReturnDynamicMemory(GsAmmGrantToken token, void *pointer, Size size)
+{
+    GsAmmDynamicAllocation *previous = NULL;
+    GsAmmDynamicAllocation *allocation;
+    GsAmmSharedState *state;
+    GsAmmApRecord *record;
+
+    if (pointer == NULL || size == 0 || !gs_amm_grant_token_is_current(token))
+        return false;
+    for (allocation = MyGsAmmDynamicAllocations; allocation != NULL; allocation = allocation->next) {
+        if (allocation->pointer == pointer)
+            break;
+        previous = allocation;
+    }
+    if (allocation == NULL || allocation->size != size)
+        return false;
+    if (previous == NULL)
+        MyGsAmmDynamicAllocations = allocation->next;
+    else
+        previous->next = allocation->next;
+
+    state = gs_amm_get_state();
+    SpinLockAcquire(&state->mutex);
+    record = gs_amm_find_ap_record_locked(state, token);
+    /* Usage is accounted at allocation/free transitions.  Returning the
+     * malloc block only removes the backend-local allocation descriptor. */
+    SpinLockRelease(&state->mutex);
+    free(allocation->pointer);
+    free(allocation);
+    return record != NULL;
+}
+
+void GsAmmGrantAccountUsedDynamicMemory(GsAmmGrantToken token, Size size)
+{
+    GsAmmSharedState *state;
+    GsAmmApRecord *record;
+
+    if (size == 0 || !gs_amm_grant_token_is_current(token))
+        return;
+    state = gs_amm_get_state();
+    SpinLockAcquire(&state->mutex);
+    record = gs_amm_find_ap_record_locked(state, token);
+    if (record != NULL) {
+        record->dynamic_used_bytes = Min(record->dynamic_used_bytes + size,
+            record->dynamic_granted_bytes);
+        gs_amm_refresh_ap_totals_locked(state);
+    }
+    SpinLockRelease(&state->mutex);
+}
+
+void GsAmmGrantAccountFreedDynamicMemory(GsAmmGrantToken token, Size size)
+{
+    GsAmmSharedState *state;
+    GsAmmApRecord *record;
+
+    if (size == 0 || !gs_amm_grant_token_is_current(token))
+        return;
+    state = gs_amm_get_state();
+    SpinLockAcquire(&state->mutex);
+    record = gs_amm_find_ap_record_locked(state, token);
+    if (record != NULL) {
+        record->dynamic_used_bytes = record->dynamic_used_bytes >= size ?
+            record->dynamic_used_bytes - size : 0;
+        gs_amm_refresh_ap_totals_locked(state);
+    }
+    SpinLockRelease(&state->mutex);
+}
+
+static void gs_amm_release_dynamic_allocations(GsAmmGrantToken token)
+{
+    while (MyGsAmmDynamicAllocations != NULL) {
+        GsAmmDynamicAllocation *allocation = MyGsAmmDynamicAllocations;
+
+        if (!GsAmmGrantReturnDynamicMemory(token, allocation->pointer, allocation->size))
+            break;
+    }
 }
 
 static bool gs_amm_grant_arena_prepare(GsAmmGrantToken token)
@@ -2642,9 +1962,14 @@ bool GsAmmGrantCanAllocateMemory(GsAmmGrantToken token, Size size)
     GsAmmSharedState *state;
     uint64 request;
     bool can_allocate = false;
-    char *buffer_blocks = gs_amm_resolve_buffer_blocks();
+    char *buffer_blocks = NULL;
 
-    if (!GsAmmGrantTokenIsValid(token) || size == 0 || buffer_blocks == NULL)
+    if (!GsAmmGrantTokenIsValid(token) || size == 0)
+        return false;
+    if (GsAmmGrantDynamicMemoryAvailable(token, size))
+        return true;
+    buffer_blocks = gs_amm_resolve_buffer_blocks();
+    if (buffer_blocks == NULL)
         return false;
 
     request = (uint64)MAXALIGN(size);
@@ -2704,6 +2029,7 @@ void *GsAmmGrantAllocMemory(GsAmmGrantToken token, Size size)
             if (gs_amm_granule_owned_by_grant(granule, token) &&
                 gs_amm_pointer_in_granule(granule, buffer_blocks, (const char *)ptr, request)) {
                 granule->used_bytes += request;
+                gs_amm_update_ap_used_locked(state, token);
                 state->grant_reused_bytes += request;
                 state->granule_alloc_success_count++;
                 SpinLockRelease(&state->mutex);
@@ -2741,6 +2067,8 @@ void *GsAmmGrantAllocMemory(GsAmmGrantToken token, Size size)
         state->granule_alloc_no_owner_count++;
     else
         state->granule_alloc_capacity_exhausted_count++;
+    if (ptr != NULL)
+        gs_amm_update_ap_used_locked(state, token);
     SpinLockRelease(&state->mutex);
 
     return ptr;
@@ -2792,6 +2120,98 @@ bool GsAmmGrantReturnMemory(GsAmmGrantToken token, void *pointer, Size size)
     return true;
 }
 
+bool GsAmmGrantProcessPendingReclaim(void)
+{
+    GsAmmSharedState *state = GsAmmState;
+    GsAmmGrantToken token = {MyGsAmmGrantId, MyGsAmmGrantGeneration};
+    GsAmmApRecord *record;
+    int granule_id = -1;
+    int released_mb;
+
+    if (state == NULL || token.grant_id == 0 || token.grant_generation == 0)
+        return false;
+
+    SpinLockAcquire(&state->mutex);
+    record = gs_amm_find_ap_record_locked(state, token);
+    if (record != NULL && record->reclaim_pending)
+        granule_id = record->reclaim_granule_id;
+    SpinLockRelease(&state->mutex);
+    if (granule_id < 0) {
+        uint64 minimum_bytes;
+
+        /* A dynamic-only AP has no shared granule to release.  Once its
+         * backend has returned free dynamic chunks, lower the reservation to
+         * the multi-pass bound and return the quota to the global pool. */
+        SpinLockAcquire(&state->mutex);
+        record = gs_amm_find_ap_record_locked(state, token);
+        if (record == NULL || !record->reclaim_pending) {
+            SpinLockRelease(&state->mutex);
+            return false;
+        }
+        minimum_bytes = (uint64)Max(record->multi_pass_bound_kb, 1) * 1024;
+        if (record->dynamic_used_bytes > minimum_bytes) {
+            SpinLockRelease(&state->mutex);
+            return false;
+        }
+        record->dynamic_granted_bytes = Max(minimum_bytes, record->dynamic_used_bytes);
+        if (state->ap_downgrade_pending > 0)
+            state->ap_downgrade_pending--;
+        record->reclaim_pending = false;
+        record->reclaim_granule_id = -1;
+        record->target_mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+        record->mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+        gs_amm_rebalance_ap_limits_locked(state);
+        gs_amm_refresh_ap_totals_locked(state);
+        state->last_action = GS_AMM_TP_RECOVERY_DONE;
+        SpinLockRelease(&state->mutex);
+        return true;
+    }
+
+    /* The operator has already spilled/rebatched.  Only now may a whole
+     * empty physical granule leave this backend's arena. */
+    SpinLockAcquire(&state->mutex);
+    released_mb = gs_amm_reclaim_unused_ap_granules_locked(
+        state, 1, granule_id, token.grant_id, token.grant_generation);
+    if (released_mb <= 0)
+    {
+        SpinLockRelease(&state->mutex);
+        return false;
+    }
+
+    record = gs_amm_find_ap_record_locked(state, token);
+    if (record != NULL) {
+        if (record->reclaim_pending && state->ap_downgrade_pending > 0)
+            state->ap_downgrade_pending--;
+        record->reclaim_pending = false;
+        record->reclaim_granule_id = -1;
+        record->target_mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+        record->mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+    }
+    state->tp_recovered_granules++;
+    state->last_action = GS_AMM_TP_RECOVERY_DONE;
+    gs_amm_rebalance_ap_limits_locked(state);
+    gs_amm_refresh_ap_totals_locked(state);
+    gs_amm_refresh_granule_counts_locked(state);
+    SpinLockRelease(&state->mutex);
+    return true;
+}
+
+bool GsAmmGrantReclaimPending(void)
+{
+    GsAmmSharedState *state = GsAmmState;
+    GsAmmGrantToken token = {MyGsAmmGrantId, MyGsAmmGrantGeneration};
+    bool pending = false;
+
+    if (state == NULL || token.grant_id == 0 || token.grant_generation == 0)
+        return false;
+
+    SpinLockAcquire(&state->mutex);
+    GsAmmApRecord *record = gs_amm_find_ap_record_locked(state, token);
+    pending = record != NULL && record->reclaim_pending;
+    SpinLockRelease(&state->mutex);
+    return pending;
+}
+
 static bool gs_amm_pointer_in_granule(
     const GsAmmGranuleMeta *granule, const char *buffer_blocks, const char *pointer, uint64 size)
 {
@@ -2839,6 +2259,7 @@ static void gs_amm_grant_account_pointer_memory(GsAmmGrantToken token, void *poi
             granule->used_bytes = Min(granule->used_bytes + request, capacity);
         else
             granule->used_bytes = granule->used_bytes > request ? granule->used_bytes - request : 0;
+        gs_amm_update_ap_used_locked(state, token);
         break;
     }
     SpinLockRelease(&state->mutex);
@@ -2859,248 +2280,6 @@ static const char *gs_amm_action_name(GsAmmAction action)
     if (action < 0 || action >= GS_AMM_ACTION_COUNT)
         return "UNKNOWN";
     return GS_AMM_ACTION_NAMES[action];
-}
-
-static void gs_amm_default_config(GsAmmConfig *cfg, int max_mb)
-{
-    cfg->shared_buffers_min_mb = gs_amm_shared_buffers_min_mb;
-    cfg->controller_horizon = gs_amm_controller_horizon;
-    cfg->resize_rate_limit_mb = gs_amm_resize_rate_limit_mb;
-    cfg->tp_pressure_guard = gs_amm_tp_pressure_guard;
-    cfg->io_pressure_guard = gs_amm_io_pressure_guard;
-    cfg->deadband_mb = gs_amm_deadband_mb;
-    cfg->hysteresis_enter_delta = 10;
-    cfg->w_ap_benefit = 1.0;
-    cfg->w_tp_recovery_benefit = 1.2;
-    cfg->w_io_risk_penalty = 1.0;
-    cfg->w_resize_cost = 0.25;
-    cfg->w_grant_debt_risk = 0.5;
-    cfg->beam_width = 4;
-
-    cfg->shared_buffers_min_mb = Max(cfg->shared_buffers_min_mb, 1);
-    cfg->shared_buffers_min_mb = Min(cfg->shared_buffers_min_mb, max_mb);
-    cfg->controller_horizon = Max(cfg->controller_horizon, 1);
-    cfg->controller_horizon = Min(cfg->controller_horizon, GS_AMM_MAX_HORIZON);
-    cfg->resize_rate_limit_mb = Max(cfg->resize_rate_limit_mb, 1);
-    if (gs_amm_resize_batch_mb > 0)
-        cfg->resize_rate_limit_mb = Min(cfg->resize_rate_limit_mb, gs_amm_resize_batch_mb);
-    cfg->beam_width = Max(cfg->beam_width, 1);
-    cfg->beam_width = Min(cfg->beam_width, GS_AMM_MAX_BEAM);
-}
-
-static int gs_amm_resize_step_mb(const GsAmmSimState *state, GsAmmAction action, const GsAmmConfig *cfg)
-{
-    int granule_mb = gs_amm_configured_granule_mb();
-
-    if (action == GS_AMM_BORROW_FROM_BUFFER) {
-        int available = Max(state->active_mb - state->min_mb, 0);
-        int target_change = Min(Max(state->ap_demand_mb, granule_mb), available);
-
-        target_change = Min(target_change, Max(cfg->resize_rate_limit_mb, granule_mb));
-        return Max(target_change, 0);
-    }
-    if (action == GS_AMM_TP_RECOVERY) {
-        int available = Max(state->max_mb - state->active_mb, 0);
-        return Max(Min(available, Max(cfg->resize_rate_limit_mb, granule_mb)), 0);
-    }
-    return 0;
-}
-
-static const char *gs_amm_single_step_reason(const GsAmmSimState *state, GsAmmAction action, const GsAmmConfig *cfg)
-{
-    if (action == GS_AMM_OBSERVE || action == GS_AMM_AP_EXPAND || action == GS_AMM_AP_SHRINK ||
-        action == GS_AMM_BACKPRESSURE)
-        return "";
-    if (action == GS_AMM_TP_RECOVERY)
-        return state->active_mb < state->max_mb ? "" : "at_max";
-    if (action == GS_AMM_BORROW_FROM_BUFFER) {
-        if (state->tp_pressure >= cfg->tp_pressure_guard)
-            return "tp_pressure_guard";
-        if (state->io_pressure >= cfg->io_pressure_guard)
-            return "io_pressure_guard";
-        if (!state->tail_reclaimable)
-            return "tail_not_reclaimable";
-        if (state->ap_demand_mb <= cfg->deadband_mb)
-            return "no_demand";
-        if (state->active_mb - state->min_mb <= 0)
-            return "shared_buffers_min";
-        return "";
-    }
-    return "not_selectable";
-}
-
-static bool gs_amm_legal_single_step(const GsAmmSimState *state, GsAmmAction action, const GsAmmConfig *cfg)
-{
-    return gs_amm_single_step_reason(state, action, cfg)[0] == '\0';
-}
-
-static void gs_amm_apply_action(
-    const GsAmmSimState *state, GsAmmAction action, const GsAmmConfig *cfg, GsAmmSimState *out)
-{
-    *out = *state;
-    if (action == GS_AMM_BORROW_FROM_BUFFER)
-        out->active_mb = state->active_mb - gs_amm_resize_step_mb(state, action, cfg);
-    else if (action == GS_AMM_TP_RECOVERY)
-        out->active_mb = state->active_mb + gs_amm_resize_step_mb(state, action, cfg);
-    out->active_mb = Max(out->min_mb, Min(out->active_mb, out->max_mb));
-}
-
-static const char *gs_amm_violates_hard_constraints(
-    const GsAmmSimState *chain, const GsAmmAction *seq, int seq_len, const GsAmmConfig *cfg)
-{
-    for (int i = 0; i <= seq_len; i++) {
-        if (chain[i].active_mb < chain[i].min_mb)
-            return "below_min";
-        if (chain[i].active_mb > chain[i].max_mb)
-            return "above_max";
-    }
-    for (int i = 0; i < seq_len; i++) {
-        const GsAmmSimState *before = &chain[i];
-
-        if (seq[i] == GS_AMM_BORROW_FROM_BUFFER) {
-            if (!before->tail_reclaimable)
-                return "tail_not_reclaimable";
-            if (before->tp_pressure >= cfg->tp_pressure_guard)
-                return "tp_pressure_guard";
-            if (before->io_pressure >= cfg->io_pressure_guard)
-                return "io_pressure_guard";
-        } else if (seq[i] == GS_AMM_TP_RECOVERY && chain[i + 1].active_mb > before->max_mb)
-            return "above_max";
-    }
-    return NULL;
-}
-
-static double gs_amm_score_sequence(
-    const GsAmmSimState *chain, const GsAmmAction *seq, int seq_len, const GsAmmObservation *obs, const GsAmmConfig *cfg)
-{
-    int borrowed = 0;
-    int recovered = 0;
-    int nonzero_delta = 0;
-
-    for (int i = 0; i < seq_len; i++) {
-        int before = chain[i].active_mb;
-        int after = chain[i + 1].active_mb;
-
-        if (after != before)
-            nonzero_delta++;
-        if (seq[i] == GS_AMM_BORROW_FROM_BUFFER)
-            borrowed += Max(before - after, 0);
-        else if (seq[i] == GS_AMM_TP_RECOVERY)
-            recovered += Max(after - before, 0);
-    }
-
-    double ap_benefit = 0.0;
-    if (borrowed > 0 && obs->ap_demand_mb > 0) {
-        int useful = Min(borrowed, obs->ap_demand_mb);
-        ap_benefit = (double)useful * (double)useful / (double)Max(obs->ap_demand_mb, 1);
-    }
-    double tp_recovery_benefit = (double)recovered * obs->tp_pressure / 100.0;
-    int io_excess = Max(obs->io_pressure - (cfg->io_pressure_guard - cfg->hysteresis_enter_delta), 0);
-    double io_risk_penalty = (double)borrowed * io_excess / 100.0;
-    double resize_cost = (double)nonzero_delta;
-    int final_active = chain[seq_len].active_mb;
-    double grant_debt_risk = (double)chain[0].grant_debt_mb / (double)Max(final_active, 1);
-
-    return cfg->w_ap_benefit * ap_benefit + cfg->w_tp_recovery_benefit * tp_recovery_benefit -
-        cfg->w_io_risk_penalty * io_risk_penalty - cfg->w_resize_cost * resize_cost -
-        cfg->w_grant_debt_risk * grant_debt_risk;
-}
-
-static void gs_amm_sort_beam(GsAmmBeamEntry *beam, int count)
-{
-    for (int i = 1; i < count; i++) {
-        GsAmmBeamEntry key = beam[i];
-        int j = i - 1;
-
-        while (j >= 0 && beam[j].score < key.score) {
-            beam[j + 1] = beam[j];
-            j--;
-        }
-        beam[j + 1] = key;
-    }
-}
-
-static void gs_amm_plan_actions(
-    const GsAmmSimState *state0, const GsAmmObservation *obs, const GsAmmConfig *cfg, GsAmmPlanResult *result)
-{
-    GsAmmBeamEntry beam[GS_AMM_MAX_BEAM];
-    GsAmmBeamEntry next[GS_AMM_MAX_BEAM * GS_AMM_SELECTABLE_ACTIONS];
-    int beam_count = 1;
-    int legal0 = 0;
-    int rejected0 = 0;
-
-    errno_t rc = memset_s(result, sizeof(*result), 0, sizeof(*result));
-    securec_check(rc, "\0", "\0");
-    beam[0].chain[0] = *state0;
-    beam[0].len = 0;
-    beam[0].score = 0.0;
-
-    for (int step = 0; step < cfg->controller_horizon; step++) {
-        int next_count = 0;
-
-        for (int b = 0; b < beam_count; b++) {
-            const GsAmmSimState *last = &beam[b].chain[beam[b].len];
-
-            for (int a = 0; a < GS_AMM_SELECTABLE_ACTIONS; a++) {
-                GsAmmAction action = GS_AMM_SELECTABLE[a];
-                GsAmmBeamEntry *cand = NULL;
-
-                if (!gs_amm_legal_single_step(last, action, cfg))
-                    continue;
-
-                cand = &next[next_count];
-                *cand = beam[b];
-                gs_amm_apply_action(last, action, cfg, &cand->chain[cand->len + 1]);
-                cand->seq[cand->len] = action;
-                cand->len++;
-                if (gs_amm_violates_hard_constraints(cand->chain, cand->seq, cand->len, cfg) != NULL)
-                    continue;
-                cand->score = gs_amm_score_sequence(cand->chain, cand->seq, cand->len, obs, cfg);
-                next_count++;
-            }
-        }
-        if (next_count == 0) {
-            beam_count = 0;
-            break;
-        }
-        gs_amm_sort_beam(next, next_count);
-        next_count = Min(next_count, cfg->beam_width);
-        for (int b = 0; b < next_count; b++)
-            beam[b] = next[b];
-        beam_count = next_count;
-    }
-
-    for (int a = 0; a < GS_AMM_SELECTABLE_ACTIONS; a++) {
-        if (gs_amm_legal_single_step(state0, GS_AMM_SELECTABLE[a], cfg))
-            legal0++;
-        else
-            rejected0++;
-    }
-    result->candidate_count = legal0;
-    result->rejected_count = rejected0;
-    result->binding_constraint = gs_amm_single_step_reason(state0, GS_AMM_BORROW_FROM_BUFFER, cfg);
-
-    if (beam_count == 0) {
-        if (gs_amm_legal_single_step(state0, GS_AMM_TP_RECOVERY, cfg) && state0->tp_pressure >= cfg->tp_pressure_guard) {
-            result->chosen_action = GS_AMM_TP_RECOVERY;
-            result->best_sequence[0] = GS_AMM_TP_RECOVERY;
-            result->sequence_len = 1;
-            return;
-        }
-        result->chosen_action = GS_AMM_FAIL_CLOSED;
-        result->best_sequence[0] = GS_AMM_FAIL_CLOSED;
-        result->sequence_len = 1;
-        if (result->binding_constraint[0] == '\0')
-            result->binding_constraint = "no_safe_action";
-        return;
-    }
-
-    gs_amm_sort_beam(beam, beam_count);
-    result->chosen_action = beam[0].seq[0];
-    result->sequence_len = beam[0].len;
-    result->score = beam[0].score;
-    for (int a = 0; a < beam[0].len && a < GS_AMM_MAX_HORIZON; a++)
-        result->best_sequence[a] = beam[0].seq[a];
 }
 
 static int gs_amm_drain_pending_total(const GsAmmDrainStats *stats)
@@ -3758,8 +2937,7 @@ static void gs_amm_finalize_disabled_reclaims_locked(GsAmmSharedState *state)
         granule->used_bytes = 0;
         granule->alloc_cursor_bytes = 0;
         granule->reclaim_retry_after = 0;
-        if (ap_reclaim)
-            state->dynamic_used_mb = Max(state->dynamic_used_mb - granule_mb, 0);
+        (void)ap_reclaim;
     }
     gs_amm_refresh_granule_counts_locked(state);
 }
@@ -3778,12 +2956,43 @@ static void gs_amm_restore_buffer_granules_if_disabled(GsAmmSharedState *state)
 void GsAmmOnEnabledGucChange(bool enabled)
 {
     GsAmmSharedState *state = GsAmmState;
+    bool was_enabled;
 
     if (state == NULL)
         return;
 
     SpinLockAcquire(&state->mutex);
+    was_enabled = state->runtime_config.amm_enabled;
     state->runtime_config.amm_enabled = enabled;
+    if (enabled != was_enabled) {
+        /* A new AMM epoch gets a fresh TP hit baseline and borrow guard. */
+        state->tp_buffer_hit_baseline_hits = 0;
+        state->tp_buffer_hit_baseline_accesses = 0;
+        state->tp_buffer_hit_pct = 0;
+        state->tp_buffer_hit_baseline_valid = false;
+        state->tp_pressure_pct = 0;
+        state->tp_pressure_valid = false;
+        state->tp_pressure_hot = false;
+        state->tp_pressure_state = GS_AMM_TP_PRESSURE_UNKNOWN;
+        state->tp_hot_clear_windows = 0;
+        state->tp_window_shared_blks_hit = 0;
+        state->tp_window_shared_blks_read = 0;
+        state->tp_cpu_last_total_jiffies = 0;
+        state->tp_cpu_last_idle_jiffies = 0;
+        state->tp_cpu_util_pct = 0;
+        state->tp_cpu_util_valid = false;
+        state->tp_cpu_guarded = false;
+        state->tp_test_mode_until = 0;
+        state->tp_test_worker_surge_until = 0;
+        state->tp_baseline_tps = 0;
+        state->tp_recent_tps = 0;
+        state->tp_tps_baseline_valid = false;
+        state->tp_tps_guarded = false;
+        state->tp_window_completed_queries = 0;
+        state->ap_borrow_buffer_hit_guarded = false;
+        state->ap_borrow_count = 0;
+        state->last_ap_borrow_at = 0;
+    }
     SpinLockRelease(&state->mutex);
     /* GUC defaults are assigned before the postmaster attaches buffer strategy shared memory. */
     if (!enabled && t_thrd.storage_cxt.StrategyControl != NULL)
@@ -3810,20 +3019,6 @@ static int gs_amm_free_granule_mb_locked(GsAmmSharedState *state)
             free_mb += gs_amm_granule_capacity_mb(granule);
     }
     return free_mb;
-}
-
-static int gs_amm_lifecycle_exhausted_granules_locked(GsAmmSharedState *state)
-{
-    int exhausted = 0;
-
-    for (int i = 0; i < state->total_granules; i++) {
-        GsAmmGranuleMeta *granule = &state->granules[i];
-
-        if (granule->state == GS_AMM_GRANULE_FREE &&
-            !GsAmmGranuleCanCompleteApLifecycle(granule->generation, granule->owner_epoch))
-            exhausted++;
-    }
-    return exhausted;
 }
 
 static int gs_amm_granule_grant_mb(const GsAmmGranuleMeta *granule)
@@ -4056,75 +3251,9 @@ static int gs_amm_release_ap_granules_locked(GsAmmSharedState *state, GsAmmGrant
     return released_mb;
 }
 
-static bool gs_amm_retry_failed_reclaim(GsAmmSharedState *state)
-{
-    GsAmmGranuleMeta reclaim_snapshot;
-    GsAmmGranuleMeta *granule = NULL;
-    TimestampTz now = GetCurrentTimestamp();
-    uint64 drain_attempt = 0;
-    uint32 owner_epoch = 0;
-    uint64 reclaim_attempt = 0;
-    uint64 reclaimed_mb = 0;
-    int granule_mb = 0;
-    bool ap_reclaim = false;
-    volatile bool reclaimed = false;
-    bool completed;
-
-    SpinLockAcquire(&state->mutex);
-    for (int i = 0; i < state->total_granules; i++) {
-        GsAmmGranuleMeta *candidate = &state->granules[i];
-
-        if (candidate->state != GS_AMM_GRANULE_RECLAIMING || candidate->reclaim_attempt == 0 ||
-            candidate->reclaim_inflight ||
-            candidate->reclaim_retry_after > now)
-            continue;
-        granule = candidate;
-        owner_epoch = granule->owner_epoch;
-        reclaim_attempt = granule->reclaim_attempt;
-        granule_mb = gs_amm_granule_grant_mb(granule);
-        ap_reclaim = granule->grant_id != 0 && granule->grant_generation != 0;
-        drain_attempt = ap_reclaim ? 0 : granule->drain_attempt;
-        if (!gs_amm_acquire_reclaim_syscall_lease_locked(state, granule, drain_attempt,
-            owner_epoch, reclaim_attempt)) {
-            granule = NULL;
-            break;
-        }
-        reclaim_snapshot = *granule;
-        break;
-    }
-    SpinLockRelease(&state->mutex);
-    if (granule == NULL)
-        return false;
-
-    PG_TRY();
-    {
-        reclaimed = gs_amm_reclaim_granule_memory(&reclaim_snapshot, &reclaimed_mb);
-    }
-    PG_CATCH();
-    {
-        SpinLockAcquire(&state->mutex);
-        (void)gs_amm_complete_reclaim_locked(
-            state, granule, drain_attempt, owner_epoch, reclaim_attempt, false, 0);
-        gs_amm_refresh_granule_counts_locked(state);
-        SpinLockRelease(&state->mutex);
-        gs_amm_restore_buffer_granules_if_disabled(state);
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    SpinLockAcquire(&state->mutex);
-    completed = gs_amm_complete_reclaim_locked(
-        state, granule, drain_attempt, owner_epoch, reclaim_attempt, reclaimed, reclaimed_mb);
-    if (completed && granule->state == GS_AMM_GRANULE_FREE && ap_reclaim)
-        state->dynamic_used_mb = Max(state->dynamic_used_mb - granule_mb, 0);
-    gs_amm_refresh_granule_counts_locked(state);
-    SpinLockRelease(&state->mutex);
-    if (completed)
-        gs_amm_restore_buffer_granules_if_disabled(state);
-    return completed;
-}
-
-static int gs_amm_reclaim_unused_ap_granules_locked(GsAmmSharedState *state, int requested_mb)
+static int gs_amm_reclaim_unused_ap_granules_locked(
+    GsAmmSharedState *state, int requested_mb, int required_granule_id, uint64 required_grant_id,
+    uint64 required_grant_generation)
 {
     int released_mb = 0;
 
@@ -4148,9 +3277,16 @@ static int gs_amm_reclaim_unused_ap_granules_locked(GsAmmSharedState *state, int
         for (int i = state->total_granules - 1; i >= 0; i--) {
             GsAmmGranuleMeta *candidate = &state->granules[i];
 
+            if (required_granule_id >= 0 && i != required_granule_id)
+                continue;
+            if (required_grant_id != 0 &&
+                (candidate->grant_id != required_grant_id ||
+                    candidate->grant_generation != required_grant_generation))
+                continue;
             if ((candidate->state != GS_AMM_GRANULE_AP_ACTIVE &&
                     candidate->state != GS_AMM_GRANULE_AP_RESERVED) ||
-                candidate->used_bytes != 0 || candidate->alloc_cursor_bytes != 0 ||
+                candidate->used_bytes != 0 ||
+                (required_granule_id < 0 && candidate->alloc_cursor_bytes != 0) ||
                 candidate->scan_inflight || candidate->reclaim_inflight ||
                 !gs_amm_grant_retains_minimum_capacity_locked(state, candidate))
                 continue;
@@ -4194,8 +3330,10 @@ static int gs_amm_reclaim_unused_ap_granules_locked(GsAmmSharedState *state, int
             reclaim_attempt, reclaimed, reclaimed_mb);
         if (completed && granule->state == GS_AMM_GRANULE_FREE) {
             released_mb += granule_mb;
-            state->ap_idle_reclaim_count++;
-            state->ap_idle_reclaim_mb += granule_mb;
+            if (required_granule_id < 0) {
+                state->ap_idle_reclaim_count++;
+                state->ap_idle_reclaim_mb += granule_mb;
+            }
         }
         gs_amm_refresh_granule_counts_locked(state);
         if (!completed)
@@ -4210,8 +3348,17 @@ static void gs_amm_backend_cleanup(int code, Datum arg)
     (void)code;
     (void)arg;
 
-    gs_amm_release_backend_grant(false);
+    gs_amm_cancel_waiting_request();
+    gs_amm_release_backend_grant();
     MyGsAmmCleanupRegistered = false;
+}
+
+void GsAmmSessionCleanup(int code, Datum arg)
+{
+    /* Thread-pool sessions are recycled on the same backend thread, so the
+     * process-exit callback is not sufficient to release an AP queue slot or
+     * grant.  Keep the cleanup idempotent for both callback paths. */
+    gs_amm_backend_cleanup(code, arg);
 }
 
 static void gs_amm_register_backend_cleanup(void)
@@ -4223,14 +3370,54 @@ static void gs_amm_register_backend_cleanup(void)
     MyGsAmmCleanupRegistered = true;
 }
 
-bool GsAmmReleaseGrantToken(GsAmmGrantToken expected_token, bool restore_work_mem)
+static void gs_amm_release_unclaimed_queue_grant(GsAmmGrantToken token)
+{
+    GsAmmSharedState *state = GsAmmState;
+
+    if (state == NULL || token.grant_id == 0 || token.grant_generation == 0)
+        return;
+    (void)gs_amm_release_ap_granules_locked(state, token);
+    SpinLockAcquire(&state->mutex);
+    gs_amm_unregister_ap_locked(state, token);
+    if (state->active_ap_count > 0)
+        state->active_ap_count--;
+    gs_amm_refresh_ap_totals_locked(state);
+    SpinLockRelease(&state->mutex);
+}
+
+static void gs_amm_cancel_waiting_request(void)
+{
+    GsAmmSharedState *state = GsAmmState;
+    GsAmmGrantToken token = {0, 0};
+
+    if (state == NULL || MyGsAmmQueueTicket == 0)
+        return;
+    SpinLockAcquire(&state->mutex);
+    GsAmmApQueueSlot *slot = gs_amm_find_queue_slot_locked(state, MyGsAmmQueueTicket);
+    /* During thread-pool session teardown the PGPROC identity fields may
+     * already have been recycled.  The ticket is thread-local and globally
+     * unique, so it is the authoritative ownership check here. */
+    if (slot != NULL) {
+        if (slot->state == GS_AMM_AP_QUEUE_GRANTED)
+            token = slot->grant_token;
+        (void)memset_s(slot, sizeof(*slot), 0, sizeof(*slot));
+        state->ap_queue_cancel_count++;
+        gs_amm_refresh_ap_queue_totals_locked(state);
+        gs_amm_refresh_ap_target_totals_locked(state);
+    }
+    SpinLockRelease(&state->mutex);
+    MyGsAmmQueueTicket = 0;
+    if (token.grant_id != 0)
+        gs_amm_release_unclaimed_queue_grant(token);
+}
+
+bool GsAmmReleaseGrantToken(GsAmmGrantToken expected_token)
 {
     GsAmmSharedState *state = GsAmmState;
     GsAmmGrantToken backend_token = {MyGsAmmGrantId, MyGsAmmGrantGeneration};
     uint64 grant_id = expected_token.grant_id;
     int released_mb = 0;
-    int saved_work_mem_kb = MyGsAmmSavedWorkMemKb;
-    bool had_grant = MyGsAmmGrantMb > 0;
+    bool had_grant = MyGsAmmGrantId != 0;
     bool native_grant = MyGsAmmGrantNative;
 
     if (expected_token.grant_id == 0 || expected_token.grant_generation == 0 ||
@@ -4243,20 +3430,30 @@ bool GsAmmReleaseGrantToken(GsAmmGrantToken expected_token, bool restore_work_me
 
     PG_TRY();
     {
+    /* A final grant release may happen during backend/error cleanup while a
+     * cursor-owned sort is still registered.  Drop the thread-local links
+     * before the grant's memory becomes invalid. */
+    tuplesort_clear_amm_reclaim_states();
     gs_amm_grant_arena_reset(expected_token);
+    gs_amm_release_dynamic_allocations(expected_token);
     MyGsAmmGrantGeneration = 0;
 
     if (state != NULL && grant_id != 0) {
         released_mb = gs_amm_release_ap_granules_locked(state, expected_token);
         SpinLockAcquire(&state->mutex);
-        if (released_mb > 0)
-            state->dynamic_used_mb = Max(state->dynamic_used_mb - released_mb, 0);
+        gs_amm_unregister_ap_locked(state, expected_token);
+        (void)released_mb;
         if (had_grant && state->active_ap_count > 0)
             state->active_ap_count--;
+        /* Once the registry is empty no AP reservation can contribute to
+         * dynamic usage.  Keep the global quota consistent even if an
+         * earlier reclaim completed after its accounting update. */
         if (state->active_ap_count == 0) {
-            state->effective_grant_kb = 0;
-            state->last_effective_grant_kb = 0;
+            state->dynamic_reserved_bytes = 0;
+            state->dynamic_allocated_bytes = 0;
+            state->dynamic_used_mb = 0;
         }
+        gs_amm_refresh_ap_totals_locked(state);
         if (native_grant) {
             state->native_release_count++;
             if (state->native_active_grant_count > 0)
@@ -4276,8 +3473,6 @@ bool GsAmmReleaseGrantToken(GsAmmGrantToken expected_token, bool restore_work_me
 
     /* GUC restoration can report errors; never leave a released grant owned by this backend. */
     gs_amm_clear_backend_grant_state();
-    if (restore_work_mem)
-        gs_amm_restore_backend_work_mem(saved_work_mem_kb);
     }
     PG_CATCH();
     {
@@ -4290,18 +3485,18 @@ bool GsAmmReleaseGrantToken(GsAmmGrantToken expected_token, bool restore_work_me
     return true;
 }
 
-bool GsAmmReleaseGrant(uint64 expected_generation, bool restore_work_mem)
+bool GsAmmReleaseGrant(uint64 expected_generation)
 {
     GsAmmGrantToken expected_token = {MyGsAmmGrantId, expected_generation};
 
-    return GsAmmReleaseGrantToken(expected_token, restore_work_mem);
+    return GsAmmReleaseGrantToken(expected_token);
 }
 
-static void gs_amm_release_backend_grant(bool restore_work_mem)
+static void gs_amm_release_backend_grant(void)
 {
     GsAmmGrantToken token = {MyGsAmmGrantId, MyGsAmmGrantGeneration};
 
-    (void)GsAmmReleaseGrantToken(token, restore_work_mem);
+    (void)GsAmmReleaseGrantToken(token);
 }
 
 static int gs_amm_reserve_ap_granules_locked(
@@ -4383,13 +3578,65 @@ static int gs_amm_current_active_buffer_blocks(GsAmmSharedState *state)
     return active_blocks > 0 ? active_blocks : StrategyActiveBufferCount();
 }
 
+static void gs_amm_request_ap_stop_locked(GsAmmSharedState *state)
+{
+    if (state == NULL)
+        return;
+    state->tp_recovery_phase = GS_AMM_TP_RECOVERY_WAIT_AP;
+    for (int index = 0; index < GS_AMM_MAX_AP_REGISTRY; index++) {
+        GsAmmApRecord *record = &state->ap_registry[index];
+
+        if (!record->active || record->stop_requested)
+            continue;
+        record->stop_requested = true;
+        state->tp_ap_stop_requested++;
+        if (record->backend_pid != 0)
+            (void)SendProcSignal(record->backend_pid, PROCSIG_AMM_AP_STOP, record->backend_id);
+    }
+    /* A queued AP has not received a grant yet, but it is still an active
+     * query blocked in the admission latch.  Cancel it as part of the same
+     * TP-priority transition so no waiter can be admitted after recovery. */
+    for (int index = 0; index < GS_AMM_AP_QUEUE_CAPACITY; index++) {
+        GsAmmApQueueSlot *slot = &state->ap_queue[index];
+
+        if (slot->state == GS_AMM_AP_QUEUE_WAITING && slot->waiter_pid != 0)
+            (void)SendProcSignal(slot->waiter_pid, PROCSIG_AMM_AP_STOP, InvalidBackendId);
+    }
+}
+
+static void gs_amm_restore_shared_buffer_after_ap_stop(GsAmmSharedState *state)
+{
+    GsAmmResizeOutcome outcome;
+    int before_blocks;
+    int baseline_blocks;
+
+    if (state == NULL)
+        return;
+    before_blocks = gs_amm_current_active_buffer_blocks(state);
+    SpinLockAcquire(&state->mutex);
+    if (state->active_ap_count != 0 || state->tp_recovery_phase == GS_AMM_TP_RECOVERY_RESTORE_SB) {
+        SpinLockRelease(&state->mutex);
+        return;
+    }
+    state->tp_recovery_phase = GS_AMM_TP_RECOVERY_RESTORE_SB;
+    baseline_blocks = gs_amm_mb_to_blocks(state->baseline_active_mb);
+    SpinLockRelease(&state->mutex);
+
+    gs_amm_resize_core(baseline_blocks, &outcome);
+    SpinLockAcquire(&state->mutex);
+    if (outcome.active_blocks >= baseline_blocks && outcome.active_blocks > before_blocks)
+        state->tp_sb_restore_granules += (uint64)((outcome.active_blocks - before_blocks + state->granule_blocks - 1) /
+            state->granule_blocks);
+    state->ap_multipass_only = true;
+    state->tp_recovery_phase = GS_AMM_TP_RECOVERY_MULTIPASS;
+    state->last_action = GS_AMM_TP_RECOVERY_DONE;
+    SpinLockRelease(&state->mutex);
+}
+
 static void gs_amm_resize_core(int target_blocks, GsAmmResizeOutcome *out)
 {
     GsAmmSharedState *state = gs_amm_get_state();
     int active_buffers = gs_amm_current_active_buffer_blocks(state);
-    TimestampTz now = GetCurrentTimestamp();
-    bool guard_blocked = false;
-    const char *guard_state = "ready";
     int final_active_buffers = active_buffers;
     int pending_retire_blocks = 0;
     bool drain_deferred = false;
@@ -4400,39 +3647,6 @@ static void gs_amm_resize_core(int target_blocks, GsAmmResizeOutcome *out)
     out->active_blocks = active_buffers;
     out->pending_retire_blocks = 0;
     out->rolled_back = false;
-
-    if (target_blocks != active_buffers) {
-        GsAmmGranuleSummary guard_event_before;
-
-        SpinLockAcquire(&state->mutex);
-        guard_state = gs_amm_resize_guard_state(state, now);
-        gs_amm_summarize_granules_locked(state, &guard_event_before);
-        if (gs_amm_recent_tps_drop_blocks_resize_locked(state, now)) {
-            state->guard_block_count++;
-            if (target_blocks < active_buffers) {
-                state->rollback_count++;
-                state->last_rollback_target_mb = (int)gs_amm_blocks_to_mb(active_buffers);
-                state->cooldown_until = gs_amm_timestamp_after_ms(now, gs_amm_resize_cooldown_ms);
-            }
-            if (gs_amm_recovery_cooldown_hot_locked(state, now))
-                state->recovery_cooldown_block_count++;
-            guard_state = gs_amm_resize_guard_state(state, now);
-            gs_amm_record_pool_event_locked(state, GS_AMM_FAIL_CLOSED, guard_state,
-                &guard_event_before, now);
-            guard_blocked = true;
-        } else {
-            state->last_resize_time = now;
-            state->resize_observe_until = gs_amm_timestamp_after_ms(now, gs_amm_resize_observe_window_ms);
-        }
-        SpinLockRelease(&state->mutex);
-
-        if (guard_blocked) {
-            out->decision = "guard_blocked";
-            out->reason = guard_state;
-            out->rolled_back = true;
-            return;
-        }
-    }
 
     if (target_blocks < active_buffers) {
         for (int granule_id = state->total_granules - 1; granule_id >= 0 && final_active_buffers > target_blocks;
@@ -4457,29 +3671,6 @@ static void gs_amm_resize_core(int target_blocks, GsAmmResizeOutcome *out)
             if (!can_drain)
                 continue;
 
-            now = GetCurrentTimestamp();
-            GsAmmGranuleSummary guard_event_before;
-
-            SpinLockAcquire(&state->mutex);
-            gs_amm_summarize_granules_locked(state, &guard_event_before);
-            if (gs_amm_recent_tps_drop_blocks_resize_locked(state, now)) {
-                state->guard_block_count++;
-                state->rollback_count++;
-                state->last_rollback_target_mb = (int)gs_amm_blocks_to_mb(final_active_buffers);
-                state->cooldown_until = gs_amm_timestamp_after_ms(now, gs_amm_resize_cooldown_ms);
-                guard_state = gs_amm_resize_guard_state(state, now);
-                gs_amm_record_pool_event_locked(state, GS_AMM_FAIL_CLOSED, guard_state,
-                    &guard_event_before, now);
-                guard_blocked = true;
-            }
-            SpinLockRelease(&state->mutex);
-            if (guard_blocked) {
-                out->decision = "guard_blocked";
-                out->reason = guard_state;
-                out->rolled_back = true;
-                break;
-            }
-
             if (gs_amm_drain_granule_with_operation(state, granule_id, &stats)) {
                 final_active_buffers = gs_amm_current_active_buffer_blocks(state);
             } else {
@@ -4493,7 +3684,7 @@ static void gs_amm_resize_core(int target_blocks, GsAmmResizeOutcome *out)
         final_active_buffers = gs_amm_expand_granules(state, target_blocks, false);
     }
 
-    if (!guard_blocked) {
+    {
         if (target_blocks < active_buffers) {
             if (final_active_buffers <= target_blocks)
                 out->decision = "shrunk";
@@ -4515,1957 +3706,1166 @@ static void gs_amm_resize_core(int target_blocks, GsAmmResizeOutcome *out)
     out->pending_retire_blocks = Max(pending_retire_blocks, Max(out->active_blocks - target_blocks, 0));
 }
 
+
 Datum gs_amm_status(PG_FUNCTION_ARGS)
 {
-    char status[10240];
     GsAmmSharedState *state = gs_amm_get_state();
-    TimestampTz now = GetCurrentTimestamp();
-    GsAmmGranuleSummary granule_summary;
-    int active_buffers;
+    char status[4096];
+    int active_mb;
     int dynamic_target_mb;
     int dynamic_used_mb;
+    int dynamic_pool_free_mb;
+    uint64 dynamic_reserved_bytes;
+    uint64 dynamic_allocated_bytes;
     int active_ap_count;
-    int ap_queue_len;
-    uint64 ap_queue_head;
-    uint64 ap_queue_tail;
-    int ap_queue_admit_count;
-    int ap_queue_timeout_count;
-    int last_queue_wait_ms;
-    int backpressure_count;
-    int new_ap_guard_block_count;
-    int grant_shrink_count;
-    int grant_debt_mb;
-    int effective_grant_kb;
-    int effective_downgrade_count;
-    double tp_baseline_tps;
-    double tp_recent_tps;
-    double tp_p95_latency_ms;
-    double tp_raw_drop_ratio;
-    int tp_window_ms;
-    int tp_sample_count;
-    int tp_baseline_rebase_count;
-    bool tp_guard_hot;
-    bool tp_generation_exhausted;
-    double physical_read_rate;
-    uint64 pending_writeback_pages;
-    double dirty_page_ratio;
-    int device_io_in_flight;
-    double device_io_ms_rate;
-    bool device_io_available;
-    double temp_spill_mb_rate;
-    double hash_multipass_rate;
-    int io_recovery_stable_windows;
-    int io_pressure_observed;
-    int io_window_ms;
-    bool io_guard_hot;
-    long resize_cooldown_ms;
-    long recovery_cooldown_ms;
-    int guard_block_count;
-    int rollback_count;
-    int recovery_action_count;
-    int recovery_cooldown_block_count;
-    int last_rollback_target_mb;
-    const char *resize_guard_state;
-    char last_backpressure_reason[32];
-    int last_prediction_mb;
-    int last_tp_pressure;
-    int last_io_pressure;
-    int last_grant_mb;
-    int last_effective_grant_kb;
-    GsAmmAction last_action;
-    int granule_mb;
-    int granule_blocks;
-    int total_granules;
-    int buffer_active_granules;
-    int buffer_draining_granules;
-    int reclaiming_granules;
+    GsAmmStage stage;
+    int ap_registry_count;
+    uint64 ap_granted_bytes_total;
+    uint64 ap_used_bytes_total;
+    uint64 ap_reclaimable_bytes_total;
+    int active_target_demand_mb;
+    int queued_target_demand_mb = 0;
+    int current_target_mb;
+    int aggregate_target_mb;
+    int dynamic_deficit_mb;
+    uint64 ap_borrow_count;
+    char last_supply_source[24];
+    int ap_queue_len = 0;
+    uint64 ap_queue_admit_count = 0;
+    uint64 ap_queue_cancel_count = 0;
     int free_granules;
-    int lifecycle_exhausted_granules;
-    int ap_reserved_granules;
     int ap_active_granules;
-    uint64 ap_grant_bytes;
-    uint64 ap_granule_used_bytes;
-    uint64 ap_granule_alloc_cursor_bytes;
-    uint64 granule_alloc_success_count;
-    uint64 granule_alloc_no_mapping_count;
-    uint64 granule_alloc_no_owner_count;
-    uint64 granule_alloc_capacity_exhausted_count;
-    uint64 grant_reused_bytes;
-    uint64 illegal_transition_count;
-    uint64 epoch_mismatch_reject_count;
-    uint64 stale_grant_token_count;
-    int drain_pending_dirty;
-    int drain_pending_pinned;
-    int drain_pending_io;
-    int drain_pending_hash;
-    int drain_success_count;
-    int drain_fail_count;
-    int drain_rollback_count;
-    int drain_priority_flush_count;
-    uint64 reclaimed_mb;
-    int reclaim_fail_count;
-    int ap_idle_reclaim_count;
-    int ap_idle_reclaim_mb;
-    int auto_controller_step_count;
-    uint64 native_eligible_count;
-    uint64 native_admit_count;
-    uint64 native_reject_count;
-    uint64 native_release_count;
-    uint64 native_error_cleanup_count;
-    int native_active_grant_count;
-    bool native_current_active;
-    uint64 native_current_grant_id;
-    uint64 native_current_grant_generation;
-    int native_current_granted_kb;
-    GsAmmMemoryMode native_current_memory_mode;
-    int64 native_current_model_version;
-    int64 native_current_leaf_id;
-    int64 native_current_calibration_version;
-    double native_current_calibration_scale;
-    double native_current_raw_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double native_current_calibrated_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    char native_last_reason[GS_AMM_ADMISSION_REASON_LENGTH];
-    uint64 dtree_feedback_sample_count;
-    uint64 dtree_feedback_sample_dropped;
-    uint64 dtree_feedback_pending;
-    uint64 dtree_calibration_sample_dropped;
-    bool dtree_last_feedback_available;
-    bool dtree_last_feedback_measurement_valid;
-    double dtree_last_feedback_observed_work_mem_kb;
-    double dtree_last_feedback_grant_mb;
-    uint64 dtree_last_feedback_spill_bytes;
-    uint32 dtree_last_feedback_spill_files;
-    uint32 dtree_last_feedback_spill_events;
-    uint64 dtree_last_feedback_session_id;
-    int64 dtree_model_version;
-    int64 dtree_leaf_id;
-    int64 dtree_calibration_version;
-    double dtree_calibration_scale;
-    uint64 dtree_calibration_update_count;
-    int dtree_calibrated_leaf_count;
-    int dtree_rollback_count;
-    int dtree_frozen_leaf_count;
-    double dtree_scale_min;
-    double dtree_scale_max;
-    double dtree_scale_avg;
-    double dtree_ewma_underpredict_rate;
-    double dtree_ewma_spill_mb;
-    double dtree_ewma_runtime_ms;
-    bool allocator_only_mode;
-    int allocator_only_grant_mb;
-    bool feedback_only_mode;
-    int feedback_bootstrap_grant_mb;
-    int feedback_max_grant_mb;
-    int feedback_current_grant_mb;
-    int feedback_ap_slot_limit;
-    int feedback_stable_windows;
-    uint64 feedback_completed_count;
-    uint64 feedback_admit_count;
-    uint64 feedback_growth_count;
-    uint64 feedback_backoff_count;
-    uint64 feedback_slot_block_count;
-    double feedback_ewma_runtime_ms;
-    double feedback_ewma_spill_mb;
-    double feedback_ewma_peak_mb;
-    char feedback_last_action[32];
-    bool dtree_calibration_enabled;
-    bool dtree_record_only;
-    GsAmmRuntimeConfig runtime_config;
-    uint64 config_version;
-    int visible_auto_controller_step_count;
-    uint64 pool_event_id;
-    TimestampTz pool_event_time;
-    GsAmmAction pool_event_action;
-    int pool_event_duration_ms;
-    GsAmmGranuleSummary pool_event_before;
-    GsAmmGranuleSummary pool_event_after;
-    char pool_event_reason[64];
-    int granule_state_sum;
-    bool granule_state_consistent;
-    uint64 recorded_ap_grant_bytes;
-    bool granule_grant_bytes_consistent;
-    bool granule_used_within_grant;
-    uint64 inactive_granule_buffer_violations;
+    int last_prediction_mb;
+    int last_grant_mb;
+    GsAmmAction last_action;
+    int tp_pressure_pct;
+    bool tp_pressure_hot;
+    GsAmmTpPressureState tp_pressure_state;
+    bool tp_pressure_valid;
+    int tp_cpu_util_pct;
+    bool tp_cpu_util_valid;
+    bool tp_cpu_guarded;
+    int baseline_active_mb;
+    int tp_buffer_hit_baseline_pct;
+    int tp_buffer_hit_pct;
+    bool tp_buffer_hit_baseline_valid;
+    uint64 tp_baseline_tps;
+    uint64 tp_recent_tps;
+    bool tp_tps_baseline_valid;
+    bool tp_tps_guarded;
+    bool ap_borrow_buffer_hit_guarded;
+    int effective_dynamic_target_mb;
+    int pending_demand_mb = 0;
+    char last_backpressure_reason[GS_AMM_ADMISSION_REASON_LENGTH];
+    uint64 tp_recovery_requested_granules;
+    uint64 tp_recovered_granules;
+    uint64 tp_recovery_deferred_count;
+    int ap_downgrade_pending;
+    uint64 ap_reclaim_poll_count;
+    uint64 ap_reclaim_operator_release_bytes;
+    int tp_low_pressure_windows;
+    int tp_hot_clear_windows;
+    GsAmmTpRecoveryPhase tp_recovery_phase;
+    bool ap_multipass_only;
+    uint64 tp_ap_stop_requested;
+    uint64 tp_ap_stop_completed;
+    uint64 tp_sb_restore_granules;
+    GsAmmGranuleSummary granule_summary;
 
     SpinLockAcquire(&state->mutex);
     gs_amm_summarize_granules_locked(state, &granule_summary);
-    active_buffers = granule_summary.buffer_active_blocks;
+    active_mb = (int)gs_amm_blocks_to_mb(granule_summary.buffer_active_blocks);
+    if (active_mb <= 0)
+        active_mb = (int)gs_amm_blocks_to_mb(StrategyActiveBufferCount());
     dynamic_target_mb = state->dynamic_target_mb;
     dynamic_used_mb = state->dynamic_used_mb;
+    dynamic_pool_free_mb = gs_amm_dynamic_free_mb_locked(state);
+    dynamic_reserved_bytes = state->dynamic_reserved_bytes;
+    dynamic_allocated_bytes = state->dynamic_allocated_bytes;
     active_ap_count = state->active_ap_count;
-    ap_queue_len = state->ap_queue_len;
-    ap_queue_head = state->ap_queue_head;
-    ap_queue_tail = state->ap_queue_tail;
-    ap_queue_admit_count = state->ap_queue_admit_count;
-    ap_queue_timeout_count = state->ap_queue_timeout_count;
-    last_queue_wait_ms = state->last_queue_wait_ms;
-    backpressure_count = state->backpressure_count;
-    new_ap_guard_block_count = state->new_ap_guard_block_count;
-    grant_shrink_count = state->grant_shrink_count;
-    grant_debt_mb = state->grant_debt_mb;
-    effective_grant_kb = state->effective_grant_kb;
-    effective_downgrade_count = state->effective_downgrade_count;
+    stage = state->stage;
+    ap_registry_count = state->ap_registry_count;
+    ap_granted_bytes_total = state->ap_granted_bytes_total;
+    ap_used_bytes_total = state->ap_used_bytes_total;
+    ap_reclaimable_bytes_total = state->ap_reclaimable_bytes_total;
+    gs_amm_refresh_ap_target_totals_locked(state);
+    active_target_demand_mb = state->active_target_demand_mb;
+    current_target_mb = state->last_current_target_mb;
+    aggregate_target_mb = state->last_aggregate_target_mb + state->queued_target_demand_mb;
+    dynamic_deficit_mb = state->last_dynamic_deficit_mb;
+    ap_borrow_count = state->ap_borrow_count;
+    (void)snprintf_s(last_supply_source, sizeof(last_supply_source),
+        sizeof(last_supply_source) - 1, "%s", state->last_supply_source);
+    free_granules = state->free_granules;
+    ap_active_granules = state->ap_active_granules;
+    last_prediction_mb = state->last_prediction_mb;
+    last_grant_mb = state->last_grant_mb;
+    last_action = state->last_action;
+    tp_pressure_pct = state->tp_pressure_pct;
+    tp_pressure_hot = state->tp_pressure_hot;
+    tp_pressure_state = state->tp_pressure_state;
+    tp_pressure_valid = state->tp_pressure_valid;
+    tp_cpu_util_pct = state->tp_cpu_util_pct;
+    tp_cpu_util_valid = state->tp_cpu_util_valid;
+    tp_cpu_guarded = state->tp_cpu_guarded;
+    baseline_active_mb = state->baseline_active_mb;
+    tp_buffer_hit_baseline_pct = state->tp_buffer_hit_baseline_accesses > 0 ?
+        (int)((state->tp_buffer_hit_baseline_hits * 100) /
+            state->tp_buffer_hit_baseline_accesses) : 0;
+    tp_buffer_hit_pct = state->tp_buffer_hit_pct;
+    tp_buffer_hit_baseline_valid = state->tp_buffer_hit_baseline_valid;
     tp_baseline_tps = state->tp_baseline_tps;
     tp_recent_tps = state->tp_recent_tps;
-    tp_p95_latency_ms = state->tp_p95_latency_ms;
-    tp_raw_drop_ratio = state->tp_raw_drop_ratio;
-    tp_window_ms = state->tp_window_ms;
-    tp_sample_count = state->tp_sample_count;
-    tp_baseline_rebase_count = state->tp_baseline_rebase_count;
-    tp_guard_hot = gs_amm_tp_drop_guard_hot_locked(state);
-    tp_generation_exhausted = state->tp_generation_exhausted;
-    physical_read_rate = state->physical_read_rate;
-    pending_writeback_pages = state->pending_writeback_pages;
-    dirty_page_ratio = state->dirty_page_ratio;
-    device_io_in_flight = state->device_io_in_flight;
-    device_io_ms_rate = state->device_io_ms_rate;
-    device_io_available = state->device_io_available;
-    temp_spill_mb_rate = state->temp_spill_mb_rate;
-    hash_multipass_rate = state->hash_multipass_rate;
-    io_recovery_stable_windows = state->io_recovery_stable_windows;
-    io_pressure_observed = state->io_pressure_observed;
-    io_window_ms = state->io_window_ms;
-    io_guard_hot = gs_amm_io_guard_hot_locked(state);
-    resize_cooldown_ms = state->cooldown_until > now ? (long)((state->cooldown_until - now) / 1000) : 0L;
-    recovery_cooldown_ms =
-        state->recovery_cooldown_until > now ? (long)((state->recovery_cooldown_until - now) / 1000) : 0L;
-    guard_block_count = state->guard_block_count;
-    rollback_count = state->rollback_count;
-    recovery_action_count = state->recovery_action_count;
-    recovery_cooldown_block_count = state->recovery_cooldown_block_count;
-    last_rollback_target_mb = state->last_rollback_target_mb;
-    resize_guard_state = gs_amm_resize_guard_state(state, now);
-    int reason_rc = snprintf_s(last_backpressure_reason, sizeof(last_backpressure_reason),
+    tp_tps_baseline_valid = state->tp_tps_baseline_valid;
+    tp_tps_guarded = state->tp_tps_guarded;
+    ap_borrow_buffer_hit_guarded = state->ap_borrow_buffer_hit_guarded;
+    effective_dynamic_target_mb = gs_amm_effective_dynamic_target_mb();
+    queued_target_demand_mb = state->queued_target_demand_mb;
+    pending_demand_mb = state->pending_demand_mb;
+    ap_queue_len = state->queued_ap_count;
+    ap_queue_admit_count = state->ap_queue_admit_count;
+    ap_queue_cancel_count = state->ap_queue_cancel_count;
+    (void)snprintf_s(last_backpressure_reason, sizeof(last_backpressure_reason),
         sizeof(last_backpressure_reason) - 1, "%s", state->last_backpressure_reason);
-    securec_check_ss(reason_rc, "\0", "\0");
-    last_prediction_mb = state->last_prediction_mb;
-    last_tp_pressure = state->last_tp_pressure;
-    last_io_pressure = state->last_io_pressure;
-    last_grant_mb = state->last_grant_mb;
-    last_effective_grant_kb = state->last_effective_grant_kb;
-    last_action = state->last_action;
-    pool_event_id = state->last_pool_event_id;
-    pool_event_time = state->last_pool_event_time;
-    pool_event_action = state->last_pool_event_action;
-    pool_event_duration_ms = state->last_pool_event_duration_ms;
-    pool_event_before = state->last_pool_event_before;
-    pool_event_after = state->last_pool_event_after;
-    int event_reason_rc = snprintf_s(pool_event_reason, sizeof(pool_event_reason), sizeof(pool_event_reason) - 1,
-        "%s", state->last_pool_event_reason);
-    securec_check_ss(event_reason_rc, "\0", "\0");
-    granule_mb = state->granule_mb;
-    granule_blocks = state->granule_blocks;
-    total_granules = granule_summary.total_granules;
-    buffer_active_granules = granule_summary.buffer_active_granules;
-    buffer_draining_granules = granule_summary.buffer_draining_granules;
-    reclaiming_granules = granule_summary.reclaiming_granules;
-    free_granules = granule_summary.free_granules;
-    lifecycle_exhausted_granules = gs_amm_lifecycle_exhausted_granules_locked(state);
-    ap_reserved_granules = granule_summary.ap_reserved_granules;
-    ap_active_granules = granule_summary.ap_active_granules;
-    ap_grant_bytes = granule_summary.ap_grant_bytes;
-    ap_granule_used_bytes = granule_summary.ap_granule_used_bytes;
-    ap_granule_alloc_cursor_bytes = granule_summary.ap_granule_alloc_cursor_bytes;
-    recorded_ap_grant_bytes = state->ap_grant_bytes;
-    granule_state_sum = granule_summary.buffer_active_granules + granule_summary.buffer_draining_granules +
-        granule_summary.reclaiming_granules + granule_summary.free_granules +
-        granule_summary.ap_reserved_granules + granule_summary.ap_active_granules;
-    granule_state_consistent = granule_state_sum == granule_summary.total_granules;
-    granule_grant_bytes_consistent = recorded_ap_grant_bytes == granule_summary.ap_grant_bytes;
-    granule_used_within_grant = granule_summary.ap_granule_used_bytes <= granule_summary.ap_grant_bytes;
-    granule_alloc_success_count = state->granule_alloc_success_count;
-    granule_alloc_no_mapping_count = state->granule_alloc_no_mapping_count;
-    granule_alloc_no_owner_count = state->granule_alloc_no_owner_count;
-    granule_alloc_capacity_exhausted_count = state->granule_alloc_capacity_exhausted_count;
-    grant_reused_bytes = state->grant_reused_bytes;
-    illegal_transition_count = state->illegal_transition_count;
-    epoch_mismatch_reject_count = state->epoch_mismatch_reject_count;
-    stale_grant_token_count = state->stale_grant_token_count;
-    drain_pending_dirty = state->drain_pending_dirty;
-    drain_pending_pinned = state->drain_pending_pinned;
-    drain_pending_io = state->drain_pending_io;
-    drain_pending_hash = state->drain_pending_hash;
-    drain_success_count = state->drain_success_count;
-    drain_fail_count = state->drain_fail_count;
-    drain_rollback_count = state->drain_rollback_count;
-    drain_priority_flush_count = state->drain_priority_flush_count;
-    reclaimed_mb = state->reclaimed_mb;
-    reclaim_fail_count = state->reclaim_fail_count;
-    ap_idle_reclaim_count = state->ap_idle_reclaim_count;
-    ap_idle_reclaim_mb = state->ap_idle_reclaim_mb;
-    auto_controller_step_count = state->auto_controller_step_count;
-    native_eligible_count = state->native_eligible_count;
-    native_admit_count = state->native_admit_count;
-    native_reject_count = state->native_reject_count;
-    native_release_count = state->native_release_count;
-    native_error_cleanup_count = state->native_error_cleanup_count;
-    native_active_grant_count = state->native_active_grant_count;
-    native_current_active = state->native_current_active;
-    native_current_grant_id = state->native_current_grant_id;
-    native_current_grant_generation = state->native_current_grant_generation;
-    native_current_granted_kb = state->native_current_granted_kb;
-    native_current_memory_mode = state->native_current_memory_mode;
-    native_current_model_version = state->native_current_model_version;
-    native_current_leaf_id = state->native_current_leaf_id;
-    native_current_calibration_version = state->native_current_calibration_version;
-    native_current_calibration_scale = state->native_current_calibration_scale;
-    for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
-        native_current_raw_bounds_kb[i] = state->native_current_raw_bounds_kb[i];
-        native_current_calibrated_bounds_kb[i] = state->native_current_calibrated_bounds_kb[i];
-    }
-    int native_reason_rc = snprintf_s(native_last_reason, sizeof(native_last_reason), sizeof(native_last_reason) - 1,
-        "%s", state->native_last_reason);
-    securec_check_ss(native_reason_rc, "\0", "\0");
-    dtree_feedback_sample_count = state->dtree_feedback_ring.feedback_sample_count;
-    dtree_feedback_sample_dropped = state->dtree_feedback_ring.feedback_sample_dropped;
-    dtree_feedback_pending = state->dtree_feedback_ring.next_sample_id -
-        state->dtree_feedback_ring.next_calibration_sample_id;
-    dtree_calibration_sample_dropped = state->dtree_feedback_ring.calibration_sample_dropped;
-    dtree_last_feedback_available = false;
-    dtree_last_feedback_measurement_valid = false;
-    dtree_last_feedback_observed_work_mem_kb = 0.0;
-    dtree_last_feedback_grant_mb = 0.0;
-    dtree_last_feedback_spill_bytes = 0;
-    dtree_last_feedback_spill_files = 0;
-    dtree_last_feedback_spill_events = 0;
-    dtree_last_feedback_session_id = 0;
-    if (state->dtree_feedback_ring.feedback_sample_count > 0 &&
-        state->dtree_feedback_ring.next_sample_id > 0) {
-        const GsAmmDtreeFeedbackSample *sample =
-            &state->dtree_feedback_ring.samples[(state->dtree_feedback_ring.next_sample_id - 1) %
-                GS_AMM_DTREE_FEEDBACK_RING_SIZE];
-
-        if (sample->sample_id == state->dtree_feedback_ring.next_sample_id - 1) {
-            dtree_last_feedback_available = true;
-            dtree_last_feedback_measurement_valid = sample->measurement_valid;
-            dtree_last_feedback_observed_work_mem_kb = sample->observed_work_mem_kb;
-            dtree_last_feedback_grant_mb = sample->grant_mb;
-            dtree_last_feedback_spill_bytes = sample->spill_bytes;
-            dtree_last_feedback_spill_files = sample->spill_files;
-            dtree_last_feedback_spill_events = sample->spill_events;
-            dtree_last_feedback_session_id = sample->session_id;
-        }
-    }
-    dtree_model_version = 0;
-    dtree_leaf_id = 0;
-    dtree_calibration_version = state->dtree_calibration_table.calibration_version;
-    dtree_calibration_scale = state->dtree_calibration_table.calibration_scale;
-    dtree_calibration_update_count = state->dtree_calibration_table.calibration_update_count;
-    dtree_calibrated_leaf_count = 0;
-    dtree_rollback_count = state->dtree_calibration_table.rollback_count;
-    dtree_frozen_leaf_count = state->dtree_calibration_table.frozen_leaf_count;
-    dtree_scale_min = 0.0;
-    dtree_scale_max = 0.0;
-    dtree_scale_avg = 0.0;
-    dtree_ewma_underpredict_rate = 0.0;
-    dtree_ewma_spill_mb = 0.0;
-    dtree_ewma_runtime_ms = 0.0;
-    gs_amm_runtime_config_snapshot_locked(state, &runtime_config);
-    config_version = runtime_config.config_version;
-    allocator_only_mode = runtime_config.allocator_only_mode;
-    allocator_only_grant_mb = gs_amm_allocator_only_grant_target_mb(&runtime_config);
-    feedback_only_mode = runtime_config.feedback_only;
-    feedback_bootstrap_grant_mb = runtime_config.feedback_bootstrap_grant_mb;
-    feedback_max_grant_mb = runtime_config.feedback_max_grant_mb;
-    feedback_current_grant_mb = state->feedback_current_grant_mb;
-    feedback_ap_slot_limit = state->feedback_ap_slot_limit;
-    feedback_stable_windows = state->feedback_stable_windows;
-    feedback_completed_count = state->feedback_completed_count;
-    feedback_admit_count = state->feedback_admit_count;
-    feedback_growth_count = state->feedback_growth_count;
-    feedback_backoff_count = state->feedback_backoff_count;
-    feedback_slot_block_count = state->feedback_slot_block_count;
-    feedback_ewma_runtime_ms = state->feedback_ewma_runtime_ms;
-    feedback_ewma_spill_mb = state->feedback_ewma_spill_mb;
-    feedback_ewma_peak_mb = state->feedback_ewma_peak_mb;
-    int feedback_action_rc = snprintf_s(feedback_last_action, sizeof(feedback_last_action),
-        sizeof(feedback_last_action) - 1, "%s", state->feedback_last_action[0] == '\0' ? "none" :
-        state->feedback_last_action);
-    securec_check_ss(feedback_action_rc, "\0", "\0");
-    for (int i = 0; i < GS_AMM_DTREE_CALIBRATION_TABLE_SIZE; i++) {
-        GsAmmDtreeCalibrationLeafState *leaf = &state->dtree_calibration_table.leaves[i];
-
-        if (!leaf->initialized)
-            continue;
-        if (dtree_calibrated_leaf_count == 0) {
-            dtree_model_version = leaf->model_version;
-            dtree_leaf_id = leaf->leaf_id;
-            dtree_calibration_version = leaf->calibration_version;
-            dtree_calibration_scale = leaf->calibration_scale;
-            dtree_ewma_underpredict_rate = leaf->ewma_underpredict_rate;
-            dtree_ewma_spill_mb = leaf->ewma_spill_mb;
-            dtree_ewma_runtime_ms = leaf->ewma_runtime_ms;
-        }
-        dtree_calibrated_leaf_count++;
-        dtree_scale_avg += leaf->calibration_scale;
-        if (dtree_scale_min == 0.0 || leaf->calibration_scale < dtree_scale_min)
-            dtree_scale_min = leaf->calibration_scale;
-        if (leaf->calibration_scale > dtree_scale_max)
-            dtree_scale_max = leaf->calibration_scale;
-    }
-    if (dtree_calibrated_leaf_count > 0)
-        dtree_scale_avg /= (double)dtree_calibrated_leaf_count;
-    else
-        dtree_scale_min = dtree_scale_max = dtree_scale_avg = dtree_calibration_scale;
-    dtree_calibration_enabled = runtime_config.dtree_calibration_enabled;
-    dtree_record_only = runtime_config.dtree_record_only;
+    tp_recovery_requested_granules = state->tp_recovery_requested_granules;
+    tp_recovered_granules = state->tp_recovered_granules;
+    tp_recovery_deferred_count = state->tp_recovery_deferred_count;
+    ap_downgrade_pending = state->ap_downgrade_pending;
+    ap_reclaim_poll_count = state->ap_reclaim_poll_count;
+    ap_reclaim_operator_release_bytes = state->ap_reclaim_operator_release_bytes;
+    tp_low_pressure_windows = state->tp_low_pressure_windows;
+    tp_hot_clear_windows = state->tp_hot_clear_windows;
+    tp_recovery_phase = state->tp_recovery_phase;
+    ap_multipass_only = state->ap_multipass_only;
+    tp_ap_stop_requested = state->tp_ap_stop_requested;
+    tp_ap_stop_completed = state->tp_ap_stop_completed;
+    tp_sb_restore_granules = state->tp_sb_restore_granules;
     SpinLockRelease(&state->mutex);
-    inactive_granule_buffer_violations = gs_amm_check_granule_invariants_locked(state);
-    active_buffers = active_buffers > 0 ? active_buffers : StrategyActiveBufferCount();
-    visible_auto_controller_step_count = gs_amm_enabled ? auto_controller_step_count : 0;
-
     int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "amm_enabled=%s config_version=%llu background_action_count=%d "
-        "active_blocks=%d active_mb=%ld max_blocks=%d max_mb=%ld "
-        "shared_buffers_min_mb=%d dynamic_target_mb=%d "
-        "dynamic_used_mb=%d dynamic_free_mb=%d active_ap_count=%d "
-        "ap_queue_len=%d ap_queue_head=%llu ap_queue_tail=%llu "
-        "ap_queue_admit_count=%d ap_queue_timeout_count=%d last_queue_wait_ms=%d "
-        "backpressure_count=%d new_ap_guard_block_count=%d last_backpressure_reason=%s grant_shrink_count=%d "
-        "grant_debt_mb=%d effective_grant_kb=%d effective_downgrade_count=%d "
-        "tp_baseline_tps=%.3f tp_recent_tps=%.3f "
-        "tp_p95_latency_ms=%.3f tp_raw_drop_ratio=%.6f "
-        "tp_jitter_limit=%.6f tp_guard_hot=%s tp_generation_exhausted=%s "
-        "tp_sample_count=%d tp_baseline_rebase_count=%d "
-        "physical_read_rate=%.6f pending_writeback_pages=%llu dirty_page_ratio=%.6f "
-        "device_io_in_flight=%d device_io_ms_rate=%.6f device_io_available=%s "
-        "temp_spill_mb_rate=%.6f hash_multipass_rate=%.6f io_recovery_stable_windows=%d "
-        "io_pressure_observed=%d io_guard_hot=%s io_window_ms=%d "
-        "tp_window_ms=%d resize_guard_state=%s resize_cooldown_ms=%ld "
-        "recovery_cooldown_ms=%ld guard_block_count=%d rollback_count=%d "
-        "recovery_action_count=%d recovery_cooldown_block_count=%d last_rollback_target_mb=%d "
-        "last_action=%s last_prediction_mb=%d last_tp_pressure=%d "
-        "last_io_pressure=%d last_grant_mb=%d last_effective_grant_kb=%d "
-        "pool_event_id=%llu pool_event_timestamp=%lld pool_event_action=%s pool_event_reason=%s "
-        "pool_event_duration_ms=%d pool_event_before_granules=%d,%d,%d,%d,%d,%d "
-        "pool_event_after_granules=%d,%d,%d,%d,%d,%d "
-        "resize_mode=granule_drain_expand resize_granule_mb=%d granule_blocks=%d "
-        "total_granules=%d buffer_active_granules=%d buffer_draining_granules=%d reclaiming_granules=%d "
-        "free_granules=%d lifecycle_exhausted_granules=%d ap_reserved_granules=%d ap_active_granules=%d "
-        "ap_grant_bytes=%llu ap_granule_used_bytes=%llu ap_granule_alloc_cursor_bytes=%llu "
-        "granule_state_sum=%d granule_state_consistent=%s granule_grant_bytes_consistent=%s "
-        "granule_used_within_grant=%s inactive_granule_buffer_violations=%llu "
-        "granule_alloc_success_count=%llu granule_alloc_no_mapping_count=%llu "
-        "granule_alloc_no_owner_count=%llu granule_alloc_capacity_exhausted_count=%llu "
-        "grant_reused_bytes=%llu "
-        "illegal_transition_count=%llu epoch_mismatch_reject_count=%llu stale_grant_token_count=%llu "
-        "drain_pending_dirty=%d drain_pending_pinned=%d drain_pending_io=%d drain_pending_hash=%d "
-        "drain_success_count=%d drain_fail_count=%d drain_rollback_count=%d drain_priority_flush_count=%d "
-        "reclaimed_mb=%llu reclaim_fail_count=%d "
-        "ap_idle_reclaim_count=%d ap_idle_reclaim_mb=%d "
-        "dtree_calibration_enabled=%s dtree_record_only=%s "
-        "dtree_feedback_sample_count=%llu dtree_feedback_sample_dropped=%llu "
-        "dtree_feedback_pending=%llu dtree_calibration_sample_dropped=%llu "
-        "dtree_last_feedback_available=%s dtree_last_feedback_measurement_valid=%s "
-        "dtree_last_feedback_observed_work_mem_kb=%.3f dtree_last_feedback_grant_mb=%.3f "
-        "dtree_last_feedback_spill_bytes=%llu dtree_last_feedback_spill_files=%u "
-        "dtree_last_feedback_spill_events=%u dtree_last_feedback_session_id=%llu "
-        "dtree_model_version=%lld dtree_leaf_id=%lld "
-        "dtree_calibration_version=%lld dtree_calibration_scale=%.10f "
-        "dtree_calibration_update_count=%llu dtree_calibrated_leaf_count=%d "
-        "dtree_scale_min=%.10f dtree_scale_max=%.10f dtree_scale_avg=%.10f "
-        "dtree_rollback_count=%d dtree_frozen_leaf_count=%d "
-        "dtree_ewma_underpredict_rate=%.10f dtree_ewma_spill_mb=%.10f dtree_ewma_runtime_ms=%.10f "
-        "allocator_only_mode=%s allocator_only_grant_mb=%d "
-        "feedback_only_mode=%s feedback_bootstrap_grant_mb=%d feedback_max_grant_mb=%d "
-        "feedback_current_grant_mb=%d feedback_ap_slot_limit=%d feedback_stable_windows=%d "
-        "feedback_completed_count=%llu feedback_admit_count=%llu feedback_growth_count=%llu "
-        "feedback_backoff_count=%llu feedback_slot_block_count=%llu "
-        "feedback_ewma_runtime_ms=%.3f feedback_ewma_spill_mb=%.3f feedback_ewma_peak_mb=%.3f "
-        "feedback_last_action=%s "
-        "native_auto_mode=%s native_ap_cost_threshold=%.3f native_eligible_count=%llu native_admit_count=%llu "
-        "native_reject_count=%llu native_release_count=%llu native_error_cleanup_count=%llu "
-        "native_active_grant_count=%d "
-        "native_last_event_active=%s native_last_event_grant_id=%llu native_last_event_grant_generation=%llu "
-        "native_last_event_granted_kb=%d native_last_event_model_version=%lld native_last_event_leaf_id=%lld "
-        "native_last_event_calibration_version=%lld native_last_event_calibration_scale=%.10f "
-        "native_last_event_raw_bounds_kb=%.3f,%.3f,%.3f "
-        "native_last_event_calibrated_bounds_kb=%.3f,%.3f,%.3f native_last_event_memory_mode=%s "
-        "native_last_reason=%s "
-        "controller_autorun=metrics auto_controller_step_count=%d "
-        "controller_decisions_observable=true "
-        "unsafe_dirty_or_pinned_invalidations=0",
-        gs_amm_enabled ? "true" : "false", (unsigned long long)config_version,
-        visible_auto_controller_step_count,
-        active_buffers, (long)gs_amm_blocks_to_mb(active_buffers), NORMAL_SHARED_BUFFER_NUM,
-        (long)gs_amm_blocks_to_mb(NORMAL_SHARED_BUFFER_NUM), gs_amm_shared_buffers_min_mb, dynamic_target_mb,
-        dynamic_used_mb, Max(dynamic_target_mb - dynamic_used_mb, 0), active_ap_count, ap_queue_len,
-        (unsigned long long)ap_queue_head, (unsigned long long)ap_queue_tail, ap_queue_admit_count,
-        ap_queue_timeout_count, last_queue_wait_ms, backpressure_count, new_ap_guard_block_count,
-        last_backpressure_reason, grant_shrink_count, grant_debt_mb,
-        effective_grant_kb, effective_downgrade_count,
-        tp_baseline_tps, tp_recent_tps, tp_p95_latency_ms, tp_raw_drop_ratio, gs_amm_tp_jitter_limit,
-        tp_guard_hot ? "true" : "false", tp_generation_exhausted ? "true" : "false", tp_sample_count,
-        tp_baseline_rebase_count, physical_read_rate,
-        (unsigned long long)pending_writeback_pages, dirty_page_ratio, device_io_in_flight, device_io_ms_rate,
-        device_io_available ? "true" : "false", temp_spill_mb_rate, hash_multipass_rate, io_recovery_stable_windows,
-        io_pressure_observed, io_guard_hot ? "true" : "false", io_window_ms,
-        tp_window_ms, resize_guard_state,
-        resize_cooldown_ms, recovery_cooldown_ms, guard_block_count, rollback_count,
-        recovery_action_count, recovery_cooldown_block_count, last_rollback_target_mb,
-        gs_amm_action_name(last_action), last_prediction_mb, last_tp_pressure,
-        last_io_pressure, last_grant_mb, last_effective_grant_kb,
-        (unsigned long long)pool_event_id, (long long)pool_event_time, gs_amm_action_name(pool_event_action),
-        pool_event_reason, pool_event_duration_ms,
-        pool_event_before.buffer_active_granules, pool_event_before.buffer_draining_granules,
-        pool_event_before.reclaiming_granules, pool_event_before.free_granules,
-        pool_event_before.ap_reserved_granules, pool_event_before.ap_active_granules,
-        pool_event_after.buffer_active_granules, pool_event_after.buffer_draining_granules,
-        pool_event_after.reclaiming_granules, pool_event_after.free_granules,
-        pool_event_after.ap_reserved_granules, pool_event_after.ap_active_granules,
-        granule_mb, granule_blocks,
-        total_granules, buffer_active_granules, buffer_draining_granules, reclaiming_granules, free_granules,
-        lifecycle_exhausted_granules, ap_reserved_granules, ap_active_granules, (unsigned long long)ap_grant_bytes,
-        (unsigned long long)ap_granule_used_bytes, (unsigned long long)ap_granule_alloc_cursor_bytes,
-        granule_state_sum, granule_state_consistent ? "true" : "false",
-        granule_grant_bytes_consistent ? "true" : "false", granule_used_within_grant ? "true" : "false",
-        (unsigned long long)inactive_granule_buffer_violations,
-        (unsigned long long)granule_alloc_success_count,
-        (unsigned long long)granule_alloc_no_mapping_count,
-        (unsigned long long)granule_alloc_no_owner_count,
-        (unsigned long long)granule_alloc_capacity_exhausted_count,
-        (unsigned long long)grant_reused_bytes,
-        (unsigned long long)illegal_transition_count,
-        (unsigned long long)epoch_mismatch_reject_count,
-        (unsigned long long)stale_grant_token_count,
-        drain_pending_dirty, drain_pending_pinned, drain_pending_io, drain_pending_hash, drain_success_count,
-        drain_fail_count, drain_rollback_count, drain_priority_flush_count,
-        (unsigned long long)reclaimed_mb, reclaim_fail_count,
-        ap_idle_reclaim_count, ap_idle_reclaim_mb,
-        dtree_calibration_enabled ? "true" : "false", dtree_record_only ? "true" : "false",
-        (unsigned long long)dtree_feedback_sample_count,
-        (unsigned long long)dtree_feedback_sample_dropped,
-        (unsigned long long)dtree_feedback_pending,
-        (unsigned long long)dtree_calibration_sample_dropped,
-        dtree_last_feedback_available ? "true" : "false",
-        dtree_last_feedback_measurement_valid ? "true" : "false",
-        dtree_last_feedback_observed_work_mem_kb, dtree_last_feedback_grant_mb,
-        (unsigned long long)dtree_last_feedback_spill_bytes, dtree_last_feedback_spill_files,
-        dtree_last_feedback_spill_events, (unsigned long long)dtree_last_feedback_session_id,
-        (long long)dtree_model_version, (long long)dtree_leaf_id,
-        (long long)dtree_calibration_version, dtree_calibration_scale,
-        (unsigned long long)dtree_calibration_update_count, dtree_calibrated_leaf_count,
-        dtree_scale_min, dtree_scale_max, dtree_scale_avg,
-        dtree_rollback_count, dtree_frozen_leaf_count,
-        dtree_ewma_underpredict_rate, dtree_ewma_spill_mb, dtree_ewma_runtime_ms,
-        allocator_only_mode ? "true" : "false", allocator_only_grant_mb,
-        feedback_only_mode ? "true" : "false", feedback_bootstrap_grant_mb, feedback_max_grant_mb,
-        feedback_current_grant_mb, feedback_ap_slot_limit, feedback_stable_windows,
-        (unsigned long long)feedback_completed_count, (unsigned long long)feedback_admit_count,
-        (unsigned long long)feedback_growth_count, (unsigned long long)feedback_backoff_count,
-        (unsigned long long)feedback_slot_block_count, feedback_ewma_runtime_ms, feedback_ewma_spill_mb,
-        feedback_ewma_peak_mb, feedback_last_action,
-        gs_amm_native_auto_mode ? "true" : "false", gs_amm_native_ap_cost_threshold,
-        (unsigned long long)native_eligible_count,
-        (unsigned long long)native_admit_count, (unsigned long long)native_reject_count,
-        (unsigned long long)native_release_count, (unsigned long long)native_error_cleanup_count,
-        native_active_grant_count,
-        native_current_active ? "true" : "false", (unsigned long long)native_current_grant_id,
-        (unsigned long long)native_current_grant_generation, native_current_granted_kb,
-        (long long)native_current_model_version, (long long)native_current_leaf_id,
-        (long long)native_current_calibration_version, native_current_calibration_scale,
-        native_current_raw_bounds_kb[0], native_current_raw_bounds_kb[1], native_current_raw_bounds_kb[2],
-        native_current_calibrated_bounds_kb[0], native_current_calibrated_bounds_kb[1],
-        native_current_calibrated_bounds_kb[2], gs_amm_memory_mode_name(native_current_memory_mode),
-        native_last_reason,
-        visible_auto_controller_step_count);
+        "amm_enabled=%s active_mb=%d shared_buffers_min_mb=%d dynamic_target_mb=%d dynamic_used_mb=%d "
+        "dynamic_pool_target_mb=%d dynamic_pool_reserved_mb=%d dynamic_pool_used_mb=%d dynamic_pool_free_mb=%d "
+        "active_ap_count=%d stage=%s ap_registry_count=%d ap_granted_bytes_total=%llu "
+        "ap_used_bytes_total=%llu ap_reclaimable_bytes_total=%llu ap_queue_len=%d "
+        "ap_queue_admit_count=%llu ap_queue_cancel_count=%llu "
+        "free_granules=%d ap_active_granules=%d last_prediction_mb=%d last_grant_mb=%d "
+        "active_target_mb=%d current_target_mb=%d queued_target_mb=%d aggregate_target_mb=%d "
+        "dynamic_deficit_mb=%d ap_borrow_count=%llu last_supply_source=%s "
+        "baseline_active_mb=%d effective_dynamic_target_mb=%d pending_demand_mb=%d "
+        "tp_pressure_pct=%d tp_pressure_hot=%s tp_pressure_state=%s tp_pressure_valid=%s "
+        "tp_cpu_util_pct=%d tp_cpu_util_valid=%s tp_cpu_guarded=%s "
+        "tp_buffer_hit_baseline_pct=%d tp_buffer_hit_pct=%d "
+        "tp_buffer_hit_baseline_valid=%s tp_baseline_tps=%llu tp_recent_tps=%llu "
+        "tp_tps_baseline_valid=%s tp_tps_guarded=%s ap_borrow_buffer_hit_guarded=%s "
+        "last_backpressure_reason=%s "
+        "tp_recovery_requested_granules=%llu "
+        "tp_recovered_granules=%llu tp_recovery_deferred_count=%llu ap_downgrade_pending=%d "
+        "ap_reclaim_poll_count=%llu ap_reclaim_operator_release_bytes=%llu "
+        "tp_low_pressure_windows=%d tp_hot_clear_windows=%d tp_recovery_phase=%s ap_multipass_only=%s "
+        "tp_ap_stop_requested=%llu tp_ap_stop_completed=%llu tp_sb_restore_granules=%llu last_action=%s",
+        gs_amm_enabled ? "true" : "false", active_mb, gs_amm_shared_buffers_min_mb,
+        dynamic_target_mb, dynamic_used_mb, dynamic_target_mb,
+        (int)Min((dynamic_reserved_bytes + 1024 * 1024 - 1) / (1024 * 1024), (uint64)INT_MAX),
+        (int)Min((dynamic_allocated_bytes + 1024 * 1024 - 1) / (1024 * 1024), (uint64)INT_MAX),
+        dynamic_pool_free_mb, active_ap_count,
+        gs_amm_stage_name(stage), ap_registry_count,
+        (unsigned long long)ap_granted_bytes_total,
+        (unsigned long long)ap_used_bytes_total,
+        (unsigned long long)ap_reclaimable_bytes_total, ap_queue_len,
+        (unsigned long long)ap_queue_admit_count, (unsigned long long)ap_queue_cancel_count,
+        free_granules, ap_active_granules, last_prediction_mb, last_grant_mb,
+        active_target_demand_mb, current_target_mb, queued_target_demand_mb, aggregate_target_mb,
+        dynamic_deficit_mb, (unsigned long long)ap_borrow_count, last_supply_source,
+        baseline_active_mb, effective_dynamic_target_mb, pending_demand_mb,
+        tp_pressure_pct, tp_pressure_hot ? "true" : "false",
+        gs_amm_tp_pressure_state_name(tp_pressure_state), tp_pressure_valid ? "true" : "false",
+        tp_cpu_util_pct, tp_cpu_util_valid ? "true" : "false", tp_cpu_guarded ? "true" : "false",
+        tp_buffer_hit_baseline_pct, tp_buffer_hit_pct,
+        tp_buffer_hit_baseline_valid ? "true" : "false",
+        (unsigned long long)tp_baseline_tps,
+        (unsigned long long)tp_recent_tps,
+        tp_tps_baseline_valid ? "true" : "false",
+        tp_tps_guarded ? "true" : "false",
+        ap_borrow_buffer_hit_guarded ? "true" : "false",
+        last_backpressure_reason,
+        (unsigned long long)tp_recovery_requested_granules,
+        (unsigned long long)tp_recovered_granules,
+        (unsigned long long)tp_recovery_deferred_count, ap_downgrade_pending,
+        (unsigned long long)ap_reclaim_poll_count,
+        (unsigned long long)ap_reclaim_operator_release_bytes,
+        tp_low_pressure_windows,
+        tp_hot_clear_windows,
+        gs_amm_tp_recovery_phase_name(tp_recovery_phase),
+        ap_multipass_only ? "true" : "false",
+        (unsigned long long)tp_ap_stop_requested,
+        (unsigned long long)tp_ap_stop_completed,
+        (unsigned long long)tp_sb_restore_granules,
+        gs_amm_action_name(last_action));
     securec_check_ss(rc, "\0", "\0");
-
     PG_RETURN_TEXT_P(cstring_to_text(status));
 }
 
-Datum gs_amm_record_dtree_feedback(PG_FUNCTION_ARGS)
+static bool gs_amm_prepare_dynamic_capacity(int ap_demand_mb)
 {
-    gs_amm_require_admin_legacy_control();
-    ArrayType *raw_bounds_array = PG_GETARG_ARRAYTYPE_P(0);
-    ArrayType *calibrated_bounds_array = PG_GETARG_ARRAYTYPE_P(1);
-    int64 model_version = PG_GETARG_INT64(2);
-    int64 leaf_id = PG_GETARG_INT64(3);
-    double observed_work_mem_kb = PG_GETARG_FLOAT8(4);
-    double runtime_ms = PG_GETARG_FLOAT8(5);
-    double spill_mb = PG_GETARG_FLOAT8(6);
-    double grant_mb = PG_GETARG_FLOAT8(7);
-    double tp_drop_ratio = PG_GETARG_FLOAT8(8);
-    double io_pressure = PG_GETARG_FLOAT8(9);
-    bool backpressure = PG_GETARG_BOOL(10);
-    bool error = PG_GETARG_BOOL(11);
-    Datum *raw_datums = NULL;
-    Datum *calibrated_datums = NULL;
-    bool *raw_nulls = NULL;
-    bool *calibrated_nulls = NULL;
-    int raw_count = 0;
-    int calibrated_count = 0;
-    double raw_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
-    double calibrated_bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
     GsAmmSharedState *state = gs_amm_get_state();
-    GsAmmFeedbackRecord feedback;
-    char status[2048];
-
-    if (!superuser())
-        ereport(ERROR,
-            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to record GS AMM dtree feedback")));
-
-    if (ARR_NDIM(raw_bounds_array) != 1 || ARR_ELEMTYPE(raw_bounds_array) != FLOAT8OID ||
-        ARR_NDIM(calibrated_bounds_array) != 1 || ARR_ELEMTYPE(calibrated_bounds_array) != FLOAT8OID) {
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("expected one-dimensional float8[] dtree bounds arrays")));
-    }
-
-    deconstruct_array(raw_bounds_array, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd', &raw_datums, &raw_nulls,
-        &raw_count);
-    deconstruct_array(calibrated_bounds_array, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd', &calibrated_datums,
-        &calibrated_nulls, &calibrated_count);
-    if (raw_count != GS_AMM_DTREE_BOUND_COUNT || calibrated_count != GS_AMM_DTREE_BOUND_COUNT) {
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("expected %d dtree bounds values", GS_AMM_DTREE_BOUND_COUNT)));
-    }
-
-    for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
-        if (raw_nulls[i] || calibrated_nulls[i]) {
-            ereport(ERROR,
-                (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("dtree feedback arrays cannot contain nulls")));
-        }
-        raw_bounds_kb[i] = DatumGetFloat8(raw_datums[i]);
-        calibrated_bounds_kb[i] = DatumGetFloat8(calibrated_datums[i]);
-    }
-    if (!(observed_work_mem_kb > 0.0))
-        observed_work_mem_kb = 0.0;
-    if (!(runtime_ms > 0.0))
-        runtime_ms = 0.0;
-    if (!(spill_mb > 0.0))
-        spill_mb = 0.0;
-    if (!(grant_mb > 0.0))
-        grant_mb = 0.0;
-    if (!(tp_drop_ratio > 0.0))
-        tp_drop_ratio = 0.0;
-    if (tp_drop_ratio > 1.0)
-        tp_drop_ratio = 1.0;
-    if (!(io_pressure > 0.0))
-        io_pressure = 0.0;
-    if (io_pressure > 100.0)
-        io_pressure = 100.0;
-
-    errno_t feedback_rc = memset_s(&feedback, sizeof(feedback), 0, sizeof(feedback));
-    securec_check(feedback_rc, "\0", "\0");
-    feedback.session_id = u_sess->session_id;
-    feedback.model_version = model_version;
-    feedback.leaf_id = leaf_id;
-    for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
-        feedback.raw_bounds_kb[i] = raw_bounds_kb[i];
-        feedback.calibrated_bounds_kb[i] = calibrated_bounds_kb[i];
-    }
-    feedback.observed_work_mem_kb = observed_work_mem_kb;
-    feedback.runtime_ms = runtime_ms;
-    feedback.spill_mb = spill_mb;
-    feedback.grant_mb = grant_mb;
-    feedback.tp_drop_ratio = tp_drop_ratio;
-    feedback.io_pressure = io_pressure;
-    feedback.backpressure = backpressure;
-    feedback.error = error;
-    GsAmmRecordFeedback(&feedback);
-
-    SpinLockAcquire(&state->mutex);
-    double calibration_scale = state->dtree_calibration_table.calibration_scale;
-    int64 calibration_version = state->dtree_calibration_table.calibration_version;
-    uint64 sample_count = state->dtree_feedback_ring.feedback_sample_count;
-    uint64 sample_dropped = state->dtree_feedback_ring.feedback_sample_dropped;
-    SpinLockRelease(&state->mutex);
-
-    int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "dtree_feedback_recorded=true model_version=%lld leaf_id=%lld calibration_version=%lld "
-        "calibration_scale=%.10f feedback_sample_count=%llu feedback_sample_dropped=%llu "
-        "observed_work_mem_kb=%.3f runtime_ms=%.3f spill_mb=%.3f grant_mb=%.3f "
-        "tp_drop_ratio=%.6f io_pressure=%.3f backpressure=%s error=%s",
-        (long long)model_version, (long long)leaf_id, (long long)calibration_version, calibration_scale,
-        (unsigned long long)sample_count, (unsigned long long)sample_dropped, observed_work_mem_kb,
-        runtime_ms, spill_mb, grant_mb, tp_drop_ratio, io_pressure,
-        backpressure ? "true" : "false", error ? "true" : "false");
-    securec_check_ss(rc, "\0", "\0");
-
-    PG_RETURN_TEXT_P(cstring_to_text(status));
-}
-
-Datum gs_amm_set_dtree_calibration_mode(PG_FUNCTION_ARGS)
-{
-    gs_amm_require_admin_legacy_control();
-    bool calibration_enabled = PG_GETARG_BOOL(0);
-    bool record_only = PG_GETARG_BOOL(1);
-    GsAmmSharedState *state = gs_amm_get_state();
-    GsAmmRuntimeConfig effective_config;
-    uint64 config_version;
-    bool updated;
-    char status[256];
-
-    if (!calibration_enabled)
-        record_only = true;
-
-    SpinLockAcquire(&state->mutex);
-    gs_amm_runtime_config_snapshot_locked(state, &effective_config);
-    updated = gs_amm_update_runtime_override_locked(state, effective_config.allocator_only_mode,
-        effective_config.allocator_only_grant_mb, calibration_enabled, record_only);
-    config_version = state->runtime_config.config_version;
-    SpinLockRelease(&state->mutex);
-    if (!updated)
-        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-            errmsg("GS AMM runtime configuration version is exhausted")));
-
-    int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "dtree_calibration_mode_set=true dtree_calibration_enabled=%s dtree_record_only=%s config_version=%llu",
-        calibration_enabled ? "true" : "false", record_only ? "true" : "false",
-        (unsigned long long)config_version);
-    securec_check_ss(rc, "\0", "\0");
-
-    PG_RETURN_TEXT_P(cstring_to_text(status));
-}
-
-Datum gs_amm_set_allocator_only_mode(PG_FUNCTION_ARGS)
-{
-    gs_amm_require_admin_legacy_control();
-    bool allocator_only_mode = PG_GETARG_BOOL(0);
-    int allocator_only_grant_mb = PG_GETARG_INT32(1);
-    GsAmmSharedState *state = gs_amm_get_state();
-    GsAmmRuntimeConfig effective_config;
-    uint64 config_version;
-    bool updated;
-    char status[256];
-
-    allocator_only_grant_mb = Max(allocator_only_grant_mb, gs_amm_ap_min_grant_mb);
-
-    SpinLockAcquire(&state->mutex);
-    gs_amm_runtime_config_snapshot_locked(state, &effective_config);
-    updated = gs_amm_update_runtime_override_locked(state, allocator_only_mode, allocator_only_grant_mb,
-        effective_config.dtree_calibration_enabled, effective_config.dtree_record_only);
-    config_version = state->runtime_config.config_version;
-    SpinLockRelease(&state->mutex);
-    if (!updated)
-        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-            errmsg("GS AMM runtime configuration version is exhausted")));
-
-    int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "allocator_only_mode_set=true allocator_only_mode=%s allocator_only_grant_mb=%d config_version=%llu",
-        allocator_only_mode ? "true" : "false", allocator_only_grant_mb,
-        (unsigned long long)config_version);
-    securec_check_ss(rc, "\0", "\0");
-
-    PG_RETURN_TEXT_P(cstring_to_text(status));
-}
-
-Datum gs_amm_reset_dtree_calibration(PG_FUNCTION_ARGS)
-{
-    gs_amm_require_admin_legacy_control();
-    GsAmmSharedState *state = gs_amm_get_state();
-    char status[256];
-
-    if (!superuser())
-        ereport(ERROR,
-            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                errmsg("must be superuser to reset GS AMM dtree calibration")));
-
-    SpinLockAcquire(&state->mutex);
-    gs_amm_init_dtree_state(state);
-    SpinLockRelease(&state->mutex);
-
-    int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "dtree_calibration_reset=true calibration_version=1 calibration_scale=1.0000000000 "
-        "feedback_sample_count=0 feedback_sample_dropped=0");
-    securec_check_ss(rc, "\0", "\0");
-
-    PG_RETURN_TEXT_P(cstring_to_text(status));
-}
-
-Datum gs_amm_reset_state(PG_FUNCTION_ARGS)
-{
-    gs_amm_require_admin_legacy_control();
-    GsAmmSharedState *state = gs_amm_get_state();
-    char status[512];
-
-    if (!superuser())
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to reset GS AMM state")));
-
-    SpinLockAcquire(&state->mutex);
-    if (state->maintenance_resetting) {
-        SpinLockRelease(&state->mutex);
-        ereport(ERROR,
-            (errcode(ERRCODE_OBJECT_IN_USE),
-                errmsg("GS AMM state reset is already in progress")));
-    }
-    state->maintenance_resetting = true;
-    if (state->operation_inflight != 0 || !gs_amm_state_can_reset_locked(state)) {
-        state->maintenance_resetting = false;
-        SpinLockRelease(&state->mutex);
-        ereport(ERROR,
-            (errcode(ERRCODE_OBJECT_IN_USE),
-                errmsg("cannot reset GS AMM state while ownership operations are active")));
-    }
-    if (!gs_amm_advance_tp_sample_generation_locked(state)) {
-        state->maintenance_resetting = false;
-        SpinLockRelease(&state->mutex);
-        ereport(ERROR,
-            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                errmsg("cannot reset GS AMM state after TPS generation exhaustion")));
-    }
-    state->dynamic_target_mb = gs_amm_dynamic_target_default_mb();
-    state->dynamic_used_mb = 0;
-    state->active_ap_count = 0;
-    state->feedback_current_grant_mb = Max(state->runtime_config.feedback_bootstrap_grant_mb, 1);
-    state->feedback_ap_slot_limit = Max(state->runtime_config.feedback_initial_ap_slots, 1);
-    state->feedback_stable_windows = 0;
-    state->feedback_completed_count = 0;
-    state->feedback_admit_count = 0;
-    state->feedback_growth_count = 0;
-    state->feedback_backoff_count = 0;
-    state->feedback_slot_block_count = 0;
-    state->feedback_ewma_runtime_ms = 0.0;
-    state->feedback_ewma_spill_mb = 0.0;
-    state->feedback_ewma_peak_mb = 0.0;
-    gs_amm_copy_admission_reason(state->feedback_last_action, "reset");
-    state->ap_queue_len = 0;
-    state->ap_queue_head = 0;
-    state->ap_queue_tail = 0;
-    state->ap_queue_admit_count = 0;
-    state->ap_queue_timeout_count = 0;
-    state->last_queue_wait_ms = 0;
-    for (int i = 0; i < GS_AMM_QUEUE_RING_SIZE; i++)
-        state->ap_queue_slots[i] = 0;
-    state->backpressure_count = 0;
-    state->new_ap_guard_block_count = 0;
-    state->grant_shrink_count = 0;
-    state->grant_debt_mb = 0;
-    state->effective_grant_kb = 0;
-    state->effective_downgrade_count = 0;
-    state->tp_baseline_tps = 0.0;
-    state->tp_recent_tps = 0.0;
-    state->tp_p95_latency_ms = 0.0;
-    state->tp_raw_drop_ratio = 0.0;
-    state->tp_window_ms = 0;
-    state->tp_sample_count = 0;
-    state->tp_baseline_rebase_count = 0;
-    state->physical_read_rate = 0.0;
-    state->pending_writeback_pages = 0;
-    state->dirty_page_ratio = 0.0;
-    state->device_io_in_flight = 0;
-    state->device_io_ms_rate = 0.0;
-    state->device_io_available = false;
-    state->temp_spill_mb_rate = 0.0;
-    state->hash_multipass_rate = 0.0;
-    state->io_guard_latched = false;
-    state->io_recovery_stable_windows = 0;
-    state->io_recovery_last_window = 0;
-    state->io_pressure_observed = 0;
-    state->io_window_ms = 0;
-    state->tp_sample_next = 0;
-    for (int i = 0; i < GS_AMM_TP_WINDOW_SAMPLE_COUNT; i++) {
-        state->tp_sample_time[i] = 0;
-        state->tp_sample_tps[i] = 0.0;
-        state->tp_sample_p95_latency_ms[i] = 0.0;
-    }
-    state->last_resize_time = 0;
-    state->resize_observe_until = 0;
-    state->cooldown_until = 0;
-    state->recovery_cooldown_until = 0;
-    state->guard_block_count = 0;
-    state->rollback_count = 0;
-    state->recovery_action_count = 0;
-    state->recovery_cooldown_block_count = 0;
-    state->last_rollback_target_mb = 0;
-    state->last_prediction_mb = 0;
-    state->last_tp_pressure = 0;
-    state->last_io_pressure = 0;
-    state->last_grant_mb = 0;
-    state->last_effective_grant_kb = 0;
-    gs_amm_set_backpressure_reason_locked(state, "none");
-    state->last_action = GS_AMM_OBSERVE;
-    state->drain_pending_dirty = 0;
-    state->drain_pending_pinned = 0;
-    state->drain_pending_io = 0;
-    state->drain_pending_hash = 0;
-    state->drain_success_count = 0;
-    state->drain_fail_count = 0;
-    state->drain_rollback_count = 0;
-    state->drain_priority_flush_count = 0;
-    state->reclaimed_mb = 0;
-    state->reclaim_fail_count = 0;
-    state->illegal_transition_count = 0;
-    state->epoch_mismatch_reject_count = 0;
-    state->stale_grant_token_count = 0;
-    state->ap_idle_reclaim_count = 0;
-    state->ap_idle_reclaim_mb = 0;
-    state->auto_controller_step_count = 0;
-    state->native_eligible_count = 0;
-    state->native_admit_count = 0;
-    state->native_reject_count = 0;
-    state->native_release_count = 0;
-    state->native_error_cleanup_count = 0;
-    state->native_active_grant_count = 0;
-    state->native_current_active = false;
-    state->native_current_grant_id = 0;
-    state->native_current_grant_generation = 0;
-    state->native_current_granted_kb = 0;
-    state->native_current_memory_mode = GS_AMM_MEMORY_MODE_NONE;
-    state->native_current_model_version = 0;
-    state->native_current_leaf_id = 0;
-    state->native_current_calibration_version = 0;
-    state->native_current_calibration_scale = 0.0;
-    for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
-        state->native_current_raw_bounds_kb[i] = 0.0;
-        state->native_current_calibrated_bounds_kb[i] = 0.0;
-    }
-    gs_amm_copy_admission_reason(state->native_last_reason, "none");
-    gs_amm_reinitialize_granule_table_locked(state);
-    state->reclaim_syscall_inflight = false;
-    state->reclaim_syscall_attempt = 0;
-    state->maintenance_resetting = false;
-    SpinLockRelease(&state->mutex);
-
-    int saved_work_mem_kb = MyGsAmmSavedWorkMemKb;
-    gs_amm_clear_backend_grant_state();
-    gs_amm_restore_backend_work_mem(saved_work_mem_kb);
-    int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "reset=true active_mb=%ld dynamic_target_mb=%d dynamic_used_mb=0 active_ap_count=0 "
-        "ap_queue_len=0 last_action=OBSERVE",
-        (long)gs_amm_blocks_to_mb(StrategyActiveBufferCount()), gs_amm_dynamic_target_default_mb());
-    securec_check_ss(rc, "\0", "\0");
-
-    PG_RETURN_TEXT_P(cstring_to_text(status));
-}
-
-Datum gs_amm_set_dynamic_target_mb(PG_FUNCTION_ARGS)
-{
-    gs_amm_require_admin_legacy_control();
-    int target_mb = PG_GETARG_INT32(0);
-    GsAmmSharedState *state = gs_amm_get_state();
-    int dynamic_target_mb;
-    int dynamic_free_mb;
-    int dynamic_used_mb;
-    char status[512];
-
-    if (!superuser())
-        ereport(ERROR,
-            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to set GS AMM dynamic target")));
-
-    target_mb = Max(target_mb, gs_amm_ap_min_grant_mb);
-
-    SpinLockAcquire(&state->mutex);
-    state->dynamic_target_mb = target_mb;
-    dynamic_target_mb = state->dynamic_target_mb;
-    dynamic_used_mb = state->dynamic_used_mb;
-    dynamic_free_mb = Max(dynamic_target_mb - dynamic_used_mb, 0);
-    SpinLockRelease(&state->mutex);
-
-    int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "set_dynamic_target=true dynamic_target_mb=%d dynamic_used_mb=%d dynamic_free_mb=%d", dynamic_target_mb,
-        dynamic_used_mb, dynamic_free_mb);
-    securec_check_ss(rc, "\0", "\0");
-
-    PG_RETURN_TEXT_P(cstring_to_text(status));
-}
-
-static int gs_amm_tp_pressure_from_drop_ratio(double drop_ratio)
-{
-    int scaled_pressure;
-
-    if (!(drop_ratio > 0.0))
-        return 0;
-    if (gs_amm_tp_jitter_limit <= 0.0 || drop_ratio >= gs_amm_tp_jitter_limit)
-        return 100;
-
-    scaled_pressure = (int)((drop_ratio / gs_amm_tp_jitter_limit) *
-                            (double)Max(gs_amm_tp_pressure_guard - 1, 1));
-    return Max(0, Min(scaled_pressure, Max(gs_amm_tp_pressure_guard - 1, 0)));
-}
-
-static void gs_amm_autorun_controller_from_metrics(int tp_pressure, int io_pressure)
-{
-    if (!gs_amm_enabled)
-        return;
-
-    GsAmmSharedState *state = gs_amm_get_state();
-    int active_ap_count;
-    int dynamic_used_mb;
-    int ap_queue_len;
-    int reclaiming_granules;
-    bool tp_guard_hot;
-    bool io_guard_hot;
-
-    tp_pressure = Max(0, Min(tp_pressure, 100));
-    io_pressure = Max(0, Min(io_pressure, 100));
-
-    SpinLockAcquire(&state->mutex);
-    active_ap_count = state->active_ap_count;
-    dynamic_used_mb = state->dynamic_used_mb;
-    ap_queue_len = state->ap_queue_len;
-    reclaiming_granules = state->reclaiming_granules;
-    tp_guard_hot = gs_amm_tp_drop_guard_hot_locked(state);
-    io_guard_hot = gs_amm_io_guard_hot_locked(state);
-    if (!tp_guard_hot && !io_guard_hot && active_ap_count == 0 && dynamic_used_mb == 0 &&
-        ap_queue_len == 0 && reclaiming_granules == 0) {
-        SpinLockRelease(&state->mutex);
-        return;
-    }
-    state->auto_controller_step_count++;
-    SpinLockRelease(&state->mutex);
-
-    gs_amm_controller_step_internal(0, tp_pressure, io_pressure, NULL, 0);
-}
-
-typedef struct GsAmmNativeIoSignals {
-    uint64 physical_read_count;
-    uint64 dirty_page_count;
-    uint64 pending_writeback_pages;
-    uint64 temp_spill_bytes;
-    uint64 hash_multipass_count;
-} GsAmmNativeIoSignals;
-
-static void GsAmmReadNativeIoSignals(GsAmmSharedState *state, GsAmmNativeIoSignals *signals)
-{
-    signals->physical_read_count = pg_atomic_read_u64(&state->shared_buffer_physical_read_count);
-    signals->dirty_page_count = pg_atomic_read_u64(&state->dirty_page_count);
-    signals->pending_writeback_pages = pg_atomic_read_u64(&state->pending_writeback_page_count);
-    signals->temp_spill_bytes = pg_atomic_read_u64(&state->ap_temp_spill_bytes);
-    signals->hash_multipass_count = pg_atomic_read_u64(&state->ap_hash_multipass_count);
-}
-
-void GsAmmPagewriterControllerTick(void)
-{
-    GsAmmDeviceIoSample device_sample;
-    GsAmmNativeIoSignals signals;
-    GsAmmTpWindowSnapshot tp_window_snapshot;
-    GsAmmSharedState *state;
+    int active_blocks;
     TimestampTz now;
-    TimestampTz elapsed_us;
-    TimestampTz last_tick;
-    double elapsed_seconds;
-    double tps;
-    double physical_read_rate;
-    double dirty_page_ratio;
-    double temp_spill_mb_rate;
-    double hash_multipass_rate;
-    double tp_recent_tps;
-    double tp_window_p95_latency_ms;
-    double tp_raw_drop_ratio;
-    double tp_baseline_tps;
-    int io_pressure;
-    int tp_pressure;
-    int active_buffer_blocks;
-    uint64 last_commit_count;
-    uint64 last_physical_read_count;
-    uint64 last_temp_spill_bytes;
-    uint64 last_hash_multipass_count;
-    bool tp_window_mature;
-    bool tp_baseline_rebased;
-    bool raw_io_hot;
+    bool can_borrow = false;
+    uint64 window_hits;
+    uint64 window_reads;
+    uint64 window_accesses;
+    int window_pressure_pct;
+    int baseline_miss_pct;
 
-    if (!gs_amm_enabled) {
-        return;
-    }
-
-    state = gs_amm_get_state();
+    if (!gs_amm_enabled)
+        return false;
     now = GetCurrentTimestamp();
-    GsAmmReadNativeIoSignals(state, &signals);
-    uint64 commit_count = pg_atomic_read_u64(&state->tp_commit_count);
-
     SpinLockAcquire(&state->mutex);
-    if (state->native_telemetry_last_tick == 0) {
-        state->native_telemetry_last_tick = now;
-        state->native_telemetry_last_commit_count = commit_count;
-        state->native_telemetry_last_physical_read_count = signals.physical_read_count;
-        state->native_telemetry_last_temp_spill_bytes = signals.temp_spill_bytes;
-        state->native_telemetry_last_hash_multipass_count = signals.hash_multipass_count;
-        state->native_telemetry_tick_count++;
-        SpinLockRelease(&state->mutex);
-        return;
+    /* A controller tick may not have consumed the current TP window yet.
+     * Evaluate the counters in-place before shrinking SB so a newly hot TP
+     * workload cannot lose a granule during that interval. */
+    window_hits = state->tp_window_shared_blks_hit;
+    window_reads = state->tp_window_shared_blks_read;
+    window_accesses = window_hits + window_reads;
+    window_pressure_pct = window_accesses > 0 ?
+        (int)((window_reads * 100) / window_accesses) : 0;
+    baseline_miss_pct = state->tp_buffer_hit_baseline_valid &&
+        state->tp_buffer_hit_baseline_accesses > 0 ?
+        Max(0, 100 - (int)((state->tp_buffer_hit_baseline_hits * 100) /
+            state->tp_buffer_hit_baseline_accesses)) : 0;
+    if (gs_amm_dynamic_free_mb_locked(state) < ap_demand_mb &&
+        gs_amm_dynamic_free_mb_locked(state) + gs_amm_free_granule_mb_locked(state) < ap_demand_mb &&
+        state->tp_pressure_valid && !state->tp_pressure_hot &&
+        state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW &&
+        state->ap_downgrade_pending == 0 &&
+        state->tp_buffer_hit_baseline_valid &&
+        !state->ap_borrow_buffer_hit_guarded &&
+        !(state->ap_borrow_count > 0 && window_accesses > 0 &&
+            gs_amm_tp_buffer_miss_threshold_pct > 0 &&
+            window_pressure_pct >= baseline_miss_pct + gs_amm_tp_buffer_miss_threshold_pct) &&
+        (state->last_ap_borrow_at == 0 || now - state->last_ap_borrow_at >= GS_AMM_TP_WINDOW_MS * 1000)) {
+        state->last_ap_borrow_at = now;
+        can_borrow = true;
     }
-
-    elapsed_us = now - state->native_telemetry_last_tick;
-    if (elapsed_us < 1000000) {
-        SpinLockRelease(&state->mutex);
-        return;
-    }
-    last_tick = state->native_telemetry_last_tick;
-    last_commit_count = state->native_telemetry_last_commit_count;
-    last_physical_read_count = state->native_telemetry_last_physical_read_count;
-    last_temp_spill_bytes = state->native_telemetry_last_temp_spill_bytes;
-    last_hash_multipass_count = state->native_telemetry_last_hash_multipass_count;
-    gs_amm_snapshot_tp_window_locked(state, &tp_window_snapshot);
     SpinLockRelease(&state->mutex);
+    if (!can_borrow)
+        return false;
 
-    /* Diskstats may block on procfs; never hold the shared AMM spinlock while sampling it. */
-    GsAmmSampleDeviceIo(&device_sample);
-
-    elapsed_seconds = (double)elapsed_us / 1000000.0;
-    tps = (double)(commit_count >= last_commit_count ? commit_count - last_commit_count : 0) /
-        elapsed_seconds;
-    physical_read_rate = (double)(signals.physical_read_count >= last_physical_read_count ?
-                                      signals.physical_read_count - last_physical_read_count : 0) /
-        elapsed_seconds;
-    temp_spill_mb_rate = (double)(signals.temp_spill_bytes >= last_temp_spill_bytes ?
-                                    signals.temp_spill_bytes - last_temp_spill_bytes : 0) /
-        (1024.0 * 1024.0 * elapsed_seconds);
-    hash_multipass_rate = (double)(signals.hash_multipass_count >= last_hash_multipass_count ?
-                                       signals.hash_multipass_count - last_hash_multipass_count : 0) /
-        elapsed_seconds;
-    active_buffer_blocks = gs_amm_current_active_buffer_blocks(state);
-    dirty_page_ratio = active_buffer_blocks > 0 ?
-        (double)signals.dirty_page_count / (double)active_buffer_blocks : 0.0;
-    io_pressure = gs_amm_compute_io_pressure(physical_read_rate, signals.pending_writeback_pages, dirty_page_ratio,
-        device_sample.available ? device_sample.in_flight : 0, device_sample.available ? device_sample.io_ms_rate : 0.0,
-        temp_spill_mb_rate, hash_multipass_rate);
-    gs_amm_append_tp_window_snapshot(&tp_window_snapshot, now, tps, 0.0);
-    gs_amm_compute_tp_window_snapshot(
-        &tp_window_snapshot, now, GS_AMM_NATIVE_TP_WINDOW_MS, &tp_recent_tps, &tp_window_p95_latency_ms);
-    tp_window_mature =
-        gs_amm_tp_window_snapshot_mature(&tp_window_snapshot, now, GS_AMM_NATIVE_TP_WINDOW_MS);
-    tp_baseline_tps = gs_amm_tp_baseline_candidate(
-        &tp_window_snapshot, now, tp_window_mature, tp_recent_tps, &tp_baseline_rebased);
-    if (!tp_window_mature || tp_baseline_tps < GS_AMM_TP_GUARD_MIN_BASELINE_TPS) {
-        tp_raw_drop_ratio = 0.0;
-    } else {
-        tp_raw_drop_ratio = tp_recent_tps > 0.0 ?
-            Max((tp_baseline_tps - tp_recent_tps) / tp_baseline_tps, 0.0) : 1.0;
-    }
-    tp_pressure = tp_window_mature && tp_baseline_tps >= GS_AMM_TP_GUARD_MIN_BASELINE_TPS ?
-        gs_amm_tp_pressure_from_drop_ratio(tp_raw_drop_ratio) : 0;
-
+    active_blocks = gs_amm_current_active_buffer_blocks(state);
+    /* A free granule may have appeared after the first snapshot (for example
+     * when TP recovery completed).  Recheck the complete supply order before
+     * shrinking shared buffers so a lower-priority source is never consumed
+     * while a higher-priority source is available. */
     SpinLockAcquire(&state->mutex);
-    if (state->native_telemetry_last_tick != last_tick ||
-        state->tp_sample_generation != tp_window_snapshot.generation) {
+    window_hits = state->tp_window_shared_blks_hit;
+    window_reads = state->tp_window_shared_blks_read;
+    window_accesses = window_hits + window_reads;
+    window_pressure_pct = window_accesses > 0 ?
+        (int)((window_reads * 100) / window_accesses) : 0;
+    baseline_miss_pct = state->tp_buffer_hit_baseline_valid &&
+        state->tp_buffer_hit_baseline_accesses > 0 ?
+        Max(0, 100 - (int)((state->tp_buffer_hit_baseline_hits * 100) /
+            state->tp_buffer_hit_baseline_accesses)) : 0;
+    if (gs_amm_dynamic_free_mb_locked(state) >= ap_demand_mb ||
+        gs_amm_dynamic_free_mb_locked(state) + gs_amm_free_granule_mb_locked(state) >= ap_demand_mb ||
+        !state->tp_pressure_valid || state->tp_pressure_hot ||
+        state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW ||
+        state->ap_downgrade_pending > 0 ||
+        state->ap_borrow_buffer_hit_guarded || !state->tp_buffer_hit_baseline_valid ||
+        (state->ap_borrow_count > 0 && window_accesses > 0 &&
+            gs_amm_tp_buffer_miss_threshold_pct > 0 &&
+            window_pressure_pct >= baseline_miss_pct + gs_amm_tp_buffer_miss_threshold_pct)) {
+        state->last_ap_borrow_at = 0;
         SpinLockRelease(&state->mutex);
-        return;
+        return false;
     }
-    if (!gs_amm_advance_tp_sample_generation_locked(state)) {
-        SpinLockRelease(&state->mutex);
-        return;
-    }
-    state->native_telemetry_last_tick = now;
-    state->native_telemetry_last_commit_count = commit_count;
-    state->native_telemetry_last_physical_read_count = signals.physical_read_count;
-    state->native_telemetry_last_temp_spill_bytes = signals.temp_spill_bytes;
-    state->native_telemetry_last_hash_multipass_count = signals.hash_multipass_count;
-    state->native_telemetry_tick_count++;
-    state->tp_sample_next = tp_window_snapshot.sample_next;
-    state->tp_sample_count = tp_window_snapshot.sample_count;
-    for (int index = 0; index < GS_AMM_TP_WINDOW_SAMPLE_COUNT; index++) {
-        state->tp_sample_time[index] = tp_window_snapshot.sample_time[index];
-        state->tp_sample_tps[index] = tp_window_snapshot.sample_tps[index];
-        state->tp_sample_p95_latency_ms[index] = tp_window_snapshot.sample_p95_latency_ms[index];
-    }
-    state->tp_baseline_tps = tp_baseline_tps;
-    if (tp_baseline_rebased)
-        state->tp_baseline_rebase_count++;
-    state->tp_recent_tps = tp_recent_tps;
-    state->tp_p95_latency_ms = tp_window_p95_latency_ms;
-    state->tp_window_ms = GS_AMM_NATIVE_TP_WINDOW_MS;
-    state->tp_raw_drop_ratio = tp_raw_drop_ratio;
-    state->physical_read_rate = physical_read_rate;
-    state->pending_writeback_pages = signals.pending_writeback_pages;
-    state->dirty_page_ratio = dirty_page_ratio;
-    state->device_io_in_flight = device_sample.available ? device_sample.in_flight : 0;
-    state->device_io_ms_rate = device_sample.available ? device_sample.io_ms_rate : 0.0;
-    state->device_io_available = device_sample.available;
-    state->temp_spill_mb_rate = temp_spill_mb_rate;
-    state->hash_multipass_rate = hash_multipass_rate;
-    state->io_pressure_observed = io_pressure;
-    state->io_window_ms = (int)(elapsed_us / 1000);
-    state->last_io_pressure = io_pressure;
-    gs_amm_update_io_recovery_locked(state, now, device_sample.available);
-    raw_io_hot = io_pressure >= gs_amm_io_pressure_guard;
-    if (gs_amm_tp_drop_guard_hot_locked(state) || raw_io_hot)
-        state->cooldown_until = gs_amm_timestamp_after_ms(now, gs_amm_resize_cooldown_ms);
-    state->last_tp_pressure = tp_pressure;
     SpinLockRelease(&state->mutex);
-
-    GsAmmCommitDeviceIoSample();
-    gs_amm_autorun_controller_from_metrics(tp_pressure, io_pressure);
-    GsAmmDtreeCalibrationTick();
-}
-
-Datum gs_amm_update_tp_metrics(PG_FUNCTION_ARGS)
-{
-    gs_amm_require_admin_legacy_control();
-    double tps = PG_GETARG_FLOAT8(0);
-    double p95_latency_ms = PG_GETARG_FLOAT8(1);
-    int window_ms = PG_GETARG_INT32(2);
-    GsAmmSharedState *state = gs_amm_get_state();
-    GsAmmTpWindowSnapshot tp_window_snapshot;
-    TimestampTz now = GetCurrentTimestamp();
-    double tp_baseline_tps;
-    double tp_recent_tps;
-    double tp_window_p95_latency_ms;
-    double tp_raw_drop_ratio;
-    bool tp_window_mature;
-    bool tp_baseline_rebased;
-    long resize_cooldown_ms;
-    const char *resize_guard_state;
-    char status[1024];
-
-    if (!superuser())
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to update GS AMM TP metrics")));
-
-    if (!(tps > 0.0))
-        tps = 0.0;
-    if (!(p95_latency_ms >= 0.0))
-        p95_latency_ms = 0.0;
-    window_ms = Max(window_ms, 0);
-
-    for (;;) {
+    if (ap_demand_mb > 0 && active_blocks > gs_amm_mb_to_blocks(gs_amm_shared_buffers_min_mb)) {
+        GsAmmResizeOutcome outcome;
+        int target_blocks = Max(active_blocks - state->granule_blocks,
+            gs_amm_mb_to_blocks(gs_amm_shared_buffers_min_mb));
+        gs_amm_resize_core(gs_amm_align_resize_target_blocks(
+            target_blocks, NORMAL_SHARED_BUFFER_NUM), &outcome);
         SpinLockAcquire(&state->mutex);
-        gs_amm_snapshot_tp_window_locked(state, &tp_window_snapshot);
-        SpinLockRelease(&state->mutex);
-
-        gs_amm_append_tp_window_snapshot(&tp_window_snapshot, now, tps, p95_latency_ms);
-        gs_amm_compute_tp_window_snapshot(
-            &tp_window_snapshot, now, window_ms, &tp_recent_tps, &tp_window_p95_latency_ms);
-        tp_window_mature = gs_amm_tp_window_snapshot_mature(&tp_window_snapshot, now, window_ms);
-        tp_baseline_tps = gs_amm_tp_baseline_candidate(
-            &tp_window_snapshot, now, tp_window_mature, tp_recent_tps, &tp_baseline_rebased);
-        if (!tp_window_mature || !(tp_baseline_tps > 0.0)) {
-            tp_raw_drop_ratio = 0.0;
+        if (outcome.decision == NULL || strcmp(outcome.decision, "shrunk") != 0) {
+            state->last_ap_borrow_at = 0;
+            SpinLockRelease(&state->mutex);
+            return false;
         } else {
-            tp_raw_drop_ratio = tp_recent_tps > 0.0 ?
-                Max((tp_baseline_tps - tp_recent_tps) / tp_baseline_tps, 0.0) : 1.0;
+            state->last_action = GS_AMM_BORROW_FROM_BUFFER;
+            state->ap_borrow_count++;
+            (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
+                sizeof(state->last_supply_source) - 1, "%s", "shared_buffer");
         }
-
-        SpinLockAcquire(&state->mutex);
-        if (state->tp_sample_generation != tp_window_snapshot.generation) {
-            SpinLockRelease(&state->mutex);
-            continue;
-        }
-        if (!gs_amm_advance_tp_sample_generation_locked(state)) {
-            SpinLockRelease(&state->mutex);
-            ereport(ERROR,
-                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                    errmsg("cannot update GS AMM TP metrics after TPS generation exhaustion")));
-        }
-        state->tp_sample_next = tp_window_snapshot.sample_next;
-        state->tp_sample_count = tp_window_snapshot.sample_count;
-        for (int index = 0; index < GS_AMM_TP_WINDOW_SAMPLE_COUNT; index++) {
-            state->tp_sample_time[index] = tp_window_snapshot.sample_time[index];
-            state->tp_sample_tps[index] = tp_window_snapshot.sample_tps[index];
-            state->tp_sample_p95_latency_ms[index] = tp_window_snapshot.sample_p95_latency_ms[index];
-        }
-        state->tp_baseline_tps = tp_baseline_tps;
-        if (tp_baseline_rebased)
-            state->tp_baseline_rebase_count++;
-        state->tp_recent_tps = tp_recent_tps;
-        state->tp_p95_latency_ms = tp_window_p95_latency_ms;
-        state->tp_window_ms = window_ms;
-        state->tp_raw_drop_ratio = tp_raw_drop_ratio;
-        if (gs_amm_tp_drop_guard_hot_locked(state))
-            state->cooldown_until = gs_amm_timestamp_after_ms(now, gs_amm_resize_cooldown_ms);
-        tp_baseline_tps = state->tp_baseline_tps;
-        tp_recent_tps = state->tp_recent_tps;
-        tp_raw_drop_ratio = state->tp_raw_drop_ratio;
-        resize_cooldown_ms = state->cooldown_until > now ? (long)((state->cooldown_until - now) / 1000) : 0L;
-        resize_guard_state = gs_amm_resize_guard_state(state, now);
         SpinLockRelease(&state->mutex);
-        break;
+        return true;
     }
-
-    int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "tp_metrics_updated=true tp_baseline_tps=%.3f tp_recent_tps=%.3f "
-        "tp_raw_drop_ratio=%.6f tp_window_ms=%d resize_guard_state=%s resize_cooldown_ms=%ld",
-        tp_baseline_tps, tp_recent_tps, tp_raw_drop_ratio, window_ms, resize_guard_state, resize_cooldown_ms);
-    securec_check_ss(rc, "\0", "\0");
-
-    gs_amm_autorun_controller_from_metrics(tp_window_mature ? gs_amm_tp_pressure_from_drop_ratio(tp_raw_drop_ratio) : 0, 0);
-
-    PG_RETURN_TEXT_P(cstring_to_text(status));
+    return false;
 }
 
-Datum gs_amm_update_io_metrics(PG_FUNCTION_ARGS)
+/* Supply active AP grants before admitting queued APs. */
+static void gs_amm_supply_ap_demand(void)
 {
-    gs_amm_require_admin_legacy_control();
-    double physical_read_rate = PG_GETARG_FLOAT8(0);
-    int pending_writeback_pages = PG_GETARG_INT32(1);
-    double temp_spill_mb_rate = PG_GETARG_FLOAT8(2);
-    int hash_multipass_count = PG_GETARG_INT32(3);
-    int window_ms = PG_GETARG_INT32(4);
     GsAmmSharedState *state = gs_amm_get_state();
-    TimestampTz now = GetCurrentTimestamp();
-    int io_pressure_observed;
-    bool io_guard_hot;
-    const char *resize_guard_state;
-    char status[1024];
-
-    if (!superuser())
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to update GS AMM IO metrics")));
-
-    if (!(physical_read_rate > 0.0))
-        physical_read_rate = 0.0;
-    pending_writeback_pages = Max(pending_writeback_pages, 0);
-    if (!(temp_spill_mb_rate > 0.0))
-        temp_spill_mb_rate = 0.0;
-    hash_multipass_count = Max(hash_multipass_count, 0);
-    window_ms = Max(window_ms, 0);
-    io_pressure_observed = gs_amm_compute_io_pressure(physical_read_rate, (uint64)pending_writeback_pages, 0.0,
-        0, 0.0, temp_spill_mb_rate, (double)hash_multipass_count);
-
-    SpinLockAcquire(&state->mutex);
-    state->physical_read_rate = physical_read_rate;
-    state->pending_writeback_pages = (uint64)pending_writeback_pages;
-    state->device_io_in_flight = 0;
-    state->device_io_ms_rate = 0.0;
-    state->device_io_available = false;
-    state->temp_spill_mb_rate = temp_spill_mb_rate;
-    state->hash_multipass_rate = (double)hash_multipass_count;
-    state->io_pressure_observed = io_pressure_observed;
-    state->io_window_ms = window_ms;
-    state->last_io_pressure = io_pressure_observed;
-    gs_amm_update_io_recovery_locked(state, now, true);
-    if (io_pressure_observed >= gs_amm_io_pressure_guard)
-        state->cooldown_until = gs_amm_timestamp_after_ms(now, gs_amm_resize_cooldown_ms);
-    io_guard_hot = gs_amm_io_guard_hot_locked(state);
-    resize_guard_state = gs_amm_resize_guard_state(state, now);
-    SpinLockRelease(&state->mutex);
-
-    int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "io_metrics_updated=true physical_read_rate=%.6f pending_writeback_pages=%d "
-        "temp_spill_mb_rate=%.6f hash_multipass_rate=%d io_pressure_observed=%d "
-        "io_guard_hot=%s io_window_ms=%d resize_guard_state=%s",
-        physical_read_rate, pending_writeback_pages, temp_spill_mb_rate, hash_multipass_count, io_pressure_observed,
-        io_guard_hot ? "true" : "false", window_ms, resize_guard_state);
-    securec_check_ss(rc, "\0", "\0");
-
-    gs_amm_autorun_controller_from_metrics(0, io_pressure_observed);
-
-    PG_RETURN_TEXT_P(cstring_to_text(status));
-}
-
-Datum gs_amm_resize_shared_buffers(PG_FUNCTION_ARGS)
-{
-    gs_amm_require_admin_legacy_control();
-    int target_mb = PG_GETARG_INT32(0);
-    int target_blocks;
-    int max_buffers = NORMAL_SHARED_BUFFER_NUM;
-    char status[2048];
-    GsAmmResizeOutcome outcome;
-
-    if (!superuser())
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to resize GS AMM shared buffers")));
-    if (target_mb <= 0)
-        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("shared buffers target must be positive")));
-
-    target_blocks = gs_amm_mb_to_blocks(target_mb);
-    if (target_blocks > max_buffers)
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("shared buffers target exceeds the startup maximum envelope")));
-    if (!GsAmmOperationBegin())
-        ereport(ERROR,
-            (errcode(ERRCODE_OBJECT_IN_USE),
-                errmsg("cannot resize GS AMM shared buffers during maintenance reset")));
-
-    PG_TRY();
-    {
-    target_blocks = gs_amm_align_resize_target_blocks(target_blocks, max_buffers);
-    target_mb = (int)gs_amm_blocks_to_mb(target_blocks);
-
-    gs_amm_resize_core(target_blocks, &outcome);
-
-    int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "resize=%s reason=%s active_blocks=%d active_mb=%ld target_blocks=%d target_mb=%d "
-        "max_blocks=%d max_mb=%ld resize_serialized=true pending_retire_blocks=%d "
-        "resize_deferred=%s resize_granule_mb=%d resize_granule_aligned=true "
-        "unsafe_dirty_or_pinned_invalidations=0",
-        outcome.decision, outcome.reason, outcome.active_blocks, (long)gs_amm_blocks_to_mb(outcome.active_blocks),
-        target_blocks, target_mb, max_buffers, (long)gs_amm_blocks_to_mb(max_buffers), outcome.pending_retire_blocks,
-        strcmp(outcome.decision, "deferred") == 0 ? "true" : "false", gs_amm_resize_batch_mb);
-    securec_check_ss(rc, "\0", "\0");
-    }
-    PG_CATCH();
-    {
-        GsAmmOperationEnd();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    GsAmmOperationEnd();
-    PG_RETURN_TEXT_P(cstring_to_text(status));
-}
-
-Datum gs_amm_controller_step(PG_FUNCTION_ARGS)
-{
-    gs_amm_require_admin_legacy_control();
-    int ap_demand_mb = PG_GETARG_INT32(0);
-    int tp_pressure = PG_GETARG_INT32(1);
-    int io_pressure = PG_GETARG_INT32(2);
-    char status[2048];
-
-    if (!superuser())
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("must be superuser to drive the GS AMM controller")));
-
-    gs_amm_controller_step_internal(ap_demand_mb, tp_pressure, io_pressure, status, sizeof(status));
-    PG_RETURN_TEXT_P(cstring_to_text(status));
-}
-
-static void gs_amm_controller_step_internal(
-    int ap_demand_mb, int tp_pressure, int io_pressure, char *status, Size status_size)
-{
-    if (!gs_amm_enabled) {
-        if (status != NULL && status_size > 0) {
-            int rc = snprintf_s(status, status_size, status_size - 1, "action=OBSERVE reason=amm_disabled");
-            securec_check_ss(rc, "\0", "\0");
-        }
-        return;
-    }
-
-    if (!GsAmmOperationBegin()) {
-        if (status != NULL && status_size > 0) {
-            int rc = snprintf_s(status, status_size, status_size - 1,
-                "action=OBSERVE reason=maintenance_resetting");
-            securec_check_ss(rc, "\0", "\0");
-        }
-        return;
-    }
-
-    PG_TRY();
-    {
-
-    int raw_ap_demand_mb;
-    int effective_ap_demand_mb;
-    int active_blocks = StrategyActiveBufferCount();
-    int max_blocks = NORMAL_SHARED_BUFFER_NUM;
-    int active_mb = (int)gs_amm_blocks_to_mb(active_blocks);
-    int max_mb = (int)gs_amm_blocks_to_mb(max_blocks);
-    GsAmmConfig cfg;
-    GsAmmObservation obs;
-    GsAmmSimState state0;
-    GsAmmPlanResult plan;
-    GsAmmResizeOutcome outcome;
-    GsAmmSharedState *shared_state = gs_amm_get_state();
-    GsAmmGranuleSummary pool_event_before;
-    TimestampTz pool_event_started;
-    GsAmmRuntimeConfig runtime_config;
-    int resize_applied_mb = 0;
-    int pre_dynamic_used_mb;
-    int pre_dynamic_free_mb;
-    int dynamic_target_mb;
-    int dynamic_used_mb;
+    int pending_mb;
+    int aggregate_target_mb;
+    int granted_mb;
     int dynamic_free_mb;
     int free_granule_mb;
-    int active_ap_count;
-    int ap_queue_len;
-    uint64 ap_queue_head;
-    uint64 ap_queue_tail;
-    int ap_queue_admit_count;
-    int ap_queue_timeout_count;
-    int backpressure_count;
-    int new_ap_guard_block_count;
-    int grant_shrink_count;
-    int grant_debt_mb;
-    int last_grant_mb;
-    int last_effective_grant_kb;
-    bool resize_guard_hot;
-    bool recovery_cooldown_hot;
-    char last_backpressure_reason[32];
+    bool should_borrow = false;
+    bool active_growth_pending;
 
-    ap_demand_mb = Max(ap_demand_mb, 0);
-    raw_ap_demand_mb = ap_demand_mb;
-    gs_amm_runtime_config_snapshot(shared_state, &runtime_config);
-    effective_ap_demand_mb = gs_amm_effective_controller_demand_mb(raw_ap_demand_mb, &runtime_config);
-    tp_pressure = Max(0, Min(tp_pressure, 100));
-    io_pressure = Max(0, Min(io_pressure, 100));
+    SpinLockAcquire(&state->mutex);
+    gs_amm_refresh_ap_totals_locked(state);
+    gs_amm_refresh_ap_target_totals_locked(state);
+    /* TP recovery owns the allocator until all requested AP downgrades have
+     * been confirmed.  Do not grow an existing AP or consume SB capacity. */
+    if (state->tp_pressure_hot || state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW ||
+        state->ap_downgrade_pending > 0) {
+        state->pending_demand_mb = 0;
+        (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
+            sizeof(state->last_supply_source) - 1, "%s", "tp_recovery");
+        SpinLockRelease(&state->mutex);
+        return;
+    }
+    active_growth_pending = gs_amm_active_ap_growth_pending_locked(state);
+    while (active_growth_pending && (dynamic_free_mb = gs_amm_dynamic_free_mb_locked(state)) > 0) {
+        GsAmmApRecord *record = gs_amm_select_ap_growth_candidate_locked(state);
+        if (record == NULL || gs_amm_grow_ap_dynamic_locked(state, record, dynamic_free_mb) <= 0)
+            break;
+        active_growth_pending = gs_amm_active_ap_growth_pending_locked(state);
+    }
+    while (active_growth_pending && (free_granule_mb = gs_amm_free_granule_mb_locked(state)) > 0) {
+        GsAmmApRecord *record = gs_amm_select_ap_growth_candidate_locked(state);
+        if (record == NULL || gs_amm_grow_ap_granule_locked(
+                state, record, Min(free_granule_mb, gs_amm_configured_granule_mb())) <= 0)
+            break;
+        active_growth_pending = gs_amm_active_ap_growth_pending_locked(state);
+    }
+    gs_amm_refresh_ap_totals_locked(state);
+    gs_amm_refresh_ap_target_totals_locked(state);
+    aggregate_target_mb = state->last_aggregate_target_mb + state->queued_target_demand_mb;
+    granted_mb = (int)Min((state->ap_granted_bytes_total + 1024 * 1024 - 1) /
+        (1024 * 1024), (uint64)INT_MAX);
+    pending_mb = Max(aggregate_target_mb - granted_mb, 0);
+    dynamic_free_mb = gs_amm_dynamic_free_mb_locked(state);
+    free_granule_mb = gs_amm_free_granule_mb_locked(state);
+    state->last_dynamic_deficit_mb = pending_mb;
+    state->pending_demand_mb = pending_mb;
+    if (pending_mb > 0) {
+        if (active_growth_pending) {
+            (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
+                sizeof(state->last_supply_source) - 1, "%s", "active_ap");
+        } else if (dynamic_free_mb > 0) {
+            (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
+                sizeof(state->last_supply_source) - 1, "%s", "dynamic");
+        } else if (free_granule_mb > 0) {
+            (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
+                sizeof(state->last_supply_source) - 1, "%s", "free_granule");
+        } else {
+            (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
+                sizeof(state->last_supply_source) - 1, "%s", "queue");
+        }
+        /* Active APs are the first consumer of every higher-priority source,
+         * but an outstanding active deficit must still be allowed to borrow
+         * from shared buffers once dynamic and free-granule supply is empty. */
+        if (dynamic_free_mb + free_granule_mb < pending_mb)
+            should_borrow = true;
+    }
+    SpinLockRelease(&state->mutex);
 
-    (void)gs_amm_retry_failed_reclaim(shared_state);
-    pool_event_started = GetCurrentTimestamp();
-    gs_amm_default_config(&cfg, max_mb);
+    if (should_borrow)
+        (void)gs_amm_prepare_dynamic_capacity(Min(pending_mb, gs_amm_configured_granule_mb()));
+}
 
-    SpinLockAcquire(&shared_state->mutex);
-    gs_amm_summarize_granules_locked(shared_state, &pool_event_before);
-    io_pressure = Max(io_pressure, shared_state->io_pressure_observed);
-    SpinLockRelease(&shared_state->mutex);
+/*
+ * Admit a request without publishing a queue slot when it is the only
+ * waiter and the current dynamic/free-granule inventory can satisfy its
+ * one-pass target.  Keeping this operation under the AMM lock preserves FIFO:
+ * callers must only use it while the queue is empty.  Shared-buffer borrowing
+ * is deliberately handled outside this helper because resize may sleep and
+ * must never run while holding the spinlock.
+ */
+static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_kb,
+    int one_pass_bound_kb, int multi_pass_bound_kb, int prediction_mb,
+    GsAmmGrantToken *grant_token, int *granted_kb, int *grant_granules)
+{
+    int demand_mb;
+    int dynamic_free_mb;
+    int free_granule_mb;
+    int dynamic_grant_kb;
+    int shared_grant_kb;
+    int shared_grant_mb;
+    GsAmmGrantToken token;
 
-    obs.ap_demand_mb = effective_ap_demand_mb;
-    obs.tp_pressure = tp_pressure;
-    obs.io_pressure = io_pressure;
-    obs.tail_reclaimable = true;
-    obs.telemetry_ok = true;
+    if (state == NULL || grant_token == NULL || granted_kb == NULL || grant_granules == NULL ||
+        state->maintenance_resetting || state->active_ap_count >= GS_AMM_MAX_AP_REGISTRY ||
+        state->tp_pressure_hot || state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW ||
+        state->ap_downgrade_pending > 0)
+        return false;
+    if (gs_amm_queue_has_entries_locked(state))
+        return false;
 
-    state0.active_mb = active_mb;
-    state0.max_mb = max_mb;
-    state0.min_mb = cfg.shared_buffers_min_mb;
-    state0.grant_debt_mb = 0;
-    state0.tail_reclaimable = obs.tail_reclaimable;
-    state0.ap_demand_mb = obs.ap_demand_mb;
-    state0.tp_pressure = obs.tp_pressure;
-    state0.io_pressure = obs.io_pressure;
+    demand_mb = (int)Min((Max((uint64)(state->ap_multipass_only ? multi_pass_bound_kb : one_pass_bound_kb), 1) + 1023) / 1024,
+        (uint64)INT_MAX);
+    demand_mb = Max(demand_mb, gs_amm_ap_min_grant_mb);
+    dynamic_free_mb = gs_amm_dynamic_free_mb_locked(state);
+    free_granule_mb = gs_amm_free_granule_mb_locked(state);
+    if (dynamic_free_mb + free_granule_mb < demand_mb)
+        return false;
 
-    gs_amm_plan_actions(&state0, &obs, &cfg, &plan);
+    token = gs_amm_next_grant_token_locked(state);
+    if (token.grant_id == 0 || token.grant_generation == 0)
+        return false;
+    dynamic_grant_kb = (int)Min((uint64)demand_mb * 1024,
+        (uint64)dynamic_free_mb * 1024);
+    shared_grant_kb = demand_mb * 1024 - dynamic_grant_kb;
+    shared_grant_mb = (shared_grant_kb + 1023) / 1024;
+    *grant_granules = 0;
 
-    SpinLockAcquire(&shared_state->mutex);
-    if (shared_state->dynamic_target_mb <= 0)
-        shared_state->dynamic_target_mb = gs_amm_dynamic_target_default_mb();
-    pre_dynamic_used_mb = shared_state->dynamic_used_mb;
-    pre_dynamic_free_mb = Max(shared_state->dynamic_target_mb - shared_state->dynamic_used_mb, 0);
-    free_granule_mb = gs_amm_free_granule_mb_locked(shared_state);
-    resize_guard_hot = gs_amm_recent_tps_drop_blocks_resize_locked(shared_state, GetCurrentTimestamp());
-    recovery_cooldown_hot = gs_amm_recovery_cooldown_hot_locked(shared_state, GetCurrentTimestamp());
-    if (recovery_cooldown_hot && tp_pressure >= cfg.tp_pressure_guard && active_mb < max_mb)
-        shared_state->recovery_cooldown_block_count++;
-    SpinLockRelease(&shared_state->mutex);
+    if (shared_grant_mb > 0 && gs_amm_reserve_ap_granules_locked(
+            state, token, shared_grant_mb, grant_granules) < shared_grant_mb)
+        return false;
+    if (shared_grant_mb > 0 && !gs_amm_activate_ap_granules_locked(state, token)) {
+        (void)gs_amm_forward_unwind_ap_granules_locked(state, token);
+        gs_amm_refresh_granule_counts_locked(state);
+        return false;
+    }
+    if (!gs_amm_register_ap_locked(state, token, cache_bound_kb, one_pass_bound_kb,
+        multi_pass_bound_kb, demand_mb * 1024, (uint64)dynamic_grant_kb * 1024,
+        state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS,
+        state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS,
+        t_thrd.proc_cxt.MyProcPid, t_thrd.proc->backendId)) {
+        (void)gs_amm_forward_unwind_ap_granules_locked(state, token);
+        gs_amm_refresh_granule_counts_locked(state);
+        return false;
+    }
+    state->active_ap_count++;
+    state->last_prediction_mb = prediction_mb;
+    state->last_grant_mb = demand_mb;
+    state->last_action = GS_AMM_AP_EXPAND;
+    (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
+        sizeof(state->last_supply_source) - 1, "%s",
+        dynamic_grant_kb == demand_mb * 1024 ? "dynamic" : "free_granule");
+    gs_amm_refresh_ap_totals_locked(state);
+    gs_amm_refresh_ap_target_totals_locked(state);
+    *grant_token = token;
+    *granted_kb = demand_mb * 1024;
+    return true;
+}
 
-    if (tp_pressure >= cfg.tp_pressure_guard && active_mb < max_mb)
-        plan.chosen_action = recovery_cooldown_hot ?
-            (pre_dynamic_used_mb > 0 ? GS_AMM_AP_SHRINK : GS_AMM_BACKPRESSURE) :
-            GS_AMM_TP_RECOVERY;
-    else if (plan.chosen_action == GS_AMM_TP_RECOVERY && recovery_cooldown_hot)
-        plan.chosen_action = pre_dynamic_used_mb > 0 ? GS_AMM_AP_SHRINK : GS_AMM_BACKPRESSURE;
-    else if (resize_guard_hot && pre_dynamic_used_mb > 0)
-        plan.chosen_action = GS_AMM_AP_SHRINK;
-    else if (resize_guard_hot)
-        plan.chosen_action = GS_AMM_BACKPRESSURE;
-    else if ((tp_pressure >= cfg.tp_pressure_guard || io_pressure >= cfg.io_pressure_guard) && pre_dynamic_used_mb > 0)
-        plan.chosen_action = GS_AMM_AP_SHRINK;
-    else if (effective_ap_demand_mb > free_granule_mb && active_mb > state0.min_mb)
-        plan.chosen_action = GS_AMM_BORROW_FROM_BUFFER;
-    else if (effective_ap_demand_mb > pre_dynamic_free_mb && active_mb <= state0.min_mb)
-        plan.chosen_action = GS_AMM_BACKPRESSURE;
+/* Admit only the FIFO head and reserve its complete one-pass grant atomically. */
+static void gs_amm_process_ap_queue(void)
+{
+    GsAmmSharedState *state = gs_amm_get_state();
 
-    outcome.active_blocks = active_blocks;
-    if (plan.chosen_action == GS_AMM_BORROW_FROM_BUFFER || plan.chosen_action == GS_AMM_TP_RECOVERY) {
-        int step_mb = gs_amm_resize_step_mb(&state0, plan.chosen_action, &cfg);
+    for (;;) {
+        GsAmmApQueueSlot wake_slot;
+        int demand_mb;
+        int dynamic_free_mb;
+        int free_granule_mb;
+        int active_buffer_mb;
+        int sb_borrowable_mb;
+        int64 available_mb;
+        int64 demand_kb;
+        int64 dynamic_free_kb;
+        int dynamic_grant_kb;
+        int shared_grant_kb;
+        int shared_grant_mb;
+        int grant_granules = 0;
+        GsAmmGrantToken token;
+        bool granted = false;
+        bool need_capacity = false;
+        bool registry_full = false;
+        GsAmmGranuleSummary granule_summary;
 
-        if (step_mb > 0) {
-            int target_mb = (plan.chosen_action == GS_AMM_BORROW_FROM_BUFFER) ? state0.active_mb - step_mb :
-                                                                                 state0.active_mb + step_mb;
-            int target_blocks = gs_amm_mb_to_blocks(target_mb);
+        (void)memset_s(&wake_slot, sizeof(wake_slot), 0, sizeof(wake_slot));
+        SpinLockAcquire(&state->mutex);
+        GsAmmApQueueSlot *head = gs_amm_queue_head_locked(state);
+        if (state->tp_pressure_hot || state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW ||
+            state->ap_downgrade_pending > 0) {
+            gs_amm_set_backpressure_reason_locked(state, "tp_recovery");
+            SpinLockRelease(&state->mutex);
+            return;
+        }
+        if (head == NULL) {
+            SpinLockRelease(&state->mutex);
+            return;
+        }
+        demand_mb = state->ap_multipass_only ?
+            (int)Min((Max((uint64)head->multi_pass_bound_kb, 1) + 1023) / 1024, (uint64)INT_MAX) :
+            gs_amm_queue_demand_mb(head);
+        dynamic_free_mb = gs_amm_dynamic_free_mb_locked(state);
+        free_granule_mb = gs_amm_free_granule_mb_locked(state);
+        gs_amm_summarize_granules_locked(state, &granule_summary);
+        active_buffer_mb = (int)gs_amm_blocks_to_mb(granule_summary.buffer_active_blocks);
+        sb_borrowable_mb = Max(active_buffer_mb - gs_amm_shared_buffers_min_mb, 0);
+        available_mb = (int64)dynamic_free_mb + free_granule_mb + sb_borrowable_mb;
+        demand_kb = (int64)demand_mb * 1024;
+        dynamic_free_kb = (int64)dynamic_free_mb * 1024;
+        registry_full = state->active_ap_count >= GS_AMM_MAX_AP_REGISTRY;
+        need_capacity = available_mb < demand_mb;
+        /* Convert borrowable SB capacity into a free granule before trying
+         * to reserve the queue head.  A queue slot is only left blocked once
+         * the SB floor has been reached. */
+        if (!state->maintenance_resetting && !registry_full &&
+            dynamic_free_mb + free_granule_mb < demand_mb && sb_borrowable_mb > 0) {
+            SpinLockRelease(&state->mutex);
+            (void)gs_amm_prepare_dynamic_capacity(demand_mb);
+            return;
+        }
+        if (state->maintenance_resetting || registry_full || need_capacity) {
+            if (registry_full)
+                gs_amm_set_backpressure_reason_locked(state, "registry_full");
+            else if (need_capacity)
+                gs_amm_set_backpressure_reason_locked(state, "capacity_floor");
+            SpinLockRelease(&state->mutex);
+            return;
+        }
+        /* Grant fields use int kB units.  An unrepresentable request cannot
+         * be admitted and remains at the FIFO head until it is cancelled. */
+        if (demand_kb > INT_MAX) {
+            SpinLockRelease(&state->mutex);
+            return;
+        }
 
-            target_blocks = gs_amm_align_resize_target_blocks(target_blocks, max_blocks);
-            gs_amm_resize_core(target_blocks, &outcome);
-            resize_applied_mb = (int)gs_amm_blocks_to_mb(outcome.active_blocks) - active_mb;
+        token = gs_amm_next_grant_token_locked(state);
+        if (token.grant_id == 0 || token.grant_generation == 0) {
+            SpinLockRelease(&state->mutex);
+            return;
+        }
+        dynamic_grant_kb = (int)Min(demand_kb, dynamic_free_kb);
+        shared_grant_kb = (int)(demand_kb - dynamic_grant_kb);
+        shared_grant_mb = (shared_grant_kb + 1023) / 1024;
+        if (shared_grant_mb == 0 || gs_amm_reserve_ap_granules_locked(
+                state, token, shared_grant_mb, &grant_granules) >= shared_grant_mb) {
+            if (shared_grant_mb == 0 || gs_amm_activate_ap_granules_locked(state, token)) {
+                if (gs_amm_register_ap_locked(state, token, head->cache_bound_kb,
+                    head->one_pass_bound_kb, head->multi_pass_bound_kb, demand_mb * 1024,
+                    (uint64)dynamic_grant_kb * 1024,
+                    state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS,
+                    state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS,
+                    /* The queue is admitted by the controller/backend that
+                     * happens to process the FIFO head, but cancellation must
+                     * target the AP backend that owns the waiting slot. */
+                    head->waiter_pid,
+                    InvalidBackendId)) {
+                    state->active_ap_count++;
+                    state->last_grant_mb = demand_mb;
+                    state->last_prediction_mb = head->prediction_mb;
+                    state->last_action = GS_AMM_AP_EXPAND;
+                    state->ap_queue_admit_count++;
+                    wake_slot = *head;
+                    wake_slot.state = GS_AMM_AP_QUEUE_GRANTED;
+                    wake_slot.grant_token = token;
+                    wake_slot.granted_kb = demand_mb * 1024;
+                    wake_slot.grant_granules = grant_granules;
+                    wake_slot.memory_mode = state->ap_multipass_only ?
+                        GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS;
+                    *head = wake_slot;
+                    gs_amm_refresh_ap_totals_locked(state);
+                    gs_amm_refresh_ap_queue_totals_locked(state);
+                    gs_amm_refresh_ap_target_totals_locked(state);
+                    granted = true;
+                }
+            }
+        }
+        if (!granted) {
+            if (shared_grant_mb > 0)
+                (void)gs_amm_forward_unwind_ap_granules_locked(state, token);
+            gs_amm_refresh_granule_counts_locked(state);
+            SpinLockRelease(&state->mutex);
+            return;
+        }
+        SpinLockRelease(&state->mutex);
+        gs_amm_wake_queue_waiter(&wake_slot);
+    }
+}
+
+static bool gs_amm_request_tp_downgrade_locked(GsAmmSharedState *state)
+{
+    GsAmmApRecord *best = NULL;
+    int best_granule_id = -1;
+    uint64 best_used_bytes = PG_UINT64_MAX;
+
+    for (int granule_id = 0; granule_id < state->total_granules; granule_id++) {
+        GsAmmGranuleMeta *granule = &state->granules[granule_id];
+        GsAmmGrantToken token;
+        GsAmmApRecord *record;
+
+        if (granule->state != GS_AMM_GRANULE_AP_ACTIVE || granule->reclaim_inflight ||
+            granule->scan_inflight)
+            continue;
+        token.grant_id = granule->grant_id;
+        token.grant_generation = granule->grant_generation;
+        record = gs_amm_find_ap_record_locked(state, token);
+        if (record == NULL || record->reclaim_pending ||
+            record->effective_grant_kb <= record->multi_pass_bound_kb)
+            continue;
+        if (best == NULL || granule->used_bytes < best_used_bytes ||
+            (granule->used_bytes == best_used_bytes && token.grant_id < best->grant_id)) {
+            best = record;
+            best_granule_id = granule_id;
+            best_used_bytes = granule->used_bytes;
         }
     }
+    /* Dynamic grants do not own a physical granule, but they still consume
+     * the global dynamic quota and must participate in TP-driven downgrade. */
+    if (best == NULL) {
+        for (int index = 0; index < GS_AMM_MAX_AP_REGISTRY; index++) {
+            GsAmmApRecord *record = &state->ap_registry[index];
+            uint64 minimum_bytes;
 
-    SpinLockAcquire(&shared_state->mutex);
-    if (shared_state->dynamic_target_mb <= 0)
-        shared_state->dynamic_target_mb = gs_amm_dynamic_target_default_mb();
-    shared_state->last_prediction_mb = raw_ap_demand_mb;
-    shared_state->last_tp_pressure = tp_pressure;
-    shared_state->last_io_pressure = io_pressure;
-    shared_state->last_action = plan.chosen_action;
-    if (plan.chosen_action == GS_AMM_AP_EXPAND) {
-        int free_mb = Max(shared_state->dynamic_target_mb - shared_state->dynamic_used_mb, 0);
-        int grant_mb = gs_amm_clamp_grant_mb(effective_ap_demand_mb, free_mb);
-
-        shared_state->effective_grant_kb = 0;
-        shared_state->last_effective_grant_kb = 0;
-        shared_state->last_grant_mb = grant_mb;
-    } else if (plan.chosen_action == GS_AMM_BORROW_FROM_BUFFER) {
-        int borrowed_mb = Max(-resize_applied_mb, 0);
-        int free_mb;
-        int grant_mb;
-
-        if (borrowed_mb > 0)
-            shared_state->dynamic_target_mb += borrowed_mb;
-        free_mb = Max(shared_state->dynamic_target_mb - shared_state->dynamic_used_mb, 0);
-        grant_mb = gs_amm_clamp_grant_mb(effective_ap_demand_mb, free_mb);
-        shared_state->effective_grant_kb = 0;
-        shared_state->last_effective_grant_kb = 0;
-        shared_state->last_grant_mb = grant_mb;
-    } else if (plan.chosen_action == GS_AMM_AP_SHRINK || plan.chosen_action == GS_AMM_TP_RECOVERY) {
-        int shrink_mb = Min(Max(effective_ap_demand_mb, cfg.resize_rate_limit_mb), Max(shared_state->dynamic_used_mb, 0));
-        bool recovered_buffer = plan.chosen_action == GS_AMM_TP_RECOVERY && resize_applied_mb > 0;
-
-        if (recovered_buffer) {
-            TimestampTz now = GetCurrentTimestamp();
-
-            shared_state->dynamic_target_mb = Max(gs_amm_ap_min_grant_mb, shared_state->dynamic_target_mb - resize_applied_mb);
-            shared_state->recovery_action_count++;
-            shared_state->recovery_cooldown_until = gs_amm_timestamp_after_ms(now, gs_amm_tp_recovery_cooldown_ms);
-        }
-        if (shrink_mb > 0 && shared_state->active_ap_count > 0) {
-            int effective_mb;
-            int idle_reclaimed_mb = gs_amm_reclaim_unused_ap_granules_locked(shared_state, shrink_mb);
-
-            shared_state->dynamic_used_mb = Max(shared_state->dynamic_used_mb - idle_reclaimed_mb, 0);
-            shared_state->grant_shrink_count++;
-            shared_state->grant_debt_mb += Max(shrink_mb - idle_reclaimed_mb, 0);
-            effective_mb = Max(gs_amm_ap_min_grant_mb, shared_state->dynamic_used_mb / Max(shared_state->active_ap_count, 1));
-            shared_state->effective_grant_kb = effective_mb * 1024;
-            shared_state->effective_downgrade_count++;
-            shared_state->last_effective_grant_kb = shared_state->effective_grant_kb;
-            shared_state->last_grant_mb = effective_mb;
-        } else if (plan.chosen_action == GS_AMM_TP_RECOVERY) {
-            shared_state->effective_grant_kb = 0;
-            shared_state->last_effective_grant_kb = 0;
-            shared_state->last_grant_mb = 0;
-        }
-    } else if (plan.chosen_action == GS_AMM_BACKPRESSURE) {
-        shared_state->backpressure_count++;
-        shared_state->last_grant_mb = 0;
-        if (tp_pressure >= cfg.tp_pressure_guard || io_pressure >= cfg.io_pressure_guard) {
-            shared_state->effective_grant_kb = 0;
-            shared_state->last_effective_grant_kb = shared_state->effective_grant_kb;
+            if (!record->active || record->reclaim_pending)
+                continue;
+            minimum_bytes = (uint64)Max(record->multi_pass_bound_kb, 1) * 1024;
+            if (record->dynamic_granted_bytes <= minimum_bytes ||
+                record->effective_grant_kb <= record->multi_pass_bound_kb)
+                continue;
+            if (best == NULL || record->dynamic_used_bytes < best_used_bytes ||
+                (record->dynamic_used_bytes == best_used_bytes && record->grant_id < best->grant_id)) {
+                best = record;
+                best_granule_id = -1;
+                best_used_bytes = record->dynamic_used_bytes;
+            }
         }
     }
-    if (plan.chosen_action != GS_AMM_OBSERVE) {
-        const char *event_reason = plan.binding_constraint[0] == '\0' ? "none" : plan.binding_constraint;
+    if (best == NULL)
+        return false;
 
-        gs_amm_record_pool_event_locked(shared_state, plan.chosen_action, event_reason,
-            &pool_event_before, pool_event_started);
-    }
-    dynamic_target_mb = shared_state->dynamic_target_mb;
-    dynamic_used_mb = shared_state->dynamic_used_mb;
-    dynamic_free_mb = Max(dynamic_target_mb - dynamic_used_mb, 0);
-    active_ap_count = shared_state->active_ap_count;
-    ap_queue_len = shared_state->ap_queue_len;
-    ap_queue_head = shared_state->ap_queue_head;
-    ap_queue_tail = shared_state->ap_queue_tail;
-    ap_queue_admit_count = shared_state->ap_queue_admit_count;
-    ap_queue_timeout_count = shared_state->ap_queue_timeout_count;
-    backpressure_count = shared_state->backpressure_count;
-    new_ap_guard_block_count = shared_state->new_ap_guard_block_count;
-    grant_shrink_count = shared_state->grant_shrink_count;
-    grant_debt_mb = shared_state->grant_debt_mb;
-    last_grant_mb = shared_state->last_grant_mb;
-    last_effective_grant_kb = shared_state->last_effective_grant_kb;
-    int reason_rc = snprintf_s(last_backpressure_reason, sizeof(last_backpressure_reason),
-        sizeof(last_backpressure_reason) - 1, "%s", shared_state->last_backpressure_reason);
-    securec_check_ss(reason_rc, "\0", "\0");
-    SpinLockRelease(&shared_state->mutex);
+    best->reclaim_pending = true;
+    best->reclaim_granule_id = best_granule_id;
+    best->target_mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+    if (best->revoke_epoch != PG_UINT64_MAX)
+        best->revoke_epoch++;
+    state->ap_downgrade_pending++;
+    state->tp_recovery_requested_granules++;
+    gs_amm_rebalance_ap_limits_locked(state);
+    return true;
+}
 
-    if (status != NULL && status_size > 0) {
-        int rc = snprintf_s(status, status_size, status_size - 1,
-            "chosen_action=%s candidate_count=%d rejected_count=%d score=%.4f active_mb=%ld "
-            "resize_applied_mb=%d dynamic_target_mb=%d dynamic_used_mb=%d dynamic_free_mb=%d "
-            "active_ap_count=%d ap_queue_len=%d ap_queue_head=%llu ap_queue_tail=%llu "
-            "ap_queue_admit_count=%d ap_queue_timeout_count=%d backpressure_count=%d "
-            "new_ap_guard_block_count=%d last_backpressure_reason=%s grant_shrink_count=%d "
-            "grant_debt_mb=%d last_grant_mb=%d last_effective_grant_kb=%d binding_constraint=%s "
-            "controller_decisions_observable=true prediction_mb=%d admission_demand_mb=%d "
-            "allocator_only_mode=%s allocator_only_grant_mb=%d tp_pressure=%d io_pressure=%d",
-            gs_amm_action_name(plan.chosen_action), plan.candidate_count, plan.rejected_count, plan.score,
-            (long)gs_amm_blocks_to_mb(StrategyActiveBufferCount()), resize_applied_mb, dynamic_target_mb,
-            dynamic_used_mb, dynamic_free_mb, active_ap_count, ap_queue_len, (unsigned long long)ap_queue_head,
-            (unsigned long long)ap_queue_tail, ap_queue_admit_count, ap_queue_timeout_count, backpressure_count,
-            new_ap_guard_block_count, last_backpressure_reason, grant_shrink_count, grant_debt_mb, last_grant_mb,
-            last_effective_grant_kb, plan.binding_constraint[0] == '\0' ? "none" : plan.binding_constraint,
-            raw_ap_demand_mb, effective_ap_demand_mb, runtime_config.allocator_only_mode ? "true" : "false",
-            runtime_config.allocator_only_grant_mb, tp_pressure, io_pressure);
-        securec_check_ss(rc, "\0", "\0");
+static bool gs_amm_expand_one_tp_granule(GsAmmSharedState *state)
+{
+    int active_blocks = gs_amm_current_active_buffer_blocks(state);
+    int baseline_blocks = gs_amm_mb_to_blocks(state->baseline_active_mb);
+    int target_blocks = Min(active_blocks + state->granule_blocks, NORMAL_SHARED_BUFFER_NUM);
+    int final_blocks;
+
+    if (baseline_blocks > 0)
+        target_blocks = Min(target_blocks, baseline_blocks);
+    if (target_blocks <= active_blocks)
+        return false;
+    final_blocks = gs_amm_expand_granules(state, target_blocks, false);
+    return final_blocks > active_blocks;
+}
+
+void GsAmmRecordTpBufferUsage(uint64 shared_blks_hit, uint64 shared_blks_read,
+    uint64 completed_queries)
+{
+    GsAmmSharedState *state;
+
+    if (!gs_amm_enabled || gs_amm_workload_role != GS_AMM_WORKLOAD_TP)
+        return;
+    state = gs_amm_get_state();
+    SpinLockAcquire(&state->mutex);
+    if (gs_amm_tp_test_mode)
+        state->tp_test_mode_until = GetCurrentTimestamp() +
+            GS_AMM_TP_TEST_MODE_LEASE_WINDOWS * GS_AMM_TP_WINDOW_MS * 1000;
+    if (gs_amm_tp_test_worker_surge)
+        /* The controller runs in pagewriter, so publish the test-only surge
+         * marker from the TP backend that owns the test GUC. */
+        state->tp_test_worker_surge_until = GetCurrentTimestamp() +
+            GS_AMM_TP_TEST_SURGE_LEASE_WINDOWS * GS_AMM_TP_WINDOW_MS * 1000;
+    state->tp_window_shared_blks_hit += shared_blks_hit;
+    state->tp_window_shared_blks_read += shared_blks_read;
+    state->tp_window_completed_queries += completed_queries;
+    SpinLockRelease(&state->mutex);
+}
+
+void GsAmmRecordApReclaimPoll(uint64 released_bytes)
+{
+    GsAmmSharedState *state;
+    GsAmmGrantToken token;
+    GsAmmApRecord *record;
+
+    if (!gs_amm_enabled || gs_amm_workload_role != GS_AMM_WORKLOAD_AP)
+        return;
+    state = gs_amm_get_state();
+    token.grant_id = MyGsAmmGrantId;
+    token.grant_generation = MyGsAmmGrantGeneration;
+    SpinLockAcquire(&state->mutex);
+    record = gs_amm_find_ap_record_locked(state, token);
+    if (record != NULL && record->reclaim_pending) {
+        state->ap_reclaim_poll_count++;
+        state->ap_reclaim_operator_release_bytes += released_bytes;
     }
+    SpinLockRelease(&state->mutex);
+}
+
+/* Read aggregate host CPU jiffies.  The controller stores consecutive
+ * snapshots in shared state so every TP backend observes the same interval. */
+static bool gs_amm_read_host_cpu_jiffies(uint64 *total_jiffies, uint64 *idle_jiffies)
+{
+    FILE *stat_file;
+    char line[256];
+    uint64 user = 0;
+    uint64 nice = 0;
+    uint64 system = 0;
+    uint64 idle = 0;
+    uint64 iowait = 0;
+    uint64 irq = 0;
+    uint64 softirq = 0;
+    uint64 steal = 0;
+    int fields;
+
+    if (total_jiffies == NULL || idle_jiffies == NULL)
+        return false;
+    stat_file = fopen("/proc/stat", "r");
+    if (stat_file == NULL)
+        return false;
+    if (fgets(line, sizeof(line), stat_file) == NULL) {
+        fclose(stat_file);
+        return false;
     }
-    PG_CATCH();
+    fclose(stat_file);
+    fields = sscanf_s(line, "cpu %lu %lu %lu %lu %lu %lu %lu %lu", &user, &nice,
+        &system, &idle, &iowait, &irq, &softirq, &steal);
+    if (fields < 4)
+        return false;
+    *total_jiffies = user + nice + system + idle + iowait + irq + softirq + steal;
+    *idle_jiffies = idle + iowait;
+    return *total_jiffies > 0;
+}
+
+void GsAmmControllerTick(void)
+{
+    GsAmmSharedState *state;
+    TimestampTz now;
+    uint64 accesses;
+    int pressure_pct;
+    bool hot;
+    int low_pressure_threshold;
+    uint64 hits;
+    uint64 reads;
+    uint64 completed_queries;
+    int hit_pct;
+    bool hit_guarded = false;
+    bool miss_guarded = false;
+    bool tps_guarded = false;
+    bool previous_hot;
+    bool hit_baseline_ready;
+    bool cpu_sample_valid = false;
+    bool cpu_guarded = false;
+    bool recovery_metrics_stable;
+    bool test_mode;
+    bool test_worker_surge;
+    bool tp_sample_available;
+    int baseline_miss_pct = 0;
+    int cpu_util_pct = 0;
+    uint64 cpu_total_jiffies = 0;
+    uint64 cpu_idle_jiffies = 0;
+
+    if (!gs_amm_enabled)
+        return;
+    state = gs_amm_get_state();
+    now = GetCurrentTimestamp();
+    cpu_sample_valid = gs_amm_read_host_cpu_jiffies(&cpu_total_jiffies, &cpu_idle_jiffies);
+    test_mode = gs_amm_tp_test_mode;
+    test_worker_surge = gs_amm_tp_test_worker_surge;
+    SpinLockAcquire(&state->mutex);
+    state->dynamic_target_mb = gs_amm_effective_dynamic_target_mb();
+    if (test_mode)
+        state->tp_test_mode_until = now +
+            GS_AMM_TP_TEST_MODE_LEASE_WINDOWS * GS_AMM_TP_WINDOW_MS * 1000;
+    if (test_worker_surge)
+        /* A test worker can spend several seconds in one full-table scan.
+         * Keep its test-only marker visible to pagewriter until its next
+         * completion publishes a fresh lease. */
+        state->tp_test_worker_surge_until = now +
+            GS_AMM_TP_TEST_SURGE_LEASE_WINDOWS * GS_AMM_TP_WINDOW_MS * 1000;
+    if (state->tp_last_window_at != 0 && now - state->tp_last_window_at < GS_AMM_TP_WINDOW_MS * 1000) {
+        SpinLockRelease(&state->mutex);
+        return;
+    }
+    state->tp_last_window_at = now;
+    /* A test worker publishes a short shared lease.  Pagewriter owns the
+     * one-second tick, so a thread-local test GUC alone would be invisible
+     * to the process that makes the scheduling decision. */
+    test_mode = state->tp_test_mode_until > now;
+    test_worker_surge = state->tp_test_worker_surge_until > now;
+    if (cpu_sample_valid) {
+        if (state->tp_cpu_util_valid && cpu_total_jiffies > state->tp_cpu_last_total_jiffies) {
+            uint64 total_delta = cpu_total_jiffies - state->tp_cpu_last_total_jiffies;
+            uint64 idle_delta = cpu_idle_jiffies >= state->tp_cpu_last_idle_jiffies ?
+                cpu_idle_jiffies - state->tp_cpu_last_idle_jiffies : 0;
+
+            idle_delta = Min(idle_delta, total_delta);
+            cpu_util_pct = (int)(((total_delta - idle_delta) * 100) / total_delta);
+            state->tp_cpu_util_pct = cpu_util_pct;
+        }
+        state->tp_cpu_last_total_jiffies = cpu_total_jiffies;
+        state->tp_cpu_last_idle_jiffies = cpu_idle_jiffies;
+        state->tp_cpu_util_valid = true;
+    }
+    hits = state->tp_window_shared_blks_hit;
+    reads = state->tp_window_shared_blks_read;
+    completed_queries = state->tp_window_completed_queries;
+    accesses = hits + reads;
+    tp_sample_available = accesses > 0 || completed_queries > 0;
+    if (accesses == 0) {
+        bool empty_window_hot = false;
+        bool restore_after_empty = false;
+
+        state->tp_recent_tps = completed_queries;
+        state->tp_window_shared_blks_hit = 0;
+        state->tp_window_shared_blks_read = 0;
+        state->tp_window_completed_queries = 0;
+        /* A completed TP query with no buffer counters still provides a TP
+         * CPU-pressure sample.  A fully empty pagewriter window does not. */
+        if (completed_queries == 0) {
+            /* Host CPU is not TP pressure without a TP completion or buffer
+             * sample.  Pagewriter executes this tick too, so do not let an
+             * unrelated workload preempt AP before TP has started. */
+            if (!state->tp_pressure_valid) {
+                state->tp_pressure_pct = 0;
+                state->tp_buffer_hit_pct = 100;
+                state->tp_pressure_valid = true;
+                state->tp_pressure_hot = false;
+                state->tp_pressure_state = GS_AMM_TP_PRESSURE_LOW_FLOW;
+            }
+            bool allow_ap_supply = state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW &&
+                state->ap_downgrade_pending == 0;
+            SpinLockRelease(&state->mutex);
+            if (allow_ap_supply) {
+                gs_amm_supply_ap_demand();
+                gs_amm_process_ap_queue();
+            }
+            return;
+        }
+        if (!state->tp_pressure_valid) {
+            state->tp_pressure_pct = 0;
+            state->tp_buffer_hit_pct = 100;
+            state->tp_pressure_valid = true;
+            state->tp_pressure_hot = false;
+            state->tp_pressure_state = GS_AMM_TP_PRESSURE_LOW_FLOW;
+            state->tp_hot_clear_windows = 0;
+            /* Do not derive a surge baseline from a counter-less window.
+             * The first real buffer sample establishes the TP rate. */
+            state->tp_baseline_tps = 0;
+            state->tp_tps_baseline_valid = false;
+        }
+        cpu_guarded = tp_sample_available && state->tp_cpu_util_valid &&
+            gs_amm_tp_cpu_pressure_threshold_pct > 0 &&
+            state->tp_cpu_util_pct >= gs_amm_tp_cpu_pressure_threshold_pct;
+        state->tp_cpu_guarded = cpu_guarded;
+        if (test_mode ? test_worker_surge : cpu_guarded) {
+            state->tp_hot_clear_windows = 0;
+            state->tp_pressure_hot = true;
+            state->tp_pressure_state = GS_AMM_TP_PRESSURE_HOT_RECOVERY;
+            empty_window_hot = true;
+        } else if (state->tp_pressure_hot) {
+            state->tp_pressure_hot = false;
+            state->tp_pressure_state = GS_AMM_TP_PRESSURE_RECOVERY_WAIT;
+            state->tp_hot_clear_windows = 1;
+        } else if (state->tp_pressure_state == GS_AMM_TP_PRESSURE_RECOVERY_WAIT) {
+            state->tp_hot_clear_windows++;
+            if (state->tp_hot_clear_windows >= GS_AMM_TP_HOT_CLEAR_WINDOWS) {
+                state->tp_hot_clear_windows = 0;
+                state->tp_pressure_state = GS_AMM_TP_PRESSURE_LOW_FLOW;
+            }
+        }
+        restore_after_empty = !state->tp_pressure_hot &&
+            state->tp_recovery_phase == GS_AMM_TP_RECOVERY_WAIT_AP &&
+            state->active_ap_count == 0;
+        bool allow_ap_supply = state->tp_pressure_valid &&
+            state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW &&
+            state->ap_downgrade_pending == 0;
+        SpinLockRelease(&state->mutex);
+        if (empty_window_hot) {
+            SpinLockAcquire(&state->mutex);
+            state->tp_recovery_phase = GS_AMM_TP_RECOVERY_STOP_AP;
+            gs_amm_request_ap_stop_locked(state);
+            bool ap_stopped = state->active_ap_count == 0;
+            SpinLockRelease(&state->mutex);
+            if (ap_stopped)
+                gs_amm_restore_shared_buffer_after_ap_stop(state);
+            return;
+        }
+        if (restore_after_empty)
+            gs_amm_restore_shared_buffer_after_ap_stop(state);
+        if (allow_ap_supply) {
+            gs_amm_supply_ap_demand();
+            gs_amm_process_ap_queue();
+        }
+        return;
+    } else {
+        pressure_pct = (int)((reads * 100) / accesses);
+        hit_pct = (int)((hits * 100) / accesses);
+    }
+    state->tp_recent_tps = completed_queries;
+    if (completed_queries > 0 && (!state->tp_tps_baseline_valid ||
+        /* During the low-flow setup window, let the baseline follow the
+         * actual two-worker rate even when AP already owns granules.  Once
+         * the rate jumps beyond the surge guard it is held for recovery. */
+        (state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW &&
+            (!state->tp_tps_baseline_valid ||
+                completed_queries <= state->tp_baseline_tps *
+                    (uint64)(100 + GS_AMM_TP_TPS_SURGE_GUARD_PCT) / 100)))) {
+        state->tp_baseline_tps = completed_queries;
+        state->tp_tps_baseline_valid = true;
+    }
+    state->tp_buffer_hit_pct = hit_pct;
+    /*
+     * A TP table scan naturally changes its hit ratio while it warms its
+     * working set.  Until AMM has actually removed an SB granule, that change
+     * is not evidence that AP allocation hurt TP.  Keep learning the baseline
+     * through this pre-borrow period, then freeze it (apart from genuine
+     * recovery) so the first AMM-caused decline is observable.
+     */
+    hit_baseline_ready = state->tp_buffer_hit_baseline_valid &&
+        state->tp_buffer_hit_baseline_accesses > 0;
+    if (!hit_baseline_ready || state->ap_borrow_count == 0) {
+        state->tp_buffer_hit_baseline_hits = hits;
+        state->tp_buffer_hit_baseline_accesses = accesses;
+        state->tp_buffer_hit_baseline_valid = true;
+    } else if (!state->tp_pressure_hot && state->tp_buffer_hit_baseline_accesses > 0 &&
+        (uint64)hit_pct * state->tp_buffer_hit_baseline_accesses >
+            state->tp_buffer_hit_baseline_hits * 100) {
+        /* Do not let the first cold-start window become the permanent TP
+         * baseline.  While pressure is cold, a better hit ratio is evidence
+         * that the working set has warmed; retain that window as the new
+         * baseline so a later cache eviction is observable. */
+        state->tp_buffer_hit_baseline_hits = hits;
+        state->tp_buffer_hit_baseline_accesses = accesses;
+    }
+    if (state->ap_borrow_count > 0 && hit_baseline_ready &&
+        gs_amm_ap_borrow_buffer_hit_guard_pct > 0 &&
+        state->tp_buffer_hit_baseline_hits > 0 &&
+        state->tp_buffer_hit_baseline_accesses > 0) {
+        double baseline_ratio = (double)state->tp_buffer_hit_baseline_hits /
+            (double)state->tp_buffer_hit_baseline_accesses;
+        double current_ratio = (double)hits / (double)accesses;
+        double decline_pct = baseline_ratio > 0.0 ?
+            (baseline_ratio - current_ratio) / baseline_ratio * 100.0 : 0.0;
+
+        hit_guarded = decline_pct >= (double)gs_amm_ap_borrow_buffer_hit_guard_pct;
+        /* The guard follows the current window.  Once hit ratio recovers to
+         * its baseline, SB borrowing may resume on a later cold tick. */
+        state->ap_borrow_buffer_hit_guarded = hit_guarded;
+    }
+    state->tp_window_shared_blks_hit = 0;
+    state->tp_window_shared_blks_read = 0;
+    state->tp_window_completed_queries = 0;
+    state->tp_pressure_pct = pressure_pct;
+    state->tp_pressure_valid = true;
+    if (state->tp_buffer_hit_baseline_valid && state->tp_buffer_hit_baseline_accesses > 0) {
+        int baseline_hit_pct = (int)((state->tp_buffer_hit_baseline_hits * 100) /
+            state->tp_buffer_hit_baseline_accesses);
+        baseline_miss_pct = Max(0, 100 - baseline_hit_pct);
+    }
+    /* The first valid window establishes normal TP locality.  Compare later
+     * windows with that baseline instead of treating a naturally read-heavy
+     * warm-up window as hot. */
+    if (state->ap_borrow_count > 0 && gs_amm_tp_buffer_miss_threshold_pct > 0 &&
+        hit_baseline_ready)
+        /* Equality at the configured boundary is normal counter rounding
+         * during the first TP window; require a genuine excess before
+         * preempting AP. */
+        miss_guarded = pressure_pct > baseline_miss_pct + gs_amm_tp_buffer_miss_threshold_pct;
+    if (test_mode) {
+        tps_guarded = test_worker_surge;
+    } else if (state->ap_borrow_count > 0 && gs_amm_tp_tps_decline_guard_pct > 0 &&
+        state->tp_tps_baseline_valid && completed_queries > 0) {
+        /* A percentage decline cannot be observed reliably until one query
+         * is less than the configured percentage of the baseline.  For
+         * example, a 3% guard needs at least 34 completed queries; with an
+         * eight-query window, a one-query change is already 12.5% and would
+         * otherwise turn normal counter quantization into a false hot state.
+         */
+        uint64 resolution_samples =
+            (uint64)((100 + gs_amm_tp_tps_decline_guard_pct - 1) /
+                gs_amm_tp_tps_decline_guard_pct);
+        if (state->tp_baseline_tps >= resolution_samples) {
+            uint64 permitted_tps = state->tp_baseline_tps *
+                (uint64)(100 - gs_amm_tp_tps_decline_guard_pct) / 100;
+
+            /* Query counts are integral; the floored permitted value is the
+             * first count whose relative decline reaches the configured
+             * threshold. */
+            tps_guarded = completed_queries <= permitted_tps;
+        }
+    }
+    state->tp_tps_guarded = tps_guarded;
+    cpu_guarded = tp_sample_available && state->tp_cpu_util_valid &&
+        gs_amm_tp_cpu_pressure_threshold_pct > 0 &&
+        state->tp_cpu_util_pct >= gs_amm_tp_cpu_pressure_threshold_pct;
+    state->tp_cpu_guarded = cpu_guarded;
+    recovery_metrics_stable = !miss_guarded && !hit_guarded && !tps_guarded;
+    /* Keep TP protection latched through transient cold samples.  Releasing
+     * the latch requires several consecutive low-pressure windows, which
+     * prevents AP supply from racing a hot TP workload at the one-second tick
+     * boundary. */
+    previous_hot = state->tp_pressure_hot;
+    if (test_mode ? test_worker_surge : cpu_guarded) {
+        state->tp_hot_clear_windows = 0;
+        state->tp_pressure_hot = true;
+        state->tp_pressure_state = GS_AMM_TP_PRESSURE_HOT_RECOVERY;
+    } else if (previous_hot) {
+        /* Leave hot recovery only after the first non-hot sample.  The
+         * recovery-wait state keeps all AP supply paths closed while the
+         * low-pressure hysteresis window is accumulated. */
+        state->tp_pressure_hot = false;
+        state->tp_pressure_state = GS_AMM_TP_PRESSURE_RECOVERY_WAIT;
+        if (recovery_metrics_stable)
+            state->tp_hot_clear_windows++;
+        else
+            state->tp_hot_clear_windows = 0;
+    } else {
+        state->tp_pressure_hot = false;
+        if (state->tp_pressure_state == GS_AMM_TP_PRESSURE_RECOVERY_WAIT) {
+            if (recovery_metrics_stable)
+                state->tp_hot_clear_windows++;
+            else
+                state->tp_hot_clear_windows = 0;
+            if (state->tp_hot_clear_windows >= GS_AMM_TP_HOT_CLEAR_WINDOWS &&
+                state->ap_downgrade_pending == 0) {
+                state->tp_hot_clear_windows = 0;
+                state->tp_pressure_state = GS_AMM_TP_PRESSURE_LOW_FLOW;
+            }
+        } else if (state->tp_pressure_state == GS_AMM_TP_PRESSURE_UNKNOWN) {
+            state->tp_hot_clear_windows = 0;
+            state->tp_pressure_state = GS_AMM_TP_PRESSURE_LOW_FLOW;
+        } else {
+            state->tp_hot_clear_windows = 0;
+            state->tp_pressure_state = GS_AMM_TP_PRESSURE_LOW_FLOW;
+        }
+    }
+    hot = state->tp_pressure_hot;
+    if (hit_guarded)
+        gs_amm_set_backpressure_reason_locked(state, "buffer_hit_guard");
+    else if (tps_guarded)
+        gs_amm_set_backpressure_reason_locked(state, "tps_guard");
+    low_pressure_threshold = Max(gs_amm_tp_buffer_miss_threshold_pct / 2, 1);
+    if (gs_amm_tp_buffer_miss_threshold_pct <= 0) {
+        state->tp_low_pressure_windows = 0;
+    } else if (state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW) {
+        state->tp_low_pressure_windows = 0;
+    } else if (pressure_pct < low_pressure_threshold) {
+        state->tp_low_pressure_windows++;
+    } else {
+        state->tp_low_pressure_windows = 0;
+    }
+    SpinLockRelease(&state->mutex);
+    if (!hot) {
+        SpinLockAcquire(&state->mutex);
+        bool waiting_for_ap = state->tp_recovery_phase == GS_AMM_TP_RECOVERY_WAIT_AP &&
+            state->active_ap_count == 0;
+        SpinLockRelease(&state->mutex);
+        if (waiting_for_ap)
+            gs_amm_restore_shared_buffer_after_ap_stop(state);
+    }
+    if (!hot && state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW) {
+        gs_amm_supply_ap_demand();
+        gs_amm_process_ap_queue();
+    }
+    if (hot) {
+        /* TP owns the memory during a hot window.  Cancel every active AP
+         * query first, then wait for normal grant cleanup before resizing SB. */
+        SpinLockAcquire(&state->mutex);
+        state->tp_recovery_phase = GS_AMM_TP_RECOVERY_STOP_AP;
+        (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
+            sizeof(state->last_supply_source) - 1, "%s", "tp_recovery_stop_ap");
+        gs_amm_request_ap_stop_locked(state);
+        state->last_action = GS_AMM_TP_DOWNGRADE_PENDING;
+        bool ap_stopped = state->active_ap_count == 0;
+        SpinLockRelease(&state->mutex);
+        if (ap_stopped)
+            gs_amm_restore_shared_buffer_after_ap_stop(state);
+        return;
+    }
+
+    /*
+     * Cold pressure may return only buffer granules that were added above the
+     * startup baseline.  In particular, an initially idle TP workload must
+     * not cause the baseline itself to be drained.  Limit the operation to
+     * one granule per control window and require a few consecutive cold
+     * samples so that a short lull cannot resize the pool.
+     */
     {
-        GsAmmOperationEnd();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
+        bool can_drain_baseline = false;
+        int baseline_blocks = 0;
 
-    GsAmmOperationEnd();
+        SpinLockAcquire(&state->mutex);
+        if (state->tp_pressure_valid && state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW &&
+            state->tp_low_pressure_windows >= GS_AMM_TP_LOW_WINDOWS_BEFORE_DRAIN &&
+            state->ap_downgrade_pending == 0) {
+            baseline_blocks = gs_amm_mb_to_blocks(state->baseline_active_mb);
+            can_drain_baseline = baseline_blocks > 0;
+        }
+        SpinLockRelease(&state->mutex);
+
+        if (can_drain_baseline) {
+            int active_blocks = gs_amm_current_active_buffer_blocks(state);
+
+            if (active_blocks > baseline_blocks) {
+                GsAmmResizeOutcome outcome;
+                int target_blocks = Max(active_blocks - state->granule_blocks, baseline_blocks);
+
+                gs_amm_resize_core(gs_amm_align_resize_target_blocks(
+                    target_blocks, NORMAL_SHARED_BUFFER_NUM), &outcome);
+                if (outcome.decision != NULL && strcmp(outcome.decision, "shrunk") == 0) {
+                    SpinLockAcquire(&state->mutex);
+                    state->last_action = GS_AMM_TP_BUFFER_BASELINE_DRAIN;
+                    SpinLockRelease(&state->mutex);
+                }
+            }
+        }
+    }
 }
 
 Datum gs_amm_begin_ap(PG_FUNCTION_ARGS)
 {
-    gs_amm_require_admin_legacy_control();
-    int prediction_mb = PG_GETARG_INT32(0);
-    int min_mb = PG_GETARG_INT32(1);
-    int max_mb = PG_GETARG_INT32(2);
+    int prediction_mb = Max(PG_GETARG_INT32(0), 1);
+    int min_mb = Max(PG_GETARG_INT32(1), 1);
+    int max_mb = Max(PG_GETARG_INT32(2), min_mb);
     int queue_timeout_ms = PG_GETARG_INT32(3);
-    GsAmmSharedState *state;
-    int dynamic_target_mb;
-    int free_mb;
-    int admission_request_mb;
-    int allocator_only_grant_mb;
-    int grant_mb = 0;
-    int grant_granules = 0;
-    int queue_wait_ms = 0;
-    uint64 queue_ticket = 0;
-    uint64 grant_id = 0;
-    GsAmmGrantToken grant_token = {0, 0};
-    bool admitted = false;
-    bool queued = false;
-    bool backpressure = false;
-    bool guard_fast_block = false;
-    bool allocator_only_mode;
-    GsAmmRuntimeConfig runtime_config;
-    const char *block_reason = "";
-    char status[1280];
+    GsAmmAdmissionResult result;
+    char status[1024];
 
-    if (!gs_amm_enabled)
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("GS AMM is disabled")));
-    state = gs_amm_get_state();
-    if (!GsAmmOperationBegin())
-        ereport(ERROR,
-            (errcode(ERRCODE_OBJECT_IN_USE),
-                errmsg("cannot request a GS AMM AP grant during maintenance reset")));
-
-    PG_TRY();
-    {
-    prediction_mb = Max(prediction_mb, 0);
-    min_mb = Max(min_mb, gs_amm_ap_min_grant_mb);
-    max_mb = Max(max_mb, min_mb);
-    gs_amm_runtime_config_snapshot(state, &runtime_config);
-    allocator_only_mode = runtime_config.allocator_only_mode;
-    allocator_only_grant_mb = gs_amm_allocator_only_grant_target_mb(&runtime_config);
-    admission_request_mb = gs_amm_effective_ap_request_mb(prediction_mb, min_mb, max_mb, &runtime_config);
-    if (queue_timeout_ms < 0)
-        queue_timeout_ms = gs_amm_ap_queue_timeout_ms;
-
-    SpinLockAcquire(&state->mutex);
-    if (state->dynamic_target_mb <= 0)
-        state->dynamic_target_mb = gs_amm_dynamic_target_default_mb();
-    dynamic_target_mb = state->dynamic_target_mb;
-    free_mb = Max(dynamic_target_mb - state->dynamic_used_mb, 0);
-    free_mb = Min(free_mb, gs_amm_free_granule_mb_locked(state));
-    block_reason = gs_amm_new_ap_block_reason_locked(state, GetCurrentTimestamp());
-    guard_fast_block = block_reason[0] != '\0';
-    if (guard_fast_block) {
-        free_mb = 0;
-        queue_timeout_ms = 0;
-        state->new_ap_guard_block_count++;
-        gs_amm_set_backpressure_reason_locked(state, block_reason);
-    }
-    if (state->effective_grant_kb > 0)
-        free_mb = Min(free_mb, Max(state->effective_grant_kb / 1024, 0));
-    grant_mb = gs_amm_clamp_grant_mb(admission_request_mb, free_mb);
-    if (grant_mb >= min_mb) {
-        grant_token = gs_amm_next_grant_token_locked(state);
-        grant_id = grant_token.grant_id;
-        grant_mb = gs_amm_reserve_ap_granules_locked(state, grant_token, grant_mb, &grant_granules);
-    }
-    if (grant_mb >= min_mb && !gs_amm_activate_ap_granules_locked(state, grant_token)) {
-        grant_mb = 0;
-        grant_granules = 0;
-    }
-    if (grant_mb >= min_mb) {
-        state->dynamic_used_mb += grant_mb;
-        state->active_ap_count++;
-        state->last_grant_mb = grant_mb;
-        state->last_prediction_mb = prediction_mb;
-        if (state->last_action == GS_AMM_OBSERVE)
-            state->last_action = GS_AMM_AP_EXPAND;
-        admitted = true;
-    } else if (queue_timeout_ms > 0 && gs_amm_queue_register_locked(state, &queue_ticket)) {
-        state->backpressure_count++;
-        state->last_grant_mb = 0;
-        state->last_prediction_mb = prediction_mb;
-        state->last_action = GS_AMM_BACKPRESSURE;
-        gs_amm_set_backpressure_reason_locked(state, "capacity");
-        queued = true;
-    } else {
-        state->backpressure_count++;
-        if (queue_timeout_ms > 0)
-            state->ap_queue_timeout_count++;
-        state->last_grant_mb = 0;
-        state->last_prediction_mb = prediction_mb;
-        state->last_action = GS_AMM_BACKPRESSURE;
-        gs_amm_set_backpressure_reason_locked(state, guard_fast_block ? block_reason : "capacity");
-        backpressure = true;
-    }
-    SpinLockRelease(&state->mutex);
-
-    volatile uint64 live_queue_ticket = queue_ticket;
-    volatile int live_queue_wait_ms = queue_wait_ms;
-    PG_TRY();
-    {
-        while (queued && live_queue_ticket > 0 && queue_wait_ms < queue_timeout_ms) {
-            int sleep_ms = Min(100, queue_timeout_ms - queue_wait_ms);
-
-            CHECK_FOR_INTERRUPTS();
-            pg_usleep((long)sleep_ms * 1000L);
-            queue_wait_ms += sleep_ms;
-            live_queue_wait_ms = queue_wait_ms;
-
-            SpinLockAcquire(&state->mutex);
-            if (gs_amm_queue_is_head_locked(state, live_queue_ticket)) {
-            free_mb = Max(state->dynamic_target_mb - state->dynamic_used_mb, 0);
-            free_mb = Min(free_mb, gs_amm_free_granule_mb_locked(state));
-            block_reason = gs_amm_new_ap_block_reason_locked(state, GetCurrentTimestamp());
-            if (block_reason[0] != '\0') {
-                free_mb = 0;
-                gs_amm_queue_finish_locked(state, live_queue_ticket, false, queue_wait_ms);
-                live_queue_ticket = 0;
-                state->new_ap_guard_block_count++;
-                state->last_grant_mb = 0;
-                state->last_prediction_mb = prediction_mb;
-                state->last_action = GS_AMM_BACKPRESSURE;
-                gs_amm_set_backpressure_reason_locked(state, block_reason);
-                backpressure = true;
-                queued = false;
-            }
-            if (state->effective_grant_kb > 0)
-                free_mb = Min(free_mb, Max(state->effective_grant_kb / 1024, 0));
-            grant_mb = queued ? gs_amm_clamp_grant_mb(admission_request_mb, free_mb) : 0;
-            if (grant_mb >= min_mb) {
-                grant_token = gs_amm_next_grant_token_locked(state);
-                grant_id = grant_token.grant_id;
-                grant_mb = gs_amm_reserve_ap_granules_locked(state, grant_token, grant_mb, &grant_granules);
-            }
-            if (grant_mb >= min_mb && !gs_amm_activate_ap_granules_locked(state, grant_token)) {
-                grant_mb = 0;
-                grant_granules = 0;
-            }
-            if (grant_mb >= min_mb) {
-                gs_amm_queue_finish_locked(state, live_queue_ticket, true, queue_wait_ms);
-                live_queue_ticket = 0;
-                state->dynamic_used_mb += grant_mb;
-                state->active_ap_count++;
-                state->last_grant_mb = grant_mb;
-                state->last_prediction_mb = prediction_mb;
-                if (state->last_action == GS_AMM_OBSERVE || state->last_action == GS_AMM_BACKPRESSURE)
-                    state->last_action = GS_AMM_AP_EXPAND;
-                admitted = true;
-                queued = false;
-            }
-            }
-            SpinLockRelease(&state->mutex);
-        }
-    }
-    PG_CATCH();
-    {
-        if (live_queue_ticket > 0) {
-            SpinLockAcquire(&state->mutex);
-            gs_amm_queue_finish_locked(state, live_queue_ticket, false, live_queue_wait_ms);
-            SpinLockRelease(&state->mutex);
-        }
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    if (queued && queue_ticket > 0 && !admitted) {
-        SpinLockAcquire(&state->mutex);
-        gs_amm_queue_finish_locked(state, queue_ticket, false, queue_wait_ms);
-        state->last_grant_mb = 0;
-        state->last_prediction_mb = prediction_mb;
-        state->last_action = GS_AMM_BACKPRESSURE;
-        SpinLockRelease(&state->mutex);
-        backpressure = true;
-    }
-
-    if (admitted) {
-        MyGsAmmGrantId = grant_id;
-        MyGsAmmGrantGeneration = grant_token.grant_generation;
-        MyGsAmmGrantGranules = grant_granules;
-        MyGsAmmGrantNative = false;
-        PG_TRY();
-        {
-            gs_amm_apply_backend_grant(grant_mb);
-        }
-        PG_CATCH();
-        {
-            (void)GsAmmReleaseGrantToken(grant_token, true);
-            PG_RE_THROW();
-        }
-        PG_END_TRY();
-    }
-
+    if (!GsAmmAdmitBounds(max_mb * 1024, prediction_mb * 1024, min_mb * 1024,
+        queue_timeout_ms, prediction_mb, &result))
+        ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("GS AMM admission result is unavailable")));
     int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "admitted=%s queued=%s backpressure=%s granted_mb=%d prediction_mb=%d min_mb=%d max_mb=%d "
-        "admission_request_mb=%d allocator_only_mode=%s allocator_only_grant_mb=%d "
-        "queue_wait_ms=%d queue_ticket=%llu grant_id=%llu grant_granules=%d backend_work_mem_kb=%d",
-        admitted ? "true" : "false", queued ? "true" : "false", backpressure ? "true" : "false", grant_mb,
-        prediction_mb, min_mb, max_mb, admission_request_mb, allocator_only_mode ? "true" : "false",
-        allocator_only_grant_mb, queue_wait_ms, (unsigned long long)queue_ticket,
-        (unsigned long long)grant_id, grant_granules, u_sess->attr.attr_memory.work_mem);
+        "admitted=%s queued=%s backpressure=%s granted_mb=%d prediction_mb=%d grant_id=%llu grant_generation=%llu",
+        result.admitted ? "true" : "false", result.queued ? "true" : "false",
+        result.backpressure ? "true" : "false", result.granted_mb, prediction_mb,
+        (unsigned long long)result.grant_id, (unsigned long long)result.grant_generation);
     securec_check_ss(rc, "\0", "\0");
-    }
-    PG_CATCH();
-    {
-        GsAmmOperationEnd();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    GsAmmOperationEnd();
     PG_RETURN_TEXT_P(cstring_to_text(status));
 }
 
-static int gs_amm_select_bound_grant_kb(int free_kb, int cache_bound_kb, int one_pass_bound_kb,
-    int multi_pass_bound_kb, int admission_request_kb, int allocator_only_min_kb,
-    bool allocator_only_mode, bool feedback_only, GsAmmMemoryMode *memory_mode)
-{
-    int grant_kb = 0;
-
-    *memory_mode = GS_AMM_MEMORY_MODE_BACKPRESSURE;
-    if (allocator_only_mode || feedback_only) {
-        grant_kb = Min(free_kb, admission_request_kb);
-        if (grant_kb >= allocator_only_min_kb)
-            *memory_mode = feedback_only ? GS_AMM_MEMORY_MODE_FEEDBACK_ONLY : GS_AMM_MEMORY_MODE_ALLOCATOR_ONLY;
-        else
-            grant_kb = 0;
-    } else if (free_kb >= cache_bound_kb) {
-        grant_kb = cache_bound_kb;
-        *memory_mode = GS_AMM_MEMORY_MODE_CACHE;
-    } else if (free_kb >= one_pass_bound_kb) {
-        grant_kb = one_pass_bound_kb;
-        *memory_mode = GS_AMM_MEMORY_MODE_ONEPASS;
-    } else if (free_kb >= multi_pass_bound_kb) {
-        grant_kb = multi_pass_bound_kb;
-        *memory_mode = GS_AMM_MEMORY_MODE_MULTIPASS;
-    }
-    return grant_kb;
-}
-
-/*
- * The dynamic target is a quota, while grants are backed by physical
- * granules.  Before a first grant can be reserved, make one guarded
- * controller pass to create physical capacity when the free list is empty.
- */
-static void gs_amm_prepare_admission_granules(int admission_demand_mb)
-{
-    GsAmmSharedState *state = gs_amm_get_state();
-    int free_granule_mb;
-    int tp_pressure;
-    int io_pressure;
-    const char *block_reason;
-
-    admission_demand_mb = Max(admission_demand_mb, gs_amm_ap_min_grant_mb);
-
-    SpinLockAcquire(&state->mutex);
-    free_granule_mb = gs_amm_free_granule_mb_locked(state);
-    block_reason = gs_amm_new_ap_block_reason_locked(state, GetCurrentTimestamp());
-    tp_pressure = gs_amm_tp_pressure_from_drop_ratio(state->tp_raw_drop_ratio);
-    io_pressure = state->io_pressure_observed;
-    SpinLockRelease(&state->mutex);
-
-    if (free_granule_mb == 0 && block_reason[0] == '\0')
-        gs_amm_controller_step_internal(admission_demand_mb, tp_pressure, io_pressure, NULL, 0);
-}
-
-static bool gs_amm_admit_bounds_internal(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_bound_kb,
+bool GsAmmAdmitBounds(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_bound_kb,
     int queue_timeout_ms, int prediction_mb, GsAmmAdmissionResult *result)
 {
     GsAmmSharedState *state;
-    int dynamic_target_kb;
-    int dynamic_used_kb;
-    int free_kb;
-    int admission_request_kb;
-    int allocator_only_min_kb;
-    int allocator_only_grant_mb;
-    int grant_kb = 0;
-    int grant_mb = 0;
-    int grant_granules = 0;
-    int queue_wait_ms = 0;
-    uint64 queue_ticket = 0;
-    uint64 grant_id = 0;
-    GsAmmGrantToken grant_token = {0, 0};
-    bool admitted = false;
-    bool queued = false;
-    bool was_queued = false;
-    bool backpressure = false;
-    bool guard_fast_block = false;
-    bool allocator_only_mode;
-    bool feedback_only;
-    const char *block_reason = "";
-    const char *result_reason = "capacity";
-    GsAmmMemoryMode memory_mode = GS_AMM_MEMORY_MODE_BACKPRESSURE;
-    GsAmmRuntimeConfig runtime_config;
+    GsAmmApQueueSlot granted_slot;
+    GsAmmGrantToken direct_token = {0, 0};
+    uint64 ticket = 0;
+    TimestampTz queued_at;
+    bool claimed = false;
+    bool directly_admitted = false;
+    GsAmmMemoryMode direct_memory_mode = GS_AMM_MEMORY_MODE_ONEPASS;
+    int direct_granted_kb = 0;
+    int direct_grant_granules = 0;
+    long wait_secs = 0;
+    int wait_usecs = 0;
+    int wait_ms = 0;
     errno_t rc;
 
-    if (result == NULL)
+    if (!gs_amm_enabled || gs_amm_workload_role != GS_AMM_WORKLOAD_AP || result == NULL)
         return false;
-
+    (void)queue_timeout_ms;
     rc = memset_s(result, sizeof(*result), 0, sizeof(*result));
     securec_check(rc, "\0", "\0");
-    result->memory_mode = GS_AMM_MEMORY_MODE_BACKPRESSURE;
-    gs_amm_copy_admission_reason(result->reason, result_reason);
-
-    state = gs_amm_get_state();
-    gs_amm_runtime_config_snapshot(state, &runtime_config);
-
     cache_bound_kb = Max(cache_bound_kb, 1);
     one_pass_bound_kb = Max(one_pass_bound_kb, 1);
     multi_pass_bound_kb = Max(multi_pass_bound_kb, 1);
@@ -6473,322 +4873,202 @@ static bool gs_amm_admit_bounds_internal(int cache_bound_kb, int one_pass_bound_
         one_pass_bound_kb = cache_bound_kb;
     if (multi_pass_bound_kb > one_pass_bound_kb)
         multi_pass_bound_kb = one_pass_bound_kb;
-    if (queue_timeout_ms < 0)
-        queue_timeout_ms = gs_amm_ap_queue_timeout_ms;
     prediction_mb = prediction_mb > 0 ? prediction_mb : Max((cache_bound_kb + 1023) / 1024, 1);
-    feedback_only = runtime_config.feedback_only;
-    allocator_only_mode = runtime_config.allocator_only_mode && !feedback_only;
-    allocator_only_grant_mb = gs_amm_allocator_only_grant_target_mb(&runtime_config);
-    admission_request_kb = allocator_only_mode ? gs_amm_effective_ap_request_kb(&runtime_config) : cache_bound_kb;
-    allocator_only_min_kb = Min(gs_amm_ap_min_grant_mb, INT_MAX / 1024) * 1024;
-
-    result->prediction_mb = feedback_only ? 0 : prediction_mb;
+    result->prediction_mb = prediction_mb;
     result->cache_bound_kb = cache_bound_kb;
     result->one_pass_bound_kb = one_pass_bound_kb;
     result->multi_pass_bound_kb = multi_pass_bound_kb;
-    result->admission_request_kb = admission_request_kb;
-    result->allocator_only_mode = allocator_only_mode;
-    result->allocator_only_grant_mb = allocator_only_grant_mb;
-    result->feedback_only = feedback_only;
+    result->admission_request_kb = one_pass_bound_kb;
+    result->backpressure = true;
+    result->memory_mode = GS_AMM_MEMORY_MODE_ONEPASS;
+    gs_amm_copy_admission_reason(result->reason, "queued");
 
     if (gs_amm_resolve_buffer_blocks() == NULL) {
-        result->backpressure = true;
         gs_amm_copy_admission_reason(result->reason, "buffer_mapping");
         return true;
     }
-
     if (MyGsAmmGrantId != 0 || MyGsAmmGrantGeneration != 0) {
-        result->backpressure = true;
         gs_amm_copy_admission_reason(result->reason, "grant_already_active");
         return true;
     }
 
-    gs_amm_prepare_admission_granules(Max(prediction_mb, (cache_bound_kb + 1023) / 1024));
-
+    /* Install cleanup before publishing the request.  This closes the small
+     * exit race where a backend could die after enqueue and before its ticket
+     * became visible to the proc-exit callback. */
+    gs_amm_register_backend_cleanup();
+    state = gs_amm_get_state();
     SpinLockAcquire(&state->mutex);
-    if (state->dynamic_target_mb <= 0)
-        state->dynamic_target_mb = gs_amm_dynamic_target_default_mb();
-    if (feedback_only)
-        admission_request_kb = Max(state->feedback_current_grant_mb, 1) * 1024;
-    result->admission_request_kb = admission_request_kb;
-    dynamic_target_kb = state->dynamic_target_mb * 1024;
-    dynamic_used_kb = state->dynamic_used_mb * 1024;
-    free_kb = Max(dynamic_target_kb - dynamic_used_kb, 0);
-    free_kb = Min(free_kb, gs_amm_free_granule_mb_locked(state) * 1024);
-    block_reason = gs_amm_new_ap_block_reason_locked(state, GetCurrentTimestamp());
-    guard_fast_block = block_reason[0] != '\0';
-    if (guard_fast_block) {
-        free_kb = 0;
-        queue_timeout_ms = 0;
-        state->new_ap_guard_block_count++;
-        gs_amm_set_backpressure_reason_locked(state, block_reason);
-    }
-    if (feedback_only && state->active_ap_count >= state->feedback_ap_slot_limit) {
-        free_kb = 0;
-        state->feedback_slot_block_count++;
-        gs_amm_set_backpressure_reason_locked(state, "feedback_slot_limit");
-        result_reason = "feedback_slot_limit";
-    }
-    if (state->effective_grant_kb > 0)
-        free_kb = Min(free_kb, state->effective_grant_kb);
-    grant_kb = gs_amm_select_bound_grant_kb(free_kb, cache_bound_kb, one_pass_bound_kb,
-        multi_pass_bound_kb, admission_request_kb, allocator_only_min_kb, allocator_only_mode, feedback_only,
-        &memory_mode);
-    grant_mb = (grant_kb + 1023) / 1024;
-    if (grant_kb > 0) {
-        grant_token = gs_amm_next_grant_token_locked(state);
-        grant_id = grant_token.grant_id;
-        if (gs_amm_reserve_ap_granules_locked(state, grant_token, grant_mb, &grant_granules) < grant_mb) {
-            grant_kb = 0;
-            grant_mb = 0;
-            memory_mode = GS_AMM_MEMORY_MODE_BACKPRESSURE;
-        }
-    }
-    if (grant_kb > 0 && !gs_amm_activate_ap_granules_locked(state, grant_token)) {
-        grant_kb = 0;
-        grant_mb = 0;
-        grant_granules = 0;
-        memory_mode = GS_AMM_MEMORY_MODE_BACKPRESSURE;
-    }
-    if (grant_kb > 0) {
-        state->dynamic_used_mb += grant_mb;
-        state->active_ap_count++;
-        if (feedback_only)
-            state->feedback_admit_count++;
-        state->last_grant_mb = grant_mb;
-        state->last_prediction_mb = prediction_mb;
-        if (state->last_action == GS_AMM_OBSERVE)
-            state->last_action = GS_AMM_AP_EXPAND;
-        admitted = true;
-        result_reason = "admitted";
-    } else if (queue_timeout_ms > 0 && gs_amm_queue_register_locked(state, &queue_ticket)) {
-        state->backpressure_count++;
-        state->last_grant_mb = 0;
-        state->last_prediction_mb = prediction_mb;
-        state->last_action = GS_AMM_BACKPRESSURE;
-        gs_amm_set_backpressure_reason_locked(state, "capacity");
-        queued = true;
-        was_queued = true;
-    } else {
-        state->backpressure_count++;
-        if (queue_timeout_ms > 0)
-            state->ap_queue_timeout_count++;
-        state->last_grant_mb = 0;
-        state->last_prediction_mb = prediction_mb;
-        state->last_action = GS_AMM_BACKPRESSURE;
-        gs_amm_set_backpressure_reason_locked(state, guard_fast_block ? block_reason : "capacity");
-        backpressure = true;
-        result_reason = guard_fast_block ? block_reason : "capacity";
-    }
+    directly_admitted = gs_amm_try_admit_ap_locked(state, cache_bound_kb, one_pass_bound_kb,
+        multi_pass_bound_kb, prediction_mb, &direct_token, &direct_granted_kb,
+        &direct_grant_granules);
+    direct_memory_mode = state->ap_multipass_only ?
+        GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS;
     SpinLockRelease(&state->mutex);
 
-    volatile uint64 live_queue_ticket = queue_ticket;
-    volatile int live_queue_wait_ms = queue_wait_ms;
-    PG_TRY();
-    {
-        while (queued && live_queue_ticket > 0 && queue_wait_ms < queue_timeout_ms) {
-            int sleep_ms = Min(100, queue_timeout_ms - queue_wait_ms);
-
-            CHECK_FOR_INTERRUPTS();
-            pg_usleep((long)sleep_ms * 1000L);
-            queue_wait_ms += sleep_ms;
-            live_queue_wait_ms = queue_wait_ms;
-
-            SpinLockAcquire(&state->mutex);
-            if (gs_amm_queue_is_head_locked(state, live_queue_ticket)) {
-            dynamic_target_kb = state->dynamic_target_mb * 1024;
-            dynamic_used_kb = state->dynamic_used_mb * 1024;
-            free_kb = Max(dynamic_target_kb - dynamic_used_kb, 0);
-            free_kb = Min(free_kb, gs_amm_free_granule_mb_locked(state) * 1024);
-            block_reason = gs_amm_new_ap_block_reason_locked(state, GetCurrentTimestamp());
-            if (block_reason[0] != '\0') {
-                free_kb = 0;
-                gs_amm_queue_finish_locked(state, live_queue_ticket, false, queue_wait_ms);
-                live_queue_ticket = 0;
-                state->new_ap_guard_block_count++;
-                state->last_grant_mb = 0;
-                state->last_prediction_mb = prediction_mb;
-                state->last_action = GS_AMM_BACKPRESSURE;
-                gs_amm_set_backpressure_reason_locked(state, block_reason);
-                backpressure = true;
-                queued = false;
-                result_reason = block_reason;
-            }
-            if (state->effective_grant_kb > 0)
-                free_kb = Min(free_kb, state->effective_grant_kb);
-            if (feedback_only && state->active_ap_count >= state->feedback_ap_slot_limit) {
-                free_kb = 0;
-                state->feedback_slot_block_count++;
-                gs_amm_set_backpressure_reason_locked(state, "feedback_slot_limit");
-                result_reason = "feedback_slot_limit";
-            }
-            if (!queued) {
-                grant_kb = 0;
-                memory_mode = GS_AMM_MEMORY_MODE_BACKPRESSURE;
-            } else {
-                grant_kb = gs_amm_select_bound_grant_kb(free_kb, cache_bound_kb, one_pass_bound_kb,
-                    multi_pass_bound_kb, admission_request_kb, allocator_only_min_kb,
-                    allocator_only_mode, feedback_only, &memory_mode);
-            }
-            grant_mb = (grant_kb + 1023) / 1024;
-            if (grant_kb > 0) {
-                grant_token = gs_amm_next_grant_token_locked(state);
-                grant_id = grant_token.grant_id;
-                if (gs_amm_reserve_ap_granules_locked(state, grant_token, grant_mb, &grant_granules) < grant_mb) {
-                    grant_kb = 0;
-                    grant_mb = 0;
-                    memory_mode = GS_AMM_MEMORY_MODE_BACKPRESSURE;
-                }
-            }
-            if (grant_kb > 0 && !gs_amm_activate_ap_granules_locked(state, grant_token)) {
-                grant_kb = 0;
-                grant_mb = 0;
-                grant_granules = 0;
-                memory_mode = GS_AMM_MEMORY_MODE_BACKPRESSURE;
-            }
-            if (grant_kb > 0) {
-                gs_amm_queue_finish_locked(state, live_queue_ticket, true, queue_wait_ms);
-                live_queue_ticket = 0;
-                state->dynamic_used_mb += grant_mb;
-                state->active_ap_count++;
-                if (feedback_only)
-                    state->feedback_admit_count++;
-                state->last_grant_mb = grant_mb;
-                state->last_prediction_mb = prediction_mb;
-                if (state->last_action == GS_AMM_OBSERVE || state->last_action == GS_AMM_BACKPRESSURE)
-                    state->last_action = GS_AMM_AP_EXPAND;
-                admitted = true;
-                queued = false;
-                result_reason = "queue_admitted";
-            }
-            }
-            SpinLockRelease(&state->mutex);
-        }
-    }
-    PG_CATCH();
-    {
-        if (live_queue_ticket > 0) {
-            SpinLockAcquire(&state->mutex);
-            gs_amm_queue_finish_locked(state, live_queue_ticket, false, live_queue_wait_ms);
-            SpinLockRelease(&state->mutex);
-        }
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    if (queued && queue_ticket > 0 && !admitted) {
-        SpinLockAcquire(&state->mutex);
-        gs_amm_queue_finish_locked(state, queue_ticket, false, queue_wait_ms);
-        state->last_grant_mb = 0;
-        state->last_prediction_mb = prediction_mb;
-        state->last_action = GS_AMM_BACKPRESSURE;
-        SpinLockRelease(&state->mutex);
-        grant_kb = 0;
-        grant_mb = 0;
-        memory_mode = GS_AMM_MEMORY_MODE_BACKPRESSURE;
-        backpressure = true;
-        queued = false;
-        result_reason = "queue_timeout";
-    }
-
-    if (admitted) {
-        MyGsAmmGrantId = grant_id;
-        MyGsAmmGrantGeneration = grant_token.grant_generation;
-        MyGsAmmGrantGranules = grant_granules;
+    if (directly_admitted) {
+        MyGsAmmGrantId = direct_token.grant_id;
+        MyGsAmmGrantGeneration = direct_token.grant_generation;
+        MyGsAmmGrantGranules = direct_grant_granules;
         MyGsAmmGrantNative = false;
         PG_TRY();
         {
-            gs_amm_apply_backend_grant_kb(grant_kb);
+            gs_amm_apply_backend_grant_kb(direct_granted_kb);
         }
         PG_CATCH();
         {
-            (void)GsAmmReleaseGrantToken(grant_token, true);
+            (void)GsAmmReleaseGrantToken(direct_token);
             PG_RE_THROW();
         }
         PG_END_TRY();
+        result->admitted = true;
+        result->queued = false;
+        result->backpressure = false;
+        result->grant_id = direct_token.grant_id;
+        result->grant_generation = direct_token.grant_generation;
+        result->granted_kb = direct_granted_kb;
+        result->granted_mb = (direct_granted_kb + 1023) / 1024;
+        result->grant_granules = direct_grant_granules;
+        result->memory_mode = direct_memory_mode;
+        gs_amm_copy_admission_reason(result->reason, "admitted");
+        return true;
     }
 
-    result->admitted = admitted;
-    result->queued = was_queued;
-    result->backpressure = backpressure;
-    result->grant_id = admitted ? grant_id : 0;
-    result->grant_generation = admitted ? grant_token.grant_generation : 0;
-    result->granted_kb = admitted ? grant_kb : 0;
-    result->granted_mb = admitted ? grant_mb : 0;
-    result->queue_wait_ms = queue_wait_ms;
-    result->queue_ticket = queue_ticket;
-    result->grant_granules = admitted ? grant_granules : 0;
-    result->memory_mode = memory_mode;
-    gs_amm_copy_admission_reason(result->reason, result_reason);
-    return true;
-}
-
-bool GsAmmAdmitBounds(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_bound_kb,
-    int queue_timeout_ms, int prediction_mb, GsAmmAdmissionResult *result)
-{
-    volatile bool admitted = false;
-
-    if (!gs_amm_enabled)
-        return false;
-
-    if (!GsAmmOperationBegin())
-        return false;
-
-    PG_TRY();
-    {
-        admitted = gs_amm_admit_bounds_internal(cache_bound_kb, one_pass_bound_kb,
-            multi_pass_bound_kb, queue_timeout_ms, prediction_mb, result);
-    }
-    PG_CATCH();
-    {
-        GsAmmOperationEnd();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    GsAmmOperationEnd();
-    return admitted;
-}
-
-bool GsAmmAdmitFeedbackOnly(GsAmmAdmissionResult *result)
-{
-    GsAmmSharedState *state;
-    GsAmmRuntimeConfig runtime_config;
-    int grant_kb;
-    volatile bool admitted = false;
-
-    if (!gs_amm_enabled || result == NULL)
-        return false;
-
-    state = gs_amm_get_state();
-    gs_amm_runtime_config_snapshot(state, &runtime_config);
-    if (!runtime_config.feedback_only)
-        return false;
+    /*
+     * The request cannot be served from dynamic/free inventory.  Try one
+     * cold-state buffer borrow before it becomes a waiter.  This preserves
+     * the supply order and avoids queueing a request merely because the
+     * controller has not reached its next one-second tick yet.
+     */
+    (void)gs_amm_prepare_dynamic_capacity(
+        Max((one_pass_bound_kb + 1023) / 1024, gs_amm_ap_min_grant_mb));
 
     SpinLockAcquire(&state->mutex);
-    grant_kb = Max(state->feedback_current_grant_mb, 1) * 1024;
+    directly_admitted = gs_amm_try_admit_ap_locked(state, cache_bound_kb, one_pass_bound_kb,
+        multi_pass_bound_kb, prediction_mb, &direct_token, &direct_granted_kb,
+        &direct_grant_granules);
+    direct_memory_mode = state->ap_multipass_only ?
+        GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS;
+    if (!directly_admitted && !gs_amm_enqueue_ap_request_locked(state, cache_bound_kb, one_pass_bound_kb,
+        multi_pass_bound_kb, prediction_mb, &ticket)) {
+        state->backpressure_count++;
+        gs_amm_set_backpressure_reason_locked(state, "queue_full");
+        gs_amm_copy_admission_reason(result->reason, "queue_full");
+        SpinLockRelease(&state->mutex);
+        return true;
+    }
     SpinLockRelease(&state->mutex);
 
-    if (!GsAmmOperationBegin())
-        return false;
+    if (directly_admitted) {
+        MyGsAmmGrantId = direct_token.grant_id;
+        MyGsAmmGrantGeneration = direct_token.grant_generation;
+        MyGsAmmGrantGranules = direct_grant_granules;
+        MyGsAmmGrantNative = false;
+        PG_TRY();
+        {
+            gs_amm_apply_backend_grant_kb(direct_granted_kb);
+        }
+        PG_CATCH();
+        {
+            (void)GsAmmReleaseGrantToken(direct_token);
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+        result->admitted = true;
+        result->queued = false;
+        result->backpressure = false;
+        result->grant_id = direct_token.grant_id;
+        result->grant_generation = direct_token.grant_generation;
+        result->granted_kb = direct_granted_kb;
+        result->granted_mb = (direct_granted_kb + 1023) / 1024;
+        result->grant_granules = direct_grant_granules;
+        result->memory_mode = direct_memory_mode;
+        gs_amm_copy_admission_reason(result->reason, "admitted");
+        return true;
+    }
+
+    SpinLockAcquire(&state->mutex);
+    GsAmmApQueueSlot *slot = gs_amm_find_queue_slot_locked(state, ticket);
+    if (slot == NULL) {
+        SpinLockRelease(&state->mutex);
+        gs_amm_copy_admission_reason(result->reason, "queue_cancelled");
+        return true;
+    }
+    queued_at = slot->queued_at;
+    MyGsAmmQueueTicket = ticket;
+    SpinLockRelease(&state->mutex);
+
     PG_TRY();
     {
-        admitted = gs_amm_admit_bounds_internal(grant_kb, grant_kb, grant_kb,
-            gs_amm_ap_queue_timeout_ms, 0, result);
+        for (;;) {
+            GsAmmApQueueSlot snapshot;
+            ResetLatch(&t_thrd.proc->procLatch);
+            SpinLockAcquire(&state->mutex);
+            slot = gs_amm_find_queue_slot_locked(state, ticket);
+            if (slot == NULL || !gs_amm_queue_slot_belongs_to_current_backend(slot)) {
+                SpinLockRelease(&state->mutex);
+                break;
+            }
+            if (slot->state == GS_AMM_AP_QUEUE_GRANTED) {
+                snapshot = *slot;
+                (void)memset_s(slot, sizeof(*slot), 0, sizeof(*slot));
+                gs_amm_refresh_ap_queue_totals_locked(state);
+                gs_amm_refresh_ap_target_totals_locked(state);
+                SpinLockRelease(&state->mutex);
+                granted_slot = snapshot;
+                claimed = true;
+                break;
+            }
+            SpinLockRelease(&state->mutex);
+            (void)WaitLatch(&t_thrd.proc->procLatch, WL_LATCH_SET | WL_POSTMASTER_DEATH, -1L);
+            CHECK_FOR_INTERRUPTS();
+        }
     }
     PG_CATCH();
     {
-        GsAmmOperationEnd();
+        gs_amm_cancel_waiting_request();
         PG_RE_THROW();
     }
     PG_END_TRY();
-    GsAmmOperationEnd();
-    return admitted;
+
+    MyGsAmmQueueTicket = 0;
+    if (!claimed) {
+        result->backpressure = true;
+        gs_amm_copy_admission_reason(result->reason, "queue_cancelled");
+        return true;
+    }
+    MyGsAmmGrantId = granted_slot.grant_token.grant_id;
+    MyGsAmmGrantGeneration = granted_slot.grant_token.grant_generation;
+    MyGsAmmGrantGranules = granted_slot.grant_granules;
+    MyGsAmmGrantNative = false;
+    PG_TRY();
+    {
+        gs_amm_apply_backend_grant_kb(granted_slot.granted_kb);
+    }
+    PG_CATCH();
+    {
+        (void)GsAmmReleaseGrantToken(granted_slot.grant_token);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+    TimestampDifference(queued_at, GetCurrentTimestamp(), &wait_secs, &wait_usecs);
+    wait_ms = wait_secs > INT_MAX / 1000 ? INT_MAX : (int)(wait_secs * 1000 + wait_usecs / 1000);
+    result->admitted = true;
+    result->queued = true;
+    result->backpressure = false;
+    result->grant_id = granted_slot.grant_token.grant_id;
+    result->grant_generation = granted_slot.grant_token.grant_generation;
+    result->granted_kb = granted_slot.granted_kb;
+    result->granted_mb = (granted_slot.granted_kb + 1023) / 1024;
+    result->queue_wait_ms = wait_ms;
+    result->queue_ticket = ticket;
+    result->grant_granules = granted_slot.grant_granules;
+    result->memory_mode = GS_AMM_MEMORY_MODE_ONEPASS;
+    gs_amm_copy_admission_reason(result->reason, "admitted");
+    return true;
 }
 
 Datum gs_amm_begin_ap_bounds(PG_FUNCTION_ARGS)
 {
-    gs_amm_require_admin_legacy_control();
     int cache_bound_kb = PG_GETARG_INT32(0);
     int one_pass_bound_kb = PG_GETARG_INT32(1);
     int multi_pass_bound_kb = PG_GETARG_INT32(2);
@@ -6806,17 +5086,14 @@ Datum gs_amm_begin_ap_bounds(PG_FUNCTION_ARGS)
     int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
         "admitted=%s queued=%s backpressure=%s memory_mode=%s granted_kb=%d granted_mb=%d "
         "prediction_mb=%d cache_bound_kb=%d one_pass_bound_kb=%d multi_pass_bound_kb=%d "
-        "admission_request_kb=%d allocator_only_mode=%s allocator_only_grant_mb=%d "
-        "queue_wait_ms=%d queue_ticket=%llu grant_id=%llu grant_generation=%llu grant_granules=%d "
-        "reason=%s backend_work_mem_kb=%d",
+        "admission_request_kb=%d queue_wait_ms=%d queue_ticket=%llu grant_id=%llu grant_generation=%llu grant_granules=%d "
+        "reason=%s",
         result.admitted ? "true" : "false", result.queued ? "true" : "false",
         result.backpressure ? "true" : "false", gs_amm_memory_mode_name(result.memory_mode),
         result.granted_kb, result.granted_mb, result.prediction_mb, result.cache_bound_kb,
         result.one_pass_bound_kb, result.multi_pass_bound_kb, result.admission_request_kb,
-        result.allocator_only_mode ? "true" : "false", result.allocator_only_grant_mb,
         result.queue_wait_ms, (unsigned long long)result.queue_ticket, (unsigned long long)result.grant_id,
-        (unsigned long long)result.grant_generation, result.grant_granules, result.reason,
-        u_sess->attr.attr_memory.work_mem);
+        (unsigned long long)result.grant_generation, result.grant_granules, result.reason);
     securec_check_ss(rc, "\0", "\0");
 
     PG_RETURN_TEXT_P(cstring_to_text(status));
@@ -6824,9 +5101,8 @@ Datum gs_amm_begin_ap_bounds(PG_FUNCTION_ARGS)
 
 Datum gs_amm_end_ap(PG_FUNCTION_ARGS)
 {
-    gs_amm_require_admin_legacy_control();
     GsAmmSharedState *state = gs_amm_get_state();
-    int released_mb = MyGsAmmGrantMb;
+    int released_mb = (int)((GsAmmCurrentBackendGrantPoolBytes() + 1024 * 1024 - 1) / (1024 * 1024));
     GsAmmGrantToken expected_token = {
         GsAmmCurrentBackendGrantId(), GsAmmCurrentBackendGrantGeneration()};
     bool released;
@@ -6834,7 +5110,7 @@ Datum gs_amm_end_ap(PG_FUNCTION_ARGS)
     int active_ap_count;
     char status[512];
 
-    released = GsAmmReleaseGrantToken(expected_token, true);
+    released = GsAmmReleaseGrantToken(expected_token);
 
     SpinLockAcquire(&state->mutex);
     dynamic_used_mb = state->dynamic_used_mb;
@@ -6842,10 +5118,9 @@ Datum gs_amm_end_ap(PG_FUNCTION_ARGS)
     SpinLockRelease(&state->mutex);
 
     int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "released=%s released_mb=%d grant_generation=%llu dynamic_used_mb=%d active_ap_count=%d "
-        "backend_work_mem_kb=%d", released ? "true" : "false", released_mb,
-        (unsigned long long)expected_token.grant_generation, dynamic_used_mb, active_ap_count,
-        u_sess->attr.attr_memory.work_mem);
+        "released=%s released_mb=%d grant_generation=%llu dynamic_used_mb=%d active_ap_count=%d",
+        released ? "true" : "false", released_mb,
+        (unsigned long long)expected_token.grant_generation, dynamic_used_mb, active_ap_count);
     securec_check_ss(rc, "\0", "\0");
 
     PG_RETURN_TEXT_P(cstring_to_text(status));

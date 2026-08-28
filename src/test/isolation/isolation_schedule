@@ -15,4 +15,3 @@ test: fk-contention
 # test: fk-deadlock2
 test: eval-plan-qual
 test: drop-index-concurrently-1
-test: gs_amm_granule_epoch

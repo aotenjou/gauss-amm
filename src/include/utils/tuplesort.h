@@ -157,6 +157,8 @@ extern IndexTuple tuplesort_getindextuple(Tuplesortstate* state, bool forward);
 extern bool tuplesort_getdatum(Tuplesortstate* state, bool forward, Datum* val, bool* isNull);
 
 extern void tuplesort_end(Tuplesortstate* state);
+extern bool tuplesort_process_amm_reclaim(void);
+extern void tuplesort_clear_amm_reclaim_states(void);
 
 extern void tuplesort_get_stats(Tuplesortstate* state, int* sortMethodId, int* spaceTypeId, long* spaceUsed);
 

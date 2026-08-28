@@ -30,7 +30,7 @@
 #include "typed_statistics_generator.h"
 
 #include "sys/times.h"
-#ifndef OPENEULER_MAJOR
+#if defined(__sun) || defined(__hpux)
 #include "sys/vtimes.h"
 #endif
 

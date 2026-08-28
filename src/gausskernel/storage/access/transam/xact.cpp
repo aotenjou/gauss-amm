@@ -2893,7 +2893,6 @@ static void CommitTransaction(bool STP_commit)
      * Here is where we really truly local commit.
      */
     latestXid = RecordTransactionCommit();
-    GsAmmRecordTransactionCommit();
 
     if (TwoPhaseCommit)
         StmtRetrySetTransactionCommitFlag(true);
@@ -3910,7 +3909,6 @@ static void AbortTransaction(bool PerfectRollback, bool STP_rollback)
      * far as assigning an XID to advertise).
      */
     latestXid = RecordTransactionAbort(false);
-    GsAmmRecordTransactionAbort();
 
     t_thrd.pgxact->prepare_xid = InvalidTransactionId;
 

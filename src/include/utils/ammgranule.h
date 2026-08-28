@@ -25,6 +25,7 @@ extern bool AmmGranuleContextStats(MemoryContext context, AmmGranuleContextStats
 extern bool AmmGranuleContextCanAllocate(MemoryContext context, Size size);
 extern void *AmmGranuleContextTryAlloc(MemoryContext context, Size size);
 extern Size AmmGranuleContextReleaseFreeMemory(MemoryContext context);
+extern Size AmmGranuleContextReleaseFreeMemoryTree(MemoryContext context);
 #ifdef MEMORY_CONTEXT_CHECKING
 extern void AmmGranuleContextCheckPointer(MemoryContext context, void *pointer);
 #endif

@@ -6,6 +6,16 @@
 #define MEMTUNE_FNV_OFFSET 1469598103934665603ULL
 #define MEMTUNE_FNV_PRIME 1099511628211ULL
 
+/*
+ * Calibrated from the AP holdout in gauss-amm-ab-test-report.md:
+ * 449387 rows x 532 bytes, quicksort peak 475082 kB (463.947 MB).
+ * The generated tree substantially under-predicts this wide, blocking sort,
+ * so keep its cache bound above the measured resident-sort boundary.
+ */
+#define MEMTUNE_AP_SORT_MIN_ROWS 400000.0
+#define MEMTUNE_AP_SORT_MIN_WIDTH 512.0
+#define MEMTUNE_AP_SORT_CACHE_BOUND_MB 463.947265625
+
 static unsigned long long
 hash_u64(unsigned long long hash, unsigned long long value)
 {
@@ -972,10 +982,19 @@ MemTuneWorkMemBounds
 memtune_predict_workmem_bounds(const double features[MEMTUNE_WORKMEM_FEATURE_COUNT])
 {
     MemTuneWorkMemBounds result;
+    double estimated_rows;
 
     result.cache_mb = predict_cache_mb(features);
     result.one_pass_mb = predict_one_pass_mb(features);
     result.multi_pass_mb = predict_multi_pass_mb(features);
+
+    estimated_rows = pow(10.0, features[MEMTUNE_FEATURE_MAX_PLAN_ROWS_LOG10]) - 1.0;
+    if (features[MEMTUNE_FEATURE_SORT_NODES] > 0.0 &&
+        estimated_rows >= MEMTUNE_AP_SORT_MIN_ROWS &&
+        features[MEMTUNE_FEATURE_MAX_PLAN_WIDTH] >= MEMTUNE_AP_SORT_MIN_WIDTH &&
+        result.cache_mb < MEMTUNE_AP_SORT_CACHE_BOUND_MB) {
+        result.cache_mb = MEMTUNE_AP_SORT_CACHE_BOUND_MB;
+    }
 
     if (result.multi_pass_mb < 0.0625)
         result.multi_pass_mb = 0.0625;

@@ -1793,19 +1793,9 @@ extern Datum gs_walwriter_flush_stat(PG_FUNCTION_ARGS);
 
 /* AMM experiment controller */
 extern Datum gs_amm_status(PG_FUNCTION_ARGS);
-extern Datum gs_amm_resize_shared_buffers(PG_FUNCTION_ARGS);
-extern Datum gs_amm_controller_step(PG_FUNCTION_ARGS);
 extern Datum gs_amm_begin_ap(PG_FUNCTION_ARGS);
 extern Datum gs_amm_begin_ap_bounds(PG_FUNCTION_ARGS);
 extern Datum gs_amm_end_ap(PG_FUNCTION_ARGS);
-extern Datum gs_amm_reset_state(PG_FUNCTION_ARGS);
-extern Datum gs_amm_set_dynamic_target_mb(PG_FUNCTION_ARGS);
-extern Datum gs_amm_update_tp_metrics(PG_FUNCTION_ARGS);
-extern Datum gs_amm_update_io_metrics(PG_FUNCTION_ARGS);
-extern Datum gs_amm_record_dtree_feedback(PG_FUNCTION_ARGS);
-extern Datum gs_amm_set_allocator_only_mode(PG_FUNCTION_ARGS);
-extern Datum gs_amm_set_dtree_calibration_mode(PG_FUNCTION_ARGS);
-extern Datum gs_amm_reset_dtree_calibration(PG_FUNCTION_ARGS);
 extern Datum gs_workmem_dtree_predict(PG_FUNCTION_ARGS);
 extern Datum gs_workmem_dtree_predict_detail(PG_FUNCTION_ARGS);
 

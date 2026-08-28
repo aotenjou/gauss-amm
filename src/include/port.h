@@ -356,7 +356,7 @@ extern long random(void);
 #endif
 
 #ifndef HAVE_UNSETENV
-extern void unsetenv(const char* name);
+extern int unsetenv(const char* name);
 #endif
 
 #ifndef HAVE_SRANDOM

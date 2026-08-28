@@ -9,6 +9,6 @@ ifneq "$(MAKECMDGOALS)" "clean"
     endif
   endif
 endif
-OBJS = buf_table.o buf_init.o bufmgr.o freelist.o gs_amm.o gs_amm_io.o gs_amm_query.o localbuf.o
+OBJS = buf_table.o buf_init.o bufmgr.o freelist.o gs_amm.o gs_amm_query.o localbuf.o
 
 include $(top_srcdir)/src/gausskernel/common.mk

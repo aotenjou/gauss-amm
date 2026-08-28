@@ -292,6 +292,12 @@ void procsignal_sigusr1_handler(SIGNAL_ARGS)
 #endif
 #endif
 
+    if (CheckProcSignal(PROCSIG_AMM_AP_STOP)) {
+        t_thrd.int_cxt.QueryCancelPending = true;
+        InterruptPending = true;
+        SetLatch(&t_thrd.proc->procLatch);
+    }
+
     if (CheckProcSignal(PROCSIG_DEFAULTXACT_READONLY))
         WLMCheckDefaultXactReadOnly();
     if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_DATABASE))
@@ -320,4 +326,3 @@ void procsignal_sigusr1_handler(SIGNAL_ARGS)
 
     errno = save_errno;
 }
-

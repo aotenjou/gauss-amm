@@ -157,3 +157,4 @@ test: xc_limit
 test: xc_sort
 test: xc_returning
 test: xc_params
+test: gs_amm_guc_surface

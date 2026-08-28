@@ -56,8 +56,6 @@ static void detail_from_prediction(const MemTuneWorkMemPrediction *prediction, G
     };
 
     gs_amm_dtree_detail(raw_bounds_mb, prediction->model_version, prediction->leaf_id, detail);
-    for (int index = 0; index < GS_AMM_DTREE_BOUND_COUNT; ++index)
-        detail->raw_bounds_kb[index] = raw_bounds_mb[index] * 1024.0;
 }
 
 bool GsWorkmemDtreePredictDetail(
@@ -76,23 +74,18 @@ bool GsWorkmemDtreePredictDetail(
 static HeapTuple form_detail_tuple(FunctionCallInfo fcinfo, const GsAmmDtreeDetail *detail)
 {
     TupleDesc tupdesc;
-    Datum values[10];
-    bool nulls[10] = {false};
+    Datum values[5];
+    bool nulls[5] = {false};
 
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("detail function requires composite result")));
     tupdesc = BlessTupleDesc(tupdesc);
 
-    values[0] = Float8GetDatum(detail->raw_bounds_kb[0]);
-    values[1] = Float8GetDatum(detail->raw_bounds_kb[1]);
-    values[2] = Float8GetDatum(detail->raw_bounds_kb[2]);
-    values[3] = Float8GetDatum(detail->calibrated_bounds_kb[0]);
-    values[4] = Float8GetDatum(detail->calibrated_bounds_kb[1]);
-    values[5] = Float8GetDatum(detail->calibrated_bounds_kb[2]);
-    values[6] = Int64GetDatum(detail->model_version);
-    values[7] = Int64GetDatum(detail->leaf_id);
-    values[8] = Int64GetDatum(detail->calibration_version);
-    values[9] = Float8GetDatum(detail->calibration_scale);
+    values[0] = Float8GetDatum(detail->bounds_kb[0]);
+    values[1] = Float8GetDatum(detail->bounds_kb[1]);
+    values[2] = Float8GetDatum(detail->bounds_kb[2]);
+    values[3] = Int64GetDatum(detail->model_version);
+    values[4] = Int64GetDatum(detail->leaf_id);
 
     return heap_form_tuple(tupdesc, values, nulls);
 }
@@ -108,9 +101,9 @@ Datum gs_workmem_dtree_predict(PG_FUNCTION_ARGS)
     if (!GsWorkmemDtreePredictDetail(features, &detail))
         ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("work_mem decision-tree prediction failed")));
 
-    result_values[0] = Float8GetDatum(detail.raw_bounds_kb[0] / 1024.0);
-    result_values[1] = Float8GetDatum(detail.raw_bounds_kb[1] / 1024.0);
-    result_values[2] = Float8GetDatum(detail.raw_bounds_kb[2] / 1024.0);
+    result_values[0] = Float8GetDatum(detail.bounds_kb[0] / 1024.0);
+    result_values[1] = Float8GetDatum(detail.bounds_kb[1] / 1024.0);
+    result_values[2] = Float8GetDatum(detail.bounds_kb[2] / 1024.0);
 
     PG_RETURN_POINTER(construct_array(result_values, GS_AMM_DTREE_BOUND_COUNT, FLOAT8OID, sizeof(float8),
         FLOAT8PASSBYVAL, 'd'));

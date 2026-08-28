@@ -237,7 +237,10 @@ void standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
     Assert(queryDesc != NULL);
     Assert(queryDesc->estate == NULL);
 
-    (void)GsAmmExecutorStart(queryDesc, eflags);
+    if (gs_amm_workload_role == GS_AMM_WORKLOAD_AP)
+        (void)GsAmmApExecutorStart(queryDesc, eflags);
+    else
+        (void)GsAmmTpExecutorStart(queryDesc, eflags);
 
 #ifdef MEMORY_CONTEXT_CHECKING
     /* Check all memory contexts when executor starts */
@@ -810,6 +813,7 @@ void standard_ExecutorEnd(QueryDesc *queryDesc)
      */
     old_context = MemoryContextSwitchTo(estate->es_query_cxt);
     EARLY_FREE_LOG(elog(LOG, "Early Free: Start to end plan, memory used %d MB.", getSessionMemoryUsageMB()));
+
     ExecEndPlan(queryDesc->planstate, estate);
 
     /* do away with our snapshots */
@@ -833,12 +837,21 @@ void standard_ExecutorEnd(QueryDesc *queryDesc)
     MemoryContextCheck(estate->es_query_cxt, (estate->es_query_cxt->session_id > 0));
 #endif
 
+    /* BufferUsage is backend-local instrumentation and must be sampled while
+     * the executor invocation is still intact.  AP teardown is deliberately
+     * deferred until after the query context is gone so its granule walk sees
+     * only operator-owned memory that can be returned.
+     */
+    if (gs_amm_workload_role != GS_AMM_WORKLOAD_AP)
+        GsAmmTpExecutorEnd(queryDesc, true);
+
     /*
      * Release EState and per-query memory context.  This should release
      * everything the executor has allocated.
      */
     FreeExecutorState(estate);
-    GsAmmExecutorEnd(queryDesc, true);
+    if (gs_amm_workload_role == GS_AMM_WORKLOAD_AP)
+        GsAmmApExecutorEnd(queryDesc, true);
 
     /* Reset queryDesc fields that no longer point to anything */
     queryDesc->tupDesc = NULL;

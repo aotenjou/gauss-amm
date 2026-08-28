@@ -63,7 +63,6 @@ typedef struct knl_session_attr_storage {
     bool fullPageWrites;
     bool Log_connections;
     bool autovacuum_start_daemon;
-    bool gs_amm_legacy_control_enabled;
 #ifdef LOCK_DEBUG
     bool Trace_locks;
     bool Trace_userlocks;

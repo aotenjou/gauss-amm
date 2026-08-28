@@ -19,10 +19,27 @@ typedef struct AmmGranuleChunkData {
     Size total_size;
     Size payload_size;
     bool is_free;
+    bool dynamic_memory;
 } AmmGranuleChunkData;
 
 typedef AmmGranuleChunkData* AmmGranuleChunk;
 typedef AmmGranuleChunkData AmmGranuleBlock;
+
+static uint64 AmmGranuleContextCurrentCapacity(AmmGranuleContextPtr context)
+{
+    uint64 capacity;
+
+    if (context == NULL)
+        return 0;
+    capacity = GsAmmCurrentBackendGrantPoolBytes();
+    if (capacity == 0)
+        capacity = GsAmmGrantEffectiveMemoryLimit(context->grant_token.grant_id, context->maxBytes);
+    if (capacity == 0)
+        capacity = context->maxBytes;
+    context->maxBytes = capacity;
+    context->set.maxSpaceSize = capacity;
+    return capacity;
+}
 
 #define AMMGRANULE_CHUNKHDRSZ MAXALIGN(sizeof(AmmGranuleChunkData))
 #define AmmGranulePointerGetStandardHeader(pointer) \
@@ -139,6 +156,7 @@ static AmmGranuleChunk AmmGranuleSplitFreeChunk(
     tail->total_size = chunk->total_size - allocated_total_size;
     tail->payload_size = tail->total_size - AMMGRANULE_CHUNKHDRSZ - STANDARDCHUNKHEADERSIZE;
     tail->is_free = false;
+    tail->dynamic_memory = chunk->dynamic_memory;
     chunk->next = tail;
     chunk->total_size = allocated_total_size;
     chunk->payload_size = payload_size;
@@ -247,7 +265,10 @@ Size AmmGranuleContextReleaseFreeMemory(MemoryContext memory_context)
         if (next != NULL)
             next->prev = previous;
 
-        if (!GsAmmGrantReturnMemory(context->grant_token, chunk, chunk_bytes)) {
+        bool returned = chunk->dynamic_memory ?
+            GsAmmGrantReturnDynamicMemory(context->grant_token, chunk, chunk_bytes) :
+            GsAmmGrantReturnMemory(context->grant_token, chunk, chunk_bytes);
+        if (!returned) {
             chunk->prev = previous;
             chunk->next = next;
             if (previous == NULL)
@@ -285,6 +306,28 @@ Size AmmGranuleContextReleaseFreeMemory(MemoryContext memory_context)
     return released_bytes;
 }
 
+/*
+ * Release free chunks in an AP query's context tree.  Sort and hash keep
+ * their AMM contexts below the query context, so a backend reclaim poll can
+ * walk the tree without knowing the operator-specific state layout.
+ */
+Size AmmGranuleContextReleaseFreeMemoryTree(MemoryContext memory_context)
+{
+    MemoryContext child;
+    Size released_bytes = 0;
+
+    if (memory_context == NULL)
+        return 0;
+
+    for (child = memory_context->firstchild; child != NULL; child = child->nextchild)
+        released_bytes += AmmGranuleContextReleaseFreeMemoryTree(child);
+
+    if (IsA(memory_context, AmmGranuleContext))
+        released_bytes += AmmGranuleContextReleaseFreeMemory(memory_context);
+
+    return released_bytes;
+}
+
 bool AmmGranuleContextCanAllocate(MemoryContext memory_context, Size size)
 {
     AmmGranuleContextPtr context = (AmmGranuleContextPtr)memory_context;
@@ -299,7 +342,7 @@ bool AmmGranuleContextCanAllocate(MemoryContext memory_context, Size size)
 
     payload_size = Max(MAXALIGN(size), (Size)MAXALIGN(sizeof(void*)));
     total_size = AmmGranuleChunkTotalSize(payload_size);
-    effective_max_bytes = context->maxBytes;
+    effective_max_bytes = AmmGranuleContextCurrentCapacity(context);
     if (context->liveBytes + total_size > effective_max_bytes)
         return false;
     if (AmmGranuleHasFreeChunk(context, payload_size))
@@ -359,7 +402,7 @@ static void* AmmGranuleAlloc(MemoryContext memory_context, Size align, Size size
 
     payload_size = Max(MAXALIGN(size), (Size)MAXALIGN(sizeof(void*)));
     total_size = AmmGranuleChunkTotalSize(payload_size);
-    effective_max_bytes = context->maxBytes;
+    effective_max_bytes = AmmGranuleContextCurrentCapacity(context);
     if (context->liveBytes + total_size > effective_max_bytes)
         return NULL;
 
@@ -376,7 +419,10 @@ static void* AmmGranuleAlloc(MemoryContext memory_context, Size align, Size size
         header->file = file;
         header->line = line;
 #endif
-        GsAmmGrantAccountUsedMemory(context->grant_token, chunk, chunk->total_size);
+        if (chunk->dynamic_memory)
+            GsAmmGrantAccountUsedDynamicMemory(context->grant_token, chunk->total_size);
+        else
+            GsAmmGrantAccountUsedMemory(context->grant_token, chunk, chunk->total_size);
         context->liveBytes += chunk->total_size;
         context->set.freeSpace -= chunk->total_size;
         memory_context->isReset = false;
@@ -386,7 +432,18 @@ static void* AmmGranuleAlloc(MemoryContext memory_context, Size align, Size size
     if (context->allocatedBytes + total_size > effective_max_bytes)
         return NULL;
 
-    chunk = (AmmGranuleChunk)GsAmmGrantAllocMemory(context->grant_token, total_size);
+    chunk = NULL;
+    if (GsAmmGrantDynamicMemoryAvailable(context->grant_token, total_size)) {
+        chunk = (AmmGranuleChunk)GsAmmGrantAllocDynamicMemory(context->grant_token, total_size);
+        if (chunk == NULL)
+            return NULL;
+        chunk->dynamic_memory = true;
+    } else {
+        chunk = (AmmGranuleChunk)GsAmmGrantAllocMemory(context->grant_token, total_size);
+        if (chunk == NULL)
+            return NULL;
+        chunk->dynamic_memory = false;
+    }
     if (chunk == NULL)
         return NULL;
 
@@ -431,7 +488,10 @@ static void AmmGranuleFree(MemoryContext memory_context, void* pointer)
     else
         context->liveBytes = 0;
     context->set.freeSpace += chunk->total_size;
-    GsAmmGrantAccountFreedMemory(context->grant_token, chunk, chunk->total_size);
+    if (chunk->dynamic_memory)
+        GsAmmGrantAccountFreedDynamicMemory(context->grant_token, chunk->total_size);
+    else
+        GsAmmGrantAccountFreedMemory(context->grant_token, chunk, chunk->total_size);
     AmmGranulePushFreeChunk(context, chunk);
     memory_context->isReset = context->liveBytes == 0;
 }
@@ -496,9 +556,16 @@ static void AmmGranuleReset(MemoryContext memory_context)
 
     for (chunk = (AmmGranuleChunk)context->chunks; chunk != NULL;) {
         AmmGranuleChunk next = chunk->next;
-        if (!chunk->is_free)
-            GsAmmGrantAccountFreedMemory(context->grant_token, chunk, chunk->total_size);
-        (void)GsAmmGrantReturnMemory(context->grant_token, chunk, chunk->total_size);
+        if (!chunk->is_free) {
+            if (chunk->dynamic_memory)
+                GsAmmGrantAccountFreedDynamicMemory(context->grant_token, chunk->total_size);
+            else
+                GsAmmGrantAccountFreedMemory(context->grant_token, chunk, chunk->total_size);
+        }
+        if (chunk->dynamic_memory)
+            (void)GsAmmGrantReturnDynamicMemory(context->grant_token, chunk, chunk->total_size);
+        else
+            (void)GsAmmGrantReturnMemory(context->grant_token, chunk, chunk->total_size);
         chunk = next;
     }
     context->chunks = NULL;
@@ -528,9 +595,16 @@ static void AmmGranuleDelete(MemoryContext memory_context)
 
     for (AmmGranuleChunk chunk = (AmmGranuleChunk)context->chunks; chunk != NULL;) {
         AmmGranuleChunk next = chunk->next;
-        if (!chunk->is_free)
-            GsAmmGrantAccountFreedMemory(context->grant_token, chunk, chunk->total_size);
-        (void)GsAmmGrantReturnMemory(context->grant_token, chunk, chunk->total_size);
+        if (!chunk->is_free) {
+            if (chunk->dynamic_memory)
+                GsAmmGrantAccountFreedDynamicMemory(context->grant_token, chunk->total_size);
+            else
+                GsAmmGrantAccountFreedMemory(context->grant_token, chunk, chunk->total_size);
+        }
+        if (chunk->dynamic_memory)
+            (void)GsAmmGrantReturnDynamicMemory(context->grant_token, chunk, chunk->total_size);
+        else
+            (void)GsAmmGrantReturnMemory(context->grant_token, chunk, chunk->total_size);
         chunk = next;
     }
     context->allocatedBytes = 0;
