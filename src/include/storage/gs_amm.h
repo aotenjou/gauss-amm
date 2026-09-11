@@ -14,6 +14,8 @@
 
 struct QueryDesc;
 typedef struct MemTuneWorkMemFeatures MemTuneWorkMemFeatures;
+typedef struct MemTuneWorkMemFeaturesV3 MemTuneWorkMemFeaturesV3;
+typedef struct MemTuneWorkMemFeaturesV5 MemTuneWorkMemFeaturesV5;
 
 typedef enum GsAmmGranuleState {
     GS_AMM_GRANULE_BUFFER_ACTIVE = 0,
@@ -61,8 +63,11 @@ typedef struct GsAmmGranuleMeta {
 
 typedef struct GsAmmDtreeDetail {
     double bounds_kb[GS_AMM_DTREE_BOUND_COUNT];
+    /* Initial controller demand; native bounds retain executor semantics. */
+    int admission_target_kb;
     int64 model_version;
     int64 leaf_id;
+    bool test_label_override;
 } GsAmmDtreeDetail;
 
 typedef enum GsAmmMemoryMode {
@@ -108,6 +113,8 @@ extern THR_LOCAL int gs_amm_test_ap_one_pass_label_kb;
 extern THR_LOCAL int gs_amm_test_ap_multi_pass_label_kb;
 /* Compatibility alias; a positive value applies to all three test bounds. */
 extern THR_LOCAL int gs_amm_test_ap_label_kb;
+/* Test-only guard around the label GUCs above.  Production uses the model. */
+extern THR_LOCAL bool gs_amm_test_ap_use_labels;
 extern int gs_amm_tp_buffer_miss_threshold_pct;
 extern int gs_amm_ap_borrow_buffer_hit_guard_pct;
 extern int gs_amm_tp_tps_decline_guard_pct;
@@ -140,6 +147,9 @@ extern void GsAmmControllerTick(void);
 /* queue_timeout_ms is retained for the legacy SQL function ABI and ignored. */
 extern bool GsAmmAdmitBounds(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_bound_kb,
     int queue_timeout_ms, int prediction_mb, GsAmmAdmissionResult *result);
+extern bool GsAmmAdmitBoundsWithTarget(int cache_bound_kb, int one_pass_bound_kb,
+    int multi_pass_bound_kb, int admission_target_kb, int queue_timeout_ms, int prediction_mb,
+    GsAmmAdmissionResult *result);
 extern bool GsAmmEvaluateAdmission(int prediction_mb);
 extern bool GsAmmReleaseGrant(uint64 expected_generation);
 extern bool GsAmmReleaseGrantToken(GsAmmGrantToken expected_token);
@@ -148,7 +158,7 @@ extern uint64 GsAmmCurrentQueryLifecycleGeneration(void);
 extern void GsAmmRecordNativeEligible(void);
 extern void GsAmmRecordNativeFailure(const char *reason);
 extern void GsAmmRecordNativeAdmission(const GsAmmDtreeDetail *detail, const GsAmmAdmissionResult *result);
-extern bool GsAmmBuildWorkMemFeatures(QueryDesc *query_desc, MemTuneWorkMemFeatures *features);
+extern bool GsAmmBuildWorkMemFeaturesV5(QueryDesc *query_desc, MemTuneWorkMemFeaturesV5 *features);
 extern int GsAmmCurrentBackendGrantKB(void);
 extern uint64 GsAmmCurrentBackendGrantId(void);
 extern uint64 GsAmmCurrentBackendGrantBytes(void);

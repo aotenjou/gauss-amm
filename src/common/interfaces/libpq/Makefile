@@ -21,7 +21,7 @@ SO_MAJOR_VERSION= 5
 SO_MINOR_VERSION= 5
 
 DOXYGEN="$(top_builddir)/../$(BUILD_TOOLS_PATH)/doxygen/bin/doxygen"
-override CPPFLAGS :=  -DFRONTEND -DFRONTEND_PARSER -DUNSAFE_STAT_OK -I$(srcdir) $(CPPFLAGS) -I$(top_builddir)/src/common/port -I$(top_srcdir)/src/common/port
+override CPPFLAGS :=  -DFRONTEND -DFRONTEND_PARSER -DUNSAFE_STAT_OK -I$(srcdir) -I$(KERBEROS_INCLUDE_PATH) $(CPPFLAGS) -I$(top_builddir)/src/common/port -I$(top_srcdir)/src/common/port
 override CPPFLAGS += -DPGXC -I$(srcdir) -I$(top_builddir)/src/ -I$(top_builddir)/src/include -I$(top_builddir)/src/include/libpq/
 override CPPFLAGS += -I$(top_builddir)/$(subdir)/client_logic_hooks
 override CPPFLAGS += -I$(top_builddir)/$(subdir)/client_logic_hooks/cmk_entity_manager_hooks

@@ -19,6 +19,6 @@ ifneq "$(MAKECMDGOALS)" "clean"
     endif
   endif
 endif
-OBJS = aset.o mcxt.o portalmem.o memprot.o asetstk.o asetalg.o memtrack.o AsanMemoryAllocator.o ammgranule.o workmem_dtree.o workmem_dtree_model.o memgroup.o memtrace.o mem_snapshot.o
+OBJS = aset.o mcxt.o portalmem.o memprot.o asetstk.o asetalg.o memtrack.o AsanMemoryAllocator.o ammgranule.o workmem_dtree.o workmem_dtree_model.o workmem_xgb_v5_model.o memgroup.o memtrace.o mem_snapshot.o
 
 include $(top_srcdir)/src/gausskernel/common.mk

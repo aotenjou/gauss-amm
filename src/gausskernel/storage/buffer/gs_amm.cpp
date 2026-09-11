@@ -41,6 +41,7 @@ THR_LOCAL int gs_amm_test_ap_cache_label_kb = 0;
 THR_LOCAL int gs_amm_test_ap_one_pass_label_kb = 0;
 THR_LOCAL int gs_amm_test_ap_multi_pass_label_kb = 0;
 THR_LOCAL int gs_amm_test_ap_label_kb = 0;
+THR_LOCAL bool gs_amm_test_ap_use_labels = false;
 int gs_amm_tp_buffer_miss_threshold_pct = 5;
 int gs_amm_ap_borrow_buffer_hit_guard_pct = 3;
 int gs_amm_tp_tps_decline_guard_pct = 3;
@@ -51,7 +52,7 @@ THR_LOCAL bool gs_amm_tp_test_mode = false;
 THR_LOCAL bool gs_amm_tp_test_worker_surge = false;
 #define GS_AMM_TP_TPS_SURGE_GUARD_PCT 50
 
-#define gs_amm_ap_min_grant_mb 1
+#define gs_amm_ap_min_grant_mb 4
 
 typedef enum GsAmmAction {
     GS_AMM_OBSERVE = 0,
@@ -107,6 +108,7 @@ typedef struct GsAmmApRecord {
     int cache_bound_kb;
     int one_pass_bound_kb;
     int multi_pass_bound_kb;
+    int admission_target_kb;
     int granted_kb;
     int effective_grant_kb;
     uint64 dynamic_granted_bytes;
@@ -136,6 +138,7 @@ typedef struct GsAmmApQueueSlot {
     int cache_bound_kb;
     int one_pass_bound_kb;
     int multi_pass_bound_kb;
+    int admission_target_kb;
     int prediction_mb;
     int pgprocno;
     ThreadId waiter_pid;
@@ -255,6 +258,7 @@ typedef struct GsAmmSharedState {
     int backpressure_count;
     int last_prediction_mb;
     int last_grant_mb;
+    int last_admission_target_mb;
     char last_backpressure_reason[32];
     GsAmmAction last_action;
     int granule_mb;
@@ -302,6 +306,7 @@ typedef struct GsAmmSharedState {
     GsAmmMemoryMode native_current_memory_mode;
     int64 native_current_model_version;
     int64 native_current_leaf_id;
+    bool native_current_label_override;
     char native_last_reason[GS_AMM_ADMISSION_REASON_LENGTH];
     uint64 next_drain_attempt;
     uint64 next_reclaim_attempt;
@@ -422,7 +427,8 @@ static void gs_amm_refresh_ap_target_totals_locked(GsAmmSharedState *state)
 }
 
 static bool gs_amm_register_ap_locked(GsAmmSharedState *state, GsAmmGrantToken token,
-    int cache_bound_kb, int one_pass_bound_kb, int multi_pass_bound_kb, int granted_kb,
+    int cache_bound_kb, int one_pass_bound_kb, int multi_pass_bound_kb, int admission_target_kb,
+    int granted_kb,
     uint64 dynamic_granted_bytes, GsAmmMemoryMode mode, GsAmmMemoryMode target_mode,
     ThreadId backend_pid, BackendId backend_id)
 {
@@ -447,6 +453,7 @@ static bool gs_amm_register_ap_locked(GsAmmSharedState *state, GsAmmGrantToken t
     record->cache_bound_kb = cache_bound_kb;
     record->one_pass_bound_kb = one_pass_bound_kb;
     record->multi_pass_bound_kb = multi_pass_bound_kb;
+    record->admission_target_kb = admission_target_kb;
     record->granted_kb = granted_kb;
     record->effective_grant_kb = granted_kb;
     record->dynamic_granted_bytes = dynamic_granted_bytes;
@@ -583,7 +590,7 @@ static bool gs_amm_prepare_dynamic_capacity(int ap_demand_mb);
 static void gs_amm_supply_ap_demand(void);
 static void gs_amm_process_ap_queue(void);
 static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_kb,
-    int one_pass_bound_kb, int multi_pass_bound_kb, int prediction_mb,
+    int one_pass_bound_kb, int multi_pass_bound_kb, int admission_target_kb, int prediction_mb,
     GsAmmGrantToken *grant_token, int *granted_kb, int *grant_granules);
 static void gs_amm_request_ap_stop_locked(GsAmmSharedState *state);
 static void gs_amm_restore_shared_buffer_after_ap_stop(GsAmmSharedState *state);
@@ -922,9 +929,11 @@ void gs_amm_dtree_detail(
 
     detail->model_version = model_version;
     detail->leaf_id = leaf_id;
+    detail->test_label_override = false;
     for (int i = 0; i < GS_AMM_DTREE_BOUND_COUNT; i++) {
         detail->bounds_kb[i] = raw_bounds_kb[i];
     }
+    detail->admission_target_kb = (int)Min(Max(raw_bounds_kb[0], 1.0), (double)INT_MAX);
 }
 
 bool GsAmmBufferIdIsInBufferGranule(int buf_id)
@@ -1039,6 +1048,7 @@ void GsAmmRecordNativeFailure(const char *reason)
     state->native_current_grant_generation = 0;
     state->native_current_granted_kb = 0;
     state->native_current_memory_mode = GS_AMM_MEMORY_MODE_BACKPRESSURE;
+    state->native_current_label_override = false;
     state->last_action = GS_AMM_FAIL_CLOSED;
     gs_amm_copy_admission_reason(state->native_last_reason, reason);
     SpinLockRelease(&state->mutex);
@@ -1072,6 +1082,7 @@ void GsAmmRecordNativeAdmission(const GsAmmDtreeDetail *detail, const GsAmmAdmis
     state->native_current_memory_mode = result->memory_mode;
     state->native_current_model_version = detail->model_version;
     state->native_current_leaf_id = detail->leaf_id;
+    state->native_current_label_override = detail->test_label_override;
     gs_amm_copy_admission_reason(state->native_last_reason, result->reason);
     SpinLockRelease(&state->mutex);
 }
@@ -1218,14 +1229,21 @@ static void gs_amm_set_backpressure_reason_locked(GsAmmSharedState *state, const
     securec_check_ss(rc, "\0", "\0");
 }
 
-static int gs_amm_queue_demand_mb(const GsAmmApQueueSlot *slot)
+static int gs_amm_queue_demand_mb(const GsAmmApQueueSlot *slot, const GsAmmSharedState *state)
 {
-    uint64 one_pass_kb;
+    uint64 demand_kb;
 
     if (slot == NULL)
         return 0;
-    one_pass_kb = (uint64)Max(slot->one_pass_bound_kb, 1);
-    return (int)Min(Max((one_pass_kb + 1023) / 1024, (uint64)gs_amm_ap_min_grant_mb),
+    /* Normal admission reserves the cache target.  Stage transitions and
+     * reclaim requests reduce already-admitted APs to one-pass separately;
+     * the TP recovery multipass-only phase remains an explicit emergency
+     * exception for APs re-entering after shared-buffer restoration. */
+    if (state != NULL && state->ap_multipass_only)
+        demand_kb = (uint64)Max(slot->multi_pass_bound_kb, 1);
+    else
+        demand_kb = (uint64)Max(slot->admission_target_kb, 1);
+    return (int)Min(Max((demand_kb + 1023) / 1024, (uint64)gs_amm_ap_min_grant_mb),
         (uint64)INT_MAX);
 }
 
@@ -1242,7 +1260,7 @@ static void gs_amm_refresh_ap_queue_totals_locked(GsAmmSharedState *state)
 
         if (slot->state != GS_AMM_AP_QUEUE_WAITING)
             continue;
-        demand_mb = gs_amm_queue_demand_mb(slot);
+        demand_mb = gs_amm_queue_demand_mb(slot, state);
         if (queue_count < INT_MAX)
             queue_count++;
         queue_demand_mb = queue_demand_mb <= INT_MAX - demand_mb ?
@@ -1303,7 +1321,8 @@ static bool gs_amm_queue_slot_belongs_to_current_backend(const GsAmmApQueueSlot 
 }
 
 static bool gs_amm_enqueue_ap_request_locked(GsAmmSharedState *state, int cache_bound_kb,
-    int one_pass_bound_kb, int multi_pass_bound_kb, int prediction_mb, uint64 *ticket)
+    int one_pass_bound_kb, int multi_pass_bound_kb, int admission_target_kb,
+    int prediction_mb, uint64 *ticket)
 {
     GsAmmApQueueSlot *slot = NULL;
     errno_t rc;
@@ -1330,6 +1349,7 @@ static bool gs_amm_enqueue_ap_request_locked(GsAmmSharedState *state, int cache_
     slot->cache_bound_kb = cache_bound_kb;
     slot->one_pass_bound_kb = one_pass_bound_kb;
     slot->multi_pass_bound_kb = multi_pass_bound_kb;
+    slot->admission_target_kb = admission_target_kb;
     slot->prediction_mb = prediction_mb;
     slot->pgprocno = t_thrd.proc->pgprocno;
     slot->waiter_pid = t_thrd.proc->pid;
@@ -1381,15 +1401,15 @@ static void gs_amm_rebalance_ap_limits_locked(GsAmmSharedState *state)
         used_kb = (int)Min((uint64)INT_MAX, (record->used_bytes + 1023) / 1024);
         if (record->reclaim_pending) {
             /* A TP revoke must be visible below current use so the operator spills. */
-            target_kb = record->multi_pass_bound_kb;
-            record->target_mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+            target_kb = record->one_pass_bound_kb;
+            record->target_mode = GS_AMM_MEMORY_MODE_ONEPASS;
         } else {
             target_kb = gs_amm_record_target_kb_locked(state, record);
             target_kb = Max(target_kb, used_kb);
         }
         record->effective_grant_kb = Max(Min(target_kb, Max(record->granted_kb, used_kb)), 1);
         if (record->reclaim_pending)
-            record->mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+            record->mode = GS_AMM_MEMORY_MODE_ONEPASS;
         else if (record->effective_grant_kb <= record->one_pass_bound_kb)
             record->mode = GS_AMM_MEMORY_MODE_ONEPASS;
     }
@@ -2141,14 +2161,14 @@ bool GsAmmGrantProcessPendingReclaim(void)
 
         /* A dynamic-only AP has no shared granule to release.  Once its
          * backend has returned free dynamic chunks, lower the reservation to
-         * the multi-pass bound and return the quota to the global pool. */
+         * the one-pass bound and return the quota to the global pool. */
         SpinLockAcquire(&state->mutex);
         record = gs_amm_find_ap_record_locked(state, token);
         if (record == NULL || !record->reclaim_pending) {
             SpinLockRelease(&state->mutex);
             return false;
         }
-        minimum_bytes = (uint64)Max(record->multi_pass_bound_kb, 1) * 1024;
+        minimum_bytes = (uint64)Max(record->one_pass_bound_kb, 1) * 1024;
         if (record->dynamic_used_bytes > minimum_bytes) {
             SpinLockRelease(&state->mutex);
             return false;
@@ -2158,8 +2178,8 @@ bool GsAmmGrantProcessPendingReclaim(void)
             state->ap_downgrade_pending--;
         record->reclaim_pending = false;
         record->reclaim_granule_id = -1;
-        record->target_mode = GS_AMM_MEMORY_MODE_MULTIPASS;
-        record->mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+        record->target_mode = GS_AMM_MEMORY_MODE_ONEPASS;
+        record->mode = GS_AMM_MEMORY_MODE_ONEPASS;
         gs_amm_rebalance_ap_limits_locked(state);
         gs_amm_refresh_ap_totals_locked(state);
         state->last_action = GS_AMM_TP_RECOVERY_DONE;
@@ -2184,8 +2204,8 @@ bool GsAmmGrantProcessPendingReclaim(void)
             state->ap_downgrade_pending--;
         record->reclaim_pending = false;
         record->reclaim_granule_id = -1;
-        record->target_mode = GS_AMM_MEMORY_MODE_MULTIPASS;
-        record->mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+        record->target_mode = GS_AMM_MEMORY_MODE_ONEPASS;
+        record->mode = GS_AMM_MEMORY_MODE_ONEPASS;
     }
     state->tp_recovered_granules++;
     state->last_action = GS_AMM_TP_RECOVERY_DONE;
@@ -2992,6 +3012,14 @@ void GsAmmOnEnabledGucChange(bool enabled)
         state->ap_borrow_buffer_hit_guarded = false;
         state->ap_borrow_count = 0;
         state->last_ap_borrow_at = 0;
+        /* Do not carry a previous TP recovery epoch into a new AMM epoch.
+         * Otherwise every subsequent AP is admitted against its multi-pass
+         * minimum instead of the model's one-pass bound. */
+        state->tp_recovery_phase = GS_AMM_TP_RECOVERY_IDLE;
+        state->ap_multipass_only = false;
+        state->tp_ap_stop_requested = 0;
+        state->tp_ap_stop_completed = 0;
+        state->tp_sb_restore_granules = 0;
     }
     SpinLockRelease(&state->mutex);
     /* GUC defaults are assigned before the postmaster attaches buffer strategy shared memory. */
@@ -3465,6 +3493,7 @@ bool GsAmmReleaseGrantToken(GsAmmGrantToken expected_token)
                 state->native_current_grant_generation = 0;
                 state->native_current_granted_kb = 0;
                 state->native_current_memory_mode = GS_AMM_MEMORY_MODE_NONE;
+                state->native_current_label_override = false;
             }
         }
         SpinLockRelease(&state->mutex);
@@ -3737,6 +3766,7 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
     int ap_active_granules;
     int last_prediction_mb;
     int last_grant_mb;
+    int last_admission_target_mb;
     GsAmmAction last_action;
     int tp_pressure_pct;
     bool tp_pressure_hot;
@@ -3767,6 +3797,10 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
     int tp_hot_clear_windows;
     GsAmmTpRecoveryPhase tp_recovery_phase;
     bool ap_multipass_only;
+    int64 native_model_version;
+    int64 native_leaf_id;
+    bool native_label_override;
+    char native_last_reason[GS_AMM_ADMISSION_REASON_LENGTH];
     uint64 tp_ap_stop_requested;
     uint64 tp_ap_stop_completed;
     uint64 tp_sb_restore_granules;
@@ -3800,6 +3834,7 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
     ap_active_granules = state->ap_active_granules;
     last_prediction_mb = state->last_prediction_mb;
     last_grant_mb = state->last_grant_mb;
+    last_admission_target_mb = state->last_admission_target_mb;
     last_action = state->last_action;
     tp_pressure_pct = state->tp_pressure_pct;
     tp_pressure_hot = state->tp_pressure_hot;
@@ -3837,6 +3872,11 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
     tp_hot_clear_windows = state->tp_hot_clear_windows;
     tp_recovery_phase = state->tp_recovery_phase;
     ap_multipass_only = state->ap_multipass_only;
+    native_model_version = state->native_current_model_version;
+    native_leaf_id = state->native_current_leaf_id;
+    native_label_override = state->native_current_label_override;
+    (void)snprintf_s(native_last_reason, sizeof(native_last_reason),
+        sizeof(native_last_reason) - 1, "%s", state->native_last_reason);
     tp_ap_stop_requested = state->tp_ap_stop_requested;
     tp_ap_stop_completed = state->tp_ap_stop_completed;
     tp_sb_restore_granules = state->tp_sb_restore_granules;
@@ -3848,6 +3888,7 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
         "ap_used_bytes_total=%llu ap_reclaimable_bytes_total=%llu ap_queue_len=%d "
         "ap_queue_admit_count=%llu ap_queue_cancel_count=%llu "
         "free_granules=%d ap_active_granules=%d last_prediction_mb=%d last_grant_mb=%d "
+        "last_admission_target_mb=%d "
         "active_target_mb=%d current_target_mb=%d queued_target_mb=%d aggregate_target_mb=%d "
         "dynamic_deficit_mb=%d ap_borrow_count=%llu last_supply_source=%s "
         "baseline_active_mb=%d effective_dynamic_target_mb=%d pending_demand_mb=%d "
@@ -3861,7 +3902,8 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
         "tp_recovered_granules=%llu tp_recovery_deferred_count=%llu ap_downgrade_pending=%d "
         "ap_reclaim_poll_count=%llu ap_reclaim_operator_release_bytes=%llu "
         "tp_low_pressure_windows=%d tp_hot_clear_windows=%d tp_recovery_phase=%s ap_multipass_only=%s "
-        "tp_ap_stop_requested=%llu tp_ap_stop_completed=%llu tp_sb_restore_granules=%llu last_action=%s",
+        "tp_ap_stop_requested=%llu tp_ap_stop_completed=%llu tp_sb_restore_granules=%llu "
+        "native_model_version=%lld native_leaf_id=%lld native_label_override=%s native_last_reason=%s last_action=%s",
         gs_amm_enabled ? "true" : "false", active_mb, gs_amm_shared_buffers_min_mb,
         dynamic_target_mb, dynamic_used_mb, dynamic_target_mb,
         (int)Min((dynamic_reserved_bytes + 1024 * 1024 - 1) / (1024 * 1024), (uint64)INT_MAX),
@@ -3873,6 +3915,7 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
         (unsigned long long)ap_reclaimable_bytes_total, ap_queue_len,
         (unsigned long long)ap_queue_admit_count, (unsigned long long)ap_queue_cancel_count,
         free_granules, ap_active_granules, last_prediction_mb, last_grant_mb,
+        last_admission_target_mb,
         active_target_demand_mb, current_target_mb, queued_target_demand_mb, aggregate_target_mb,
         dynamic_deficit_mb, (unsigned long long)ap_borrow_count, last_supply_source,
         baseline_active_mb, effective_dynamic_target_mb, pending_demand_mb,
@@ -3899,6 +3942,10 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
         (unsigned long long)tp_ap_stop_requested,
         (unsigned long long)tp_ap_stop_completed,
         (unsigned long long)tp_sb_restore_granules,
+        (long long)native_model_version,
+        (long long)native_leaf_id,
+        native_label_override ? "true" : "false",
+        native_last_reason,
         gs_amm_action_name(last_action));
     securec_check_ss(rc, "\0", "\0");
     PG_RETURN_TEXT_P(cstring_to_text(status));
@@ -4086,7 +4133,7 @@ static void gs_amm_supply_ap_demand(void)
  * must never run while holding the spinlock.
  */
 static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_kb,
-    int one_pass_bound_kb, int multi_pass_bound_kb, int prediction_mb,
+    int one_pass_bound_kb, int multi_pass_bound_kb, int admission_target_kb, int prediction_mb,
     GsAmmGrantToken *grant_token, int *granted_kb, int *grant_granules)
 {
     int demand_mb;
@@ -4105,7 +4152,7 @@ static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_
     if (gs_amm_queue_has_entries_locked(state))
         return false;
 
-    demand_mb = (int)Min((Max((uint64)(state->ap_multipass_only ? multi_pass_bound_kb : one_pass_bound_kb), 1) + 1023) / 1024,
+    demand_mb = (int)Min((Max((uint64)(state->ap_multipass_only ? multi_pass_bound_kb : admission_target_kb), 1) + 1023) / 1024,
         (uint64)INT_MAX);
     demand_mb = Max(demand_mb, gs_amm_ap_min_grant_mb);
     dynamic_free_mb = gs_amm_dynamic_free_mb_locked(state);
@@ -4131,9 +4178,9 @@ static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_
         return false;
     }
     if (!gs_amm_register_ap_locked(state, token, cache_bound_kb, one_pass_bound_kb,
-        multi_pass_bound_kb, demand_mb * 1024, (uint64)dynamic_grant_kb * 1024,
-        state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS,
-        state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS,
+        multi_pass_bound_kb, admission_target_kb, demand_mb * 1024, (uint64)dynamic_grant_kb * 1024,
+    state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
+        state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
         t_thrd.proc_cxt.MyProcPid, t_thrd.proc->backendId)) {
         (void)gs_amm_forward_unwind_ap_granules_locked(state, token);
         gs_amm_refresh_granule_counts_locked(state);
@@ -4142,6 +4189,7 @@ static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_
     state->active_ap_count++;
     state->last_prediction_mb = prediction_mb;
     state->last_grant_mb = demand_mb;
+    state->last_admission_target_mb = demand_mb;
     state->last_action = GS_AMM_AP_EXPAND;
     (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
         sizeof(state->last_supply_source) - 1, "%s",
@@ -4191,9 +4239,7 @@ static void gs_amm_process_ap_queue(void)
             SpinLockRelease(&state->mutex);
             return;
         }
-        demand_mb = state->ap_multipass_only ?
-            (int)Min((Max((uint64)head->multi_pass_bound_kb, 1) + 1023) / 1024, (uint64)INT_MAX) :
-            gs_amm_queue_demand_mb(head);
+        demand_mb = gs_amm_queue_demand_mb(head, state);
         dynamic_free_mb = gs_amm_dynamic_free_mb_locked(state);
         free_granule_mb = gs_amm_free_granule_mb_locked(state);
         gs_amm_summarize_granules_locked(state, &granule_summary);
@@ -4240,10 +4286,11 @@ static void gs_amm_process_ap_queue(void)
                 state, token, shared_grant_mb, &grant_granules) >= shared_grant_mb) {
             if (shared_grant_mb == 0 || gs_amm_activate_ap_granules_locked(state, token)) {
                 if (gs_amm_register_ap_locked(state, token, head->cache_bound_kb,
-                    head->one_pass_bound_kb, head->multi_pass_bound_kb, demand_mb * 1024,
+                    head->one_pass_bound_kb, head->multi_pass_bound_kb, head->admission_target_kb,
+                    demand_mb * 1024,
                     (uint64)dynamic_grant_kb * 1024,
-                    state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS,
-                    state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS,
+                    state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
+                    state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
                     /* The queue is admitted by the controller/backend that
                      * happens to process the FIFO head, but cancellation must
                      * target the AP backend that owns the waiting slot. */
@@ -4251,6 +4298,7 @@ static void gs_amm_process_ap_queue(void)
                     InvalidBackendId)) {
                     state->active_ap_count++;
                     state->last_grant_mb = demand_mb;
+                    state->last_admission_target_mb = demand_mb;
                     state->last_prediction_mb = head->prediction_mb;
                     state->last_action = GS_AMM_AP_EXPAND;
                     state->ap_queue_admit_count++;
@@ -4260,7 +4308,7 @@ static void gs_amm_process_ap_queue(void)
                     wake_slot.granted_kb = demand_mb * 1024;
                     wake_slot.grant_granules = grant_granules;
                     wake_slot.memory_mode = state->ap_multipass_only ?
-                        GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS;
+                        GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE;
                     *head = wake_slot;
                     gs_amm_refresh_ap_totals_locked(state);
                     gs_amm_refresh_ap_queue_totals_locked(state);
@@ -4299,7 +4347,7 @@ static bool gs_amm_request_tp_downgrade_locked(GsAmmSharedState *state)
         token.grant_generation = granule->grant_generation;
         record = gs_amm_find_ap_record_locked(state, token);
         if (record == NULL || record->reclaim_pending ||
-            record->effective_grant_kb <= record->multi_pass_bound_kb)
+            record->effective_grant_kb <= record->one_pass_bound_kb)
             continue;
         if (best == NULL || granule->used_bytes < best_used_bytes ||
             (granule->used_bytes == best_used_bytes && token.grant_id < best->grant_id)) {
@@ -4317,9 +4365,9 @@ static bool gs_amm_request_tp_downgrade_locked(GsAmmSharedState *state)
 
             if (!record->active || record->reclaim_pending)
                 continue;
-            minimum_bytes = (uint64)Max(record->multi_pass_bound_kb, 1) * 1024;
+            minimum_bytes = (uint64)Max(record->one_pass_bound_kb, 1) * 1024;
             if (record->dynamic_granted_bytes <= minimum_bytes ||
-                record->effective_grant_kb <= record->multi_pass_bound_kb)
+                record->effective_grant_kb <= record->one_pass_bound_kb)
                 continue;
             if (best == NULL || record->dynamic_used_bytes < best_used_bytes ||
                 (record->dynamic_used_bytes == best_used_bytes && record->grant_id < best->grant_id)) {
@@ -4334,7 +4382,7 @@ static bool gs_amm_request_tp_downgrade_locked(GsAmmSharedState *state)
 
     best->reclaim_pending = true;
     best->reclaim_granule_id = best_granule_id;
-    best->target_mode = GS_AMM_MEMORY_MODE_MULTIPASS;
+    best->target_mode = GS_AMM_MEMORY_MODE_ONEPASS;
     if (best->revoke_epoch != PG_UINT64_MAX)
         best->revoke_epoch++;
     state->ap_downgrade_pending++;
@@ -4846,6 +4894,13 @@ Datum gs_amm_begin_ap(PG_FUNCTION_ARGS)
 bool GsAmmAdmitBounds(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_bound_kb,
     int queue_timeout_ms, int prediction_mb, GsAmmAdmissionResult *result)
 {
+    return GsAmmAdmitBoundsWithTarget(cache_bound_kb, one_pass_bound_kb, multi_pass_bound_kb,
+        cache_bound_kb, queue_timeout_ms, prediction_mb, result);
+}
+
+bool GsAmmAdmitBoundsWithTarget(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_bound_kb,
+    int admission_target_kb, int queue_timeout_ms, int prediction_mb, GsAmmAdmissionResult *result)
+{
     GsAmmSharedState *state;
     GsAmmApQueueSlot granted_slot;
     GsAmmGrantToken direct_token = {0, 0};
@@ -4873,12 +4928,17 @@ bool GsAmmAdmitBounds(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_
         one_pass_bound_kb = cache_bound_kb;
     if (multi_pass_bound_kb > one_pass_bound_kb)
         multi_pass_bound_kb = one_pass_bound_kb;
+    admission_target_kb = Max(admission_target_kb, 1);
+    if (admission_target_kb > cache_bound_kb)
+        admission_target_kb = cache_bound_kb;
+    if (admission_target_kb < multi_pass_bound_kb)
+        admission_target_kb = multi_pass_bound_kb;
     prediction_mb = prediction_mb > 0 ? prediction_mb : Max((cache_bound_kb + 1023) / 1024, 1);
     result->prediction_mb = prediction_mb;
     result->cache_bound_kb = cache_bound_kb;
     result->one_pass_bound_kb = one_pass_bound_kb;
     result->multi_pass_bound_kb = multi_pass_bound_kb;
-    result->admission_request_kb = one_pass_bound_kb;
+    result->admission_request_kb = admission_target_kb;
     result->backpressure = true;
     result->memory_mode = GS_AMM_MEMORY_MODE_ONEPASS;
     gs_amm_copy_admission_reason(result->reason, "queued");
@@ -4899,10 +4959,10 @@ bool GsAmmAdmitBounds(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_
     state = gs_amm_get_state();
     SpinLockAcquire(&state->mutex);
     directly_admitted = gs_amm_try_admit_ap_locked(state, cache_bound_kb, one_pass_bound_kb,
-        multi_pass_bound_kb, prediction_mb, &direct_token, &direct_granted_kb,
+        multi_pass_bound_kb, admission_target_kb, prediction_mb, &direct_token, &direct_granted_kb,
         &direct_grant_granules);
     direct_memory_mode = state->ap_multipass_only ?
-        GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS;
+        GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE;
     SpinLockRelease(&state->mutex);
 
     if (directly_admitted) {
@@ -4940,16 +5000,16 @@ bool GsAmmAdmitBounds(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_
      * controller has not reached its next one-second tick yet.
      */
     (void)gs_amm_prepare_dynamic_capacity(
-        Max((one_pass_bound_kb + 1023) / 1024, gs_amm_ap_min_grant_mb));
+        Max((admission_target_kb + 1023) / 1024, gs_amm_ap_min_grant_mb));
 
     SpinLockAcquire(&state->mutex);
     directly_admitted = gs_amm_try_admit_ap_locked(state, cache_bound_kb, one_pass_bound_kb,
-        multi_pass_bound_kb, prediction_mb, &direct_token, &direct_granted_kb,
+        multi_pass_bound_kb, admission_target_kb, prediction_mb, &direct_token, &direct_granted_kb,
         &direct_grant_granules);
     direct_memory_mode = state->ap_multipass_only ?
-        GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_ONEPASS;
+        GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE;
     if (!directly_admitted && !gs_amm_enqueue_ap_request_locked(state, cache_bound_kb, one_pass_bound_kb,
-        multi_pass_bound_kb, prediction_mb, &ticket)) {
+        multi_pass_bound_kb, admission_target_kb, prediction_mb, &ticket)) {
         state->backpressure_count++;
         gs_amm_set_backpressure_reason_locked(state, "queue_full");
         gs_amm_copy_admission_reason(result->reason, "queue_full");
@@ -5062,7 +5122,7 @@ bool GsAmmAdmitBounds(int cache_bound_kb, int one_pass_bound_kb, int multi_pass_
     result->queue_wait_ms = wait_ms;
     result->queue_ticket = ticket;
     result->grant_granules = granted_slot.grant_granules;
-    result->memory_mode = GS_AMM_MEMORY_MODE_ONEPASS;
+    result->memory_mode = granted_slot.memory_mode;
     gs_amm_copy_admission_reason(result->reason, "admitted");
     return true;
 }

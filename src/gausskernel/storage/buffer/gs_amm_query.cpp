@@ -9,11 +9,9 @@
 
 #include <limits.h>
 #include <math.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "access/heapam.h"
-#include "access/tupdesc.h"
 #include "access/xact.h"
 #include "executor/exec/execdesc.h"
 #include "executor/executor.h"
@@ -22,26 +20,22 @@
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
 #include "optimizer/planmem_walker.h"
-#include "pgstat.h"
 #include "storage/buf/bufmgr.h"
 #include "storage/gs_amm.h"
 #include "storage/smgr/fd.h"
-#include "utils/lsyscache.h"
 #include "utils/ammgranule.h"
 #include "utils/guc.h"
-#include "utils/memprot.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
-#include "utils/timestamp.h"
 #include "utils/tuplesort.h"
-#include "utils/workmem_dtree_model.h"
+#include "utils/workmem_xgb_v5_model.h"
 
 extern uint64 pg_relation_perm_table_size(Relation rel);
 extern uint64 pg_relation_table_size(Relation rel);
 
 typedef struct GsAmmWorkMemFeatureContext {
     MethodPlanWalkerContext base;
-    MemTuneWorkMemFeatures features;
+    MemTuneWorkMemFeaturesV5 features;
     double max_plan_rows;
     int max_plan_dop;
     bool has_memory_intensive_node;
@@ -92,6 +86,9 @@ static void gs_amm_clear_executor_frames(void);
 
 static void gs_amm_apply_test_ap_bounds(GsAmmDtreeDetail *detail)
 {
+    if (!gs_amm_test_ap_use_labels)
+        return;
+
     int cache_kb = gs_amm_test_ap_cache_label_kb;
     int one_pass_kb = gs_amm_test_ap_one_pass_label_kb;
     int multi_pass_kb = gs_amm_test_ap_multi_pass_label_kb;
@@ -115,6 +112,8 @@ static void gs_amm_apply_test_ap_bounds(GsAmmDtreeDetail *detail)
     detail->bounds_kb[0] = cache_kb;
     detail->bounds_kb[1] = one_pass_kb;
     detail->bounds_kb[2] = multi_pass_kb;
+    detail->admission_target_kb = cache_kb;
+    detail->test_label_override = true;
 }
 
 static void gs_amm_clear_tp_query_state(void)
@@ -338,13 +337,14 @@ static double gs_amm_nonnegative_finite(double value)
 
 static bool gs_amm_workmem_feature_walker(Node *node, GsAmmWorkMemFeatureContext *ctx)
 {
-    MemTuneWorkMemFeatures &features = ctx->features;
+    MemTuneWorkMemFeaturesV5 &features = ctx->features;
 
     if (node == NULL)
         return false;
 
     if (IsPlanNode(node)) {
         Plan *plan = (Plan *)node;
+        features.plan_node_count += 1.0;
 
         switch (nodeTag(node)) {
             case T_HashJoin:
@@ -356,6 +356,13 @@ static bool gs_amm_workmem_feature_walker(Node *node, GsAmmWorkMemFeatureContext
             case T_VecSort:
                 features.sort_nodes += 1.0;
                 ctx->has_memory_intensive_node = true;
+                if (isfinite(plan->plan_rows) && plan->plan_rows >= 0.0)
+                    features.sort_input_rows = isfinite(features.sort_input_rows) ?
+                        Max(features.sort_input_rows, plan->plan_rows) : plan->plan_rows;
+                features.sort_tuple_width = Max(features.sort_tuple_width,
+                    (double)Max(plan->plan_width, 0));
+                features.sort_key_count = Max(features.sort_key_count,
+                    (double)Max(((Sort *)node)->numCols, 0));
                 break;
             case T_Agg:
             case T_VecAgg:
@@ -383,8 +390,7 @@ static bool gs_amm_workmem_feature_walker(Node *node, GsAmmWorkMemFeatureContext
     return plan_tree_walker(node, (MethodWalker)gs_amm_workmem_feature_walker, (void *)ctx);
 }
 
-static void gs_amm_collect_one_relation(Oid relation_id, double *table_size_mb, double *index_size_mb,
-    double *average_width_sum, int *average_width_count)
+static bool gs_amm_collect_one_relation(Oid relation_id, double *table_size_mb, double *index_size_mb)
 {
     MemoryContext caller_context = CurrentMemoryContext;
     MemoryContext temporary_context = AllocSetContextCreate(caller_context,
@@ -392,32 +398,18 @@ static void gs_amm_collect_one_relation(Oid relation_id, double *table_size_mb, 
     Relation relation;
     double local_table_size_mb = 0.0;
     double local_index_size_mb = 0.0;
-    double local_column_width_sum = 0.0;
-    int local_column_width_count = 0;
+    bool relation_ok = false;
 
     (void)MemoryContextSwitchTo(temporary_context);
     relation = try_relation_open(relation_id, AccessShareLock);
     if (relation != NULL) {
-        TupleDesc tuple_desc = RelationGetDescr(relation);
         uint64 total_size = pg_relation_perm_table_size(relation);
         uint64 table_size = pg_relation_table_size(relation);
 
+        relation_ok = true;
         local_table_size_mb = (double)total_size / (1024.0 * 1024.0);
         if (total_size >= table_size)
             local_index_size_mb = (double)(total_size - table_size) / (1024.0 * 1024.0);
-
-        for (int attr_index = 0; attr_index < tuple_desc->natts; attr_index++) {
-            Form_pg_attribute attribute = TupleDescAttr(tuple_desc, attr_index);
-            int32 average_width;
-
-            if (attribute->attisdropped || attribute->attnum <= 0)
-                continue;
-            average_width = get_attavgwidth(relation_id, attribute->attnum, false);
-            if (average_width > 0) {
-                local_column_width_sum += (double)average_width;
-                local_column_width_count++;
-            }
-        }
         relation_close(relation, AccessShareLock);
     }
 
@@ -425,14 +417,11 @@ static void gs_amm_collect_one_relation(Oid relation_id, double *table_size_mb, 
     MemoryContextDelete(temporary_context);
     *table_size_mb += local_table_size_mb;
     *index_size_mb += local_index_size_mb;
-    if (local_column_width_count > 0) {
-        *average_width_sum += local_column_width_sum / local_column_width_count;
-        (*average_width_count)++;
-    }
+    return relation_ok;
 }
 
 static void gs_amm_collect_relation_features(PlannedStmt *planned_stmt, double *table_size_mb,
-    double *index_size_mb, double *average_width_sum, int *average_width_count)
+    double *index_size_mb, double *table_count, bool *relation_ok)
 {
     List *seen_relations = NIL;
     ListCell *cell = NULL;
@@ -445,49 +434,12 @@ static void gs_amm_collect_relation_features(PlannedStmt *planned_stmt, double *
         if (list_member_oid(seen_relations, rte->relid))
             continue;
         seen_relations = lappend_oid(seen_relations, rte->relid);
-        gs_amm_collect_one_relation(rte->relid, table_size_mb, index_size_mb,
-            average_width_sum, average_width_count);
+        *table_count += 1.0;
+        if (!gs_amm_collect_one_relation(rte->relid, table_size_mb, index_size_mb))
+            *relation_ok = false;
     }
 
     list_free(seen_relations);
-}
-
-static void gs_amm_collect_system_memory(MemTuneWorkMemFeatures &features)
-{
-    FILE *file = AllocateFile("/proc/meminfo", "r");
-    char line[256];
-    unsigned long long total_kb = 0;
-    unsigned long long available_kb = 0;
-
-    if (file == NULL)
-        return;
-
-    while (fgets(line, sizeof(line), file) != NULL) {
-        unsigned long long value_kb = 0;
-
-        if (strncmp(line, "MemTotal:", strlen("MemTotal:")) == 0 &&
-            sscanf_s(line + strlen("MemTotal:"), "%llu", &value_kb) == 1)
-            total_kb = value_kb;
-        else if (strncmp(line, "MemAvailable:", strlen("MemAvailable:")) == 0 &&
-            sscanf_s(line + strlen("MemAvailable:"), "%llu", &value_kb) == 1)
-            available_kb = value_kb;
-    }
-    FreeFile(file);
-    features.system_total_memory_mb = (double)total_kb / 1024.0;
-    features.system_available_memory_mb = (double)available_kb / 1024.0;
-}
-
-static void gs_amm_collect_runtime_features(MemTuneWorkMemFeatures &features)
-{
-    TimestampTz transaction_start = GetCurrentTransactionStartTimestamp();
-    TimestampTz now = GetCurrentTimestamp();
-
-    features.active_sessions = (double)Max(pgstat_get_current_active_numbackends() - 1, 0);
-    features.current_session_private_memory_mb = (double)Max(getSessionMemoryUsageMB(), 0);
-    if (transaction_start > 0 && now > transaction_start)
-        features.current_transaction_age_sec = (double)(now - transaction_start) / 1000000.0;
-    gs_amm_collect_system_memory(features);
-    features.memory_pressure_score = 0.0;
 }
 
 static void gs_amm_release_feature_context(GsAmmWorkMemFeatureContext *ctx)
@@ -506,13 +458,14 @@ static void gs_amm_release_feature_context(GsAmmWorkMemFeatureContext *ctx)
     }
 }
 
-bool GsAmmBuildWorkMemFeatures(QueryDesc *query_desc, MemTuneWorkMemFeatures *output_features)
+bool GsAmmBuildWorkMemFeaturesV5(QueryDesc *query_desc, MemTuneWorkMemFeaturesV5 *output_features)
 {
     GsAmmWorkMemFeatureContext ctx;
-    MemTuneWorkMemFeatures &features = ctx.features;
+    MemTuneWorkMemFeaturesV5 &features = ctx.features;
     PlannedStmt *planned_stmt;
-    double average_width_sum = 0.0;
-    int average_width_count = 0;
+    bool relation_ok = true;
+    double relation_table_size_mb = 0.0;
+    double relation_index_size_mb = 0.0;
 
     if (query_desc == NULL || output_features == NULL || query_desc->plannedstmt == NULL ||
         query_desc->plannedstmt->planTree == NULL)
@@ -524,20 +477,51 @@ bool GsAmmBuildWorkMemFeatures(QueryDesc *query_desc, MemTuneWorkMemFeatures *ou
     {
     planned_stmt = query_desc->plannedstmt;
     (void)memset(&ctx, 0, sizeof(ctx));
+    ctx.max_plan_rows = -1.0;
+    features.involved_table_total_size_mb = NAN;
+    features.involved_index_total_size_mb = NAN;
+    features.index_table_ratio = NAN;
+    features.table_size_log1p = NAN;
+    features.index_size_log1p = NAN;
+    features.sort_input_rows = NAN;
+    features.sort_tuple_width = NAN;
+    features.sort_input_bytes = NAN;
+    features.sort_input_rows_log1p = NAN;
+    features.sort_input_bytes_log1p = NAN;
     exec_init_plan_tree_base(&ctx.base.base, query_desc->plannedstmt);
     ctx.base.plannedStmt = query_desc->plannedstmt;
     ctx.base.dnExec = false;
 
     (void)gs_amm_workmem_feature_walker((Node *)planned_stmt->planTree, &ctx);
-    features.max_plan_rows_log10 = log10(ctx.max_plan_rows + 1.0);
+    features.max_plan_rows_log10 = ctx.max_plan_rows >= 0.0 ?
+        log10(ctx.max_plan_rows + 1.0) : NAN;
     features.total_cost = gs_amm_nonnegative_finite(planned_stmt->planTree->total_cost);
     features.parallel_workers_planned =
         (double)Max(Max(planned_stmt->query_dop, 0), ctx.max_plan_dop);
-    gs_amm_collect_runtime_features(features);
-    gs_amm_collect_relation_features(planned_stmt, &features.involved_table_total_size_mb,
-        &features.involved_index_total_size_mb, &average_width_sum, &average_width_count);
-    if (average_width_count > 0)
-        features.average_column_width = average_width_sum / average_width_count;
+    gs_amm_collect_relation_features(planned_stmt, &relation_table_size_mb,
+        &relation_index_size_mb, &features.table_count, &relation_ok);
+    if (features.table_count > 0.0 && relation_ok) {
+        features.involved_table_total_size_mb = relation_table_size_mb;
+        features.involved_index_total_size_mb = relation_index_size_mb;
+        features.index_table_ratio = features.involved_index_total_size_mb /
+            Max(features.involved_table_total_size_mb, 1e-6);
+        features.table_size_log1p = log1p(Max(features.involved_table_total_size_mb, 0.0));
+        features.index_size_log1p = log1p(Max(features.involved_index_total_size_mb, 0.0));
+    } else if (features.table_count > 0.0) {
+        features.involved_table_total_size_mb = NAN;
+        features.involved_index_total_size_mb = NAN;
+        features.index_table_ratio = NAN;
+        features.table_size_log1p = NAN;
+        features.index_size_log1p = NAN;
+    }
+    if (features.sort_nodes > 0.0 && isfinite(features.sort_input_rows) &&
+        isfinite(features.sort_tuple_width)) {
+        features.sort_input_bytes = features.sort_input_rows * features.sort_tuple_width;
+        features.sort_input_rows_log1p = log1p(Max(features.sort_input_rows, 0.0));
+        features.sort_input_bytes_log1p = log1p(Max(features.sort_input_bytes, 0.0));
+    }
+    features.rows_width_log1p = isfinite(features.max_plan_rows_log10) ?
+        log1p(Max(features.max_plan_rows_log10 * features.max_plan_width, 0.0)) : NAN;
     features.total_cost_log1p = log1p(Max(features.total_cost, 0.0));
 
     *output_features = features;
@@ -628,8 +612,8 @@ bool GsAmmApExecutorStart(QueryDesc *query_desc, int eflags)
         return false;
 
     GsAmmNativeQueryState *state = &gs_amm_native_query_state;
-    MemTuneWorkMemFeatures features;
-    double feature_values[MEMTUNE_WORKMEM_FEATURE_COUNT];
+    MemTuneWorkMemFeaturesV5 features;
+    double feature_values[MEMTUNE_XGB_V5_FEATURE_COUNT];
     GsAmmDtreeDetail detail;
     GsAmmAdmissionResult admission;
     int prediction_mb;
@@ -665,17 +649,17 @@ bool GsAmmApExecutorStart(QueryDesc *query_desc, int eflags)
 
     PG_TRY();
     {
-        if (!GsAmmBuildWorkMemFeatures(query_desc, &features)) {
+        if (!GsAmmBuildWorkMemFeaturesV5(query_desc, &features)) {
             fallback_needed = true;
             fallback_reason = "feature_collection";
         } else if (features.hash_join_nodes > 0.0 || features.sort_nodes > 0.0 ||
             features.aggregate_nodes > 0.0 || features.window_nodes > 0.0) {
             GsAmmRecordNativeEligible();
 
-            memtune_workmem_features_to_array(&features, feature_values);
-            if (!GsWorkmemDtreePredictDetail(feature_values, &detail)) {
+            memtune_xgb_v5_features_to_array(&features, feature_values);
+            if (!GsWorkmemXgbV5PredictDetail(feature_values, &detail)) {
                 fallback_needed = true;
-                fallback_reason = "dtree_prediction";
+                fallback_reason = "xgb_v5_prediction";
             } else {
                 gs_amm_apply_test_ap_bounds(&detail);
                 prediction_mb = Max((gs_amm_native_bound_kb(detail.bounds_kb[0]) + 1023) / 1024, 1);
@@ -683,9 +667,10 @@ bool GsAmmApExecutorStart(QueryDesc *query_desc, int eflags)
                  * operation reference while this backend sleeps in FIFO. */
                 GsAmmOperationEnd();
                 operation_held = false;
-                if (!GsAmmAdmitBounds(gs_amm_native_bound_kb(detail.bounds_kb[0]),
+                if (!GsAmmAdmitBoundsWithTarget(gs_amm_native_bound_kb(detail.bounds_kb[0]),
                     gs_amm_native_bound_kb(detail.bounds_kb[1]),
-                    gs_amm_native_bound_kb(detail.bounds_kb[2]), 0,
+                    gs_amm_native_bound_kb(detail.bounds_kb[2]),
+                    Max(detail.admission_target_kb, 1), 0,
                     prediction_mb, &admission)) {
                     fallback_needed = true;
                     fallback_reason = "admission_api";
