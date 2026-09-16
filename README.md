@@ -2,6 +2,13 @@
 
 [English](./README.en.md) | 简体中文
 
+## AMM 评估框架
+
+AMM 与 gsbench 的标准化性能评估入口位于
+[tools/amm-eval](tools/amm-eval/README.md)。每次运行会产生独立的证据目录和
+Markdown 报告，包含 gsbench 规模与 workload、TPS、1 秒 TPS 抖动、AP spill 与
+执行时间、数据库/主机 I/O 负载、AMM 状态及原始 JSONL/CSV 数据。
+
 
 
 - [什么是openGauss](#什么是openGauss)

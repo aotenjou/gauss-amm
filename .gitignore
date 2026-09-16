@@ -22,3 +22,6 @@ objfiles.txt
 /ereport.txt
 
 /build/script/version.cfg
+evaluation-runs/
+tools/amm-eval/__pycache__/
+tools/amm-eval/tests/__pycache__/
