@@ -173,13 +173,18 @@ def generate_report(run_dir: Path) -> dict[str, Any]:
     tps_values = [value for value in tps if value is not None]
     jitter = [number(row.get("tps_jitter")) for row in samples]
     jitter_values = [value for value in jitter if value is not None]
-    ap_exec = [number(row.get("execution_ms")) for row in ap_rows if row.get("status") == "ok"]
+    ap_exec = [number(row.get("execution_ms")) or number(row.get("wall_ms"))
+               for row in ap_rows if row.get("status") == "ok"]
+    ap_exec = [value for value in ap_exec if value is not None]
     spills = [row for row in ap_rows if row.get("spill") is True]
     ap_active = [number(row.get("ap_active")) for row in samples]
     ap_load = [number(row.get("ap_exec_ms")) for row in samples]
+    operations = parse_gsbench_operations(run_dir / "gsbench.log")
+    duration = number(manifest.get("duration_sec"))
     summary = {
         "sample_count": len(samples), "ap_query_count": len(ap_rows),
-        "gsbench_operations": parse_gsbench_operations(run_dir / "gsbench.log"),
+        "gsbench_operations": operations,
+        "gsbench_operations_per_sec": operations / duration if operations is not None and duration else None,
         "tps_1s": {"mean": statistics.fmean(tps_values) if tps_values else None,
                    "min": min(tps_values) if tps_values else None,
                    "max": max(tps_values) if tps_values else None,
@@ -203,7 +208,7 @@ def generate_report(run_dir: Path) -> dict[str, Any]:
                          "optional_io_view_available": any(row.get("io_read_bytes") is not None for row in samples)},
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    chart(run_dir / "tps.svg", "gsbench TPS (one-second windows)", "transactions / second", [("TPS_1S", tps)])
+    chart(run_dir / "tps.svg", "Database commit TPS (one-second windows)", "commits / second", [("DB_COMMIT_TPS_1S", tps)])
     chart(run_dir / "tps-jitter.svg", "TPS one-second jitter", "absolute deviation from mean TPS", [("jitter", jitter)])
     chart(run_dir / "io.svg", "I/O load", "bytes / second", [("read", [number(row.get("io_read_bytes_sec")) for row in samples]), ("write", [number(row.get("io_write_bytes_sec")) for row in samples])])
     chart(run_dir / "ap-execution.svg", "AP execution time", "milliseconds", [("execution_ms", [number(row.get("execution_ms")) for row in ap_rows])])
@@ -218,9 +223,10 @@ def generate_report(run_dir: Path) -> dict[str, Any]:
         f"- Workload: {manifest.get('workload', 'unknown')}", f"- Schema: {manifest.get('schema', 'unknown')}",
         f"- gsbench command: {manifest.get('gsbench', 'unknown')}", "",
         "## Summary", "", "| Metric | Value |", "|---|---:|",
-        f"| TPS mean / min / max | {fmt(t.get('mean'))} / {fmt(t.get('min'))} / {fmt(t.get('max'))} |",
-        f"| TPS p95 | {fmt(t.get('p95'))} |",
-        f"| TPS 1s jitter mean / p95 | {fmt(t.get('jitter_mean_abs'))} / {fmt(t.get('jitter_p95_abs'))} |",
+        f"| gsbench operations / operations/sec | {fmt(summary['gsbench_operations'])} / {fmt(summary['gsbench_operations_per_sec'])} |",
+        f"| DB commit TPS mean / min / max | {fmt(t.get('mean'))} / {fmt(t.get('min'))} / {fmt(t.get('max'))} |",
+        f"| DB commit TPS p95 | {fmt(t.get('p95'))} |",
+        f"| DB commit TPS 1s jitter mean / p95 | {fmt(t.get('jitter_mean_abs'))} / {fmt(t.get('jitter_p95_abs'))} |",
         f"| AP executions / errors | {a['ok']} / {a['errors']} |",
         f"| AP active peak / sampled execution load peak (ms) | {fmt(a['active_peak'])} / {fmt(a['load_ms_peak'])} |",
         f"| AP spill queries / rate | {a['spill_queries']} / {fmt(a['spill_rate'], percent=True)} |",

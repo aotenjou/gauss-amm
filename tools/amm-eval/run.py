@@ -26,6 +26,14 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def json_default(value: Any) -> Any:
+    """Keep driver Decimal/numeric values JSON compatible without losing nulls."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output-root", type=Path, default=Path("evaluation-runs"))
@@ -145,7 +153,7 @@ def sampler(args: argparse.Namespace, path: Path, stop: threading.Event) -> None
     try:
         conn = connect(args)
     except Exception as exc:
-        path.write_text(json.dumps({"error": str(exc), "ts": now()}) + "\n", encoding="utf-8")
+        path.write_text(json.dumps({"error": str(exc), "ts": now()}, default=json_default) + "\n", encoding="utf-8")
         return
     conn.autocommit = True
     previous_host: dict[str, Any] | None = None
@@ -158,7 +166,7 @@ def sampler(args: argparse.Namespace, path: Path, stop: threading.Event) -> None
                 row_delta = (host.get("cpu_iowait") or 0) - (previous_host.get("cpu_iowait") or 0)
                 record["cpu_iowait_pct"] = round(100 * row_delta / total, 3) if total > 0 else None
             record.update(host)
-            out.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            out.write(json.dumps(record, ensure_ascii=False, sort_keys=True, default=json_default) + "\n")
             out.flush()
             previous_host = host
             stop.wait(max(args.sample_interval, 0.1))
