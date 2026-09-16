@@ -175,6 +175,8 @@ def generate_report(run_dir: Path) -> dict[str, Any]:
     jitter_values = [value for value in jitter if value is not None]
     ap_exec = [number(row.get("execution_ms")) for row in ap_rows if row.get("status") == "ok"]
     spills = [row for row in ap_rows if row.get("spill") is True]
+    ap_active = [number(row.get("ap_active")) for row in samples]
+    ap_load = [number(row.get("ap_exec_ms")) for row in samples]
     summary = {
         "sample_count": len(samples), "ap_query_count": len(ap_rows),
         "gsbench_operations": parse_gsbench_operations(run_dir / "gsbench.log"),
@@ -188,13 +190,16 @@ def generate_report(run_dir: Path) -> dict[str, Any]:
                "spill_queries": len(spills), "spill_rate": len(spills) / len(ap_rows) if ap_rows else None,
                "execution_mean_ms": statistics.fmean(ap_exec) if ap_exec else None,
                "execution_p95_ms": percentile(ap_exec, .95), "execution_max_ms": max(ap_exec) if ap_exec else None,
-               "temp_written_blocks": sum(number(row.get("temp_written_blocks")) or 0 for row in ap_rows)},
+               "temp_written_blocks": sum(number(row.get("temp_written_blocks")) or 0 for row in ap_rows),
+               "active_peak": max((value for value in ap_active if value is not None), default=None),
+               "load_ms_peak": max((value for value in ap_load if value is not None), default=None)},
         "io": {"read_bytes_sec_max": max((number(row.get("io_read_bytes_sec")) or 0 for row in samples), default=None),
                "write_bytes_sec_max": max((number(row.get("io_write_bytes_sec")) or 0 for row in samples), default=None),
                "busy_ms_sec_max": max((number(row.get("disk_busy_ms_sec")) or 0 for row in samples), default=None),
                "iowait_pct_max": max((number(row.get("cpu_iowait_pct")) or 0 for row in samples), default=None)},
         "data_quality": {"samples_available": bool(samples), "ap_metrics_available": bool(ap_rows),
                          "amm_status_available": any(row.get("amm_status") not in (None, "") for row in samples),
+                         "amm_status_samples": sum(row.get("amm_status") not in (None, "") for row in samples),
                          "optional_io_view_available": any(row.get("io_read_bytes") is not None for row in samples)},
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -217,6 +222,7 @@ def generate_report(run_dir: Path) -> dict[str, Any]:
         f"| TPS p95 | {fmt(t.get('p95'))} |",
         f"| TPS 1s jitter mean / p95 | {fmt(t.get('jitter_mean_abs'))} / {fmt(t.get('jitter_p95_abs'))} |",
         f"| AP executions / errors | {a['ok']} / {a['errors']} |",
+        f"| AP active peak / sampled execution load peak (ms) | {fmt(a['active_peak'])} / {fmt(a['load_ms_peak'])} |",
         f"| AP spill queries / rate | {a['spill_queries']} / {fmt(a['spill_rate'], percent=True)} |",
         f"| AP execution mean / p95 / max (ms) | {fmt(a['execution_mean_ms'])} / {fmt(a['execution_p95_ms'])} / {fmt(a['execution_max_ms'])} |",
         f"| AP temp written blocks | {fmt(a['temp_written_blocks'])} |", "",
@@ -226,6 +232,7 @@ def generate_report(run_dir: Path) -> dict[str, Any]:
         f"- Per-second samples: {'available' if quality['samples_available'] else 'missing'}",
         f"- AP metrics: {'available' if quality['ap_metrics_available'] else 'missing'}",
         f"- AMM status: {'available' if quality['amm_status_available'] else 'missing'}",
+        f"- AMM status samples: {quality['amm_status_samples']}",
         f"- pg_stat_io: {'available' if quality['optional_io_view_available'] else 'missing (server does not expose it)'}",
         "", "Raw evidence is kept in samples.jsonl, ap-metrics.jsonl, gsbench.log, metrics.csv and ap-metrics.csv.",
     ]
