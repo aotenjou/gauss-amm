@@ -216,6 +216,9 @@ static bool check_ss_dss_conn_path(char** newval, void** extra, GucSource source
 static bool check_ss_enable_ssl(bool* newval, void** extra, GucSource source);
 static void assign_ss_enable_aio(bool newval, void *extra);
 static void assign_gs_amm_enabled(bool newval, void *extra);
+static bool check_gs_amm_dynamic_target_mb(int *newval, void **extra, GucSource source);
+static bool check_gs_amm_memory_target_mb(int *newval, void **extra, GucSource source);
+static bool check_gs_amm_shared_buffers_reserved_mb(int *newval, void **extra, GucSource source);
 #ifdef USE_ASSERT_CHECKING
 static void assign_ss_enable_verify_page(bool newval, void *extra);
 #endif
@@ -523,6 +526,28 @@ static void InitStorageConfigureNamesBool()
             gettext_noop("For test use only.  When off, AP label GUCs are ignored and the static XGBoost model is used.")},
             &gs_amm_test_ap_use_labels,
             false,
+            NULL,
+            NULL,
+            NULL},
+        {{"gs_amm_borrow_cold_granules",
+            PGC_SIGHUP,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("Selects the coldest GS AMM granules when borrowing shared buffers for AP memory."),
+            gettext_noop("When off, borrowing always drains the highest granule ids first.")},
+            &gs_amm_borrow_cold_granules,
+            true,
+            NULL,
+            NULL,
+            NULL},
+        {{"gs_amm_controller_idle_sleep",
+            PGC_SIGHUP,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("Skips GS AMM controller work when no AP session or queued AP exists."),
+            gettext_noop("Eliminates pagewriter controller overhead during TP-only workloads.")},
+            &gs_amm_controller_idle_sleep,
+            true,
             NULL,
             NULL,
             NULL},
@@ -1331,17 +1356,43 @@ static void InitStorageConfigureNamesInt()
             NULL,
             NULL,
             NULL},
+        {{"gs_amm_shared_buffers_reserved_mb",
+            PGC_SIGHUP,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("Sets the shared-buffer reserve that GS AMM never borrows from."),
+            gettext_noop("Shared buffers are split into a reserved cache zone and a dynamic granule zone; AP memory borrows only from the dynamic zone.")},
+            &gs_amm_shared_buffers_reserved_mb,
+            128,
+            1,
+            INT_MAX / 2,
+            check_gs_amm_shared_buffers_reserved_mb,
+            NULL,
+            NULL},
         {{"gs_amm_dynamic_target_mb",
             PGC_SIGHUP,
             NODE_ALL,
             RESOURCES_MEM,
             gettext_noop("Sets the default dynamic AP memory target for GS AMM."),
-            NULL},
+            gettext_noop("The configured shared_buffers plus this value must not exceed gs_amm_memory_target_mb when that limit is set.")},
             &gs_amm_dynamic_target_mb,
             512,
             1,
             INT_MAX / 2,
+            check_gs_amm_dynamic_target_mb,
             NULL,
+            NULL},
+        {{"gs_amm_memory_target_mb",
+            PGC_SIGHUP,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("Sets the unified GS AMM memory ceiling for shared_buffers plus dynamic AP memory."),
+            gettext_noop("Zero derives the ceiling from shared_buffers plus gs_amm_dynamic_target_mb.")},
+            &gs_amm_memory_target_mb,
+            0,
+            0,
+            INT_MAX / 2,
+            check_gs_amm_memory_target_mb,
             NULL,
             NULL},
         {{"gs_amm_test_ap_cache_label_kb",
@@ -1452,6 +1503,20 @@ static void InitStorageConfigureNamesInt()
             NULL,
             NULL,
             NULL},
+        {{"gs_amm_ap_scan_ring_pages",
+            PGC_USERSET,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("Sets the AP Seq Scan buffer ring size in pages for GS AMM."),
+            gettext_noop("Smaller rings keep AP heap scans from polluting the reserved shared-buffer zone."),
+            GUC_UNIT_BLOCKS},
+            &gs_amm_ap_scan_ring_pages,
+            32,
+            4,
+            1024,
+            NULL,
+            NULL,
+            NULL},
         {{"gs_amm_granule_size_mb",
             PGC_POSTMASTER,
             NODE_ALL,
@@ -1462,6 +1527,71 @@ static void InitStorageConfigureNamesInt()
             64,
             1,
             INT_MAX / 2,
+            NULL,
+            NULL,
+            NULL},
+        {{"gs_amm_resize_granule_per_tick",
+            PGC_SIGHUP,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("Sets the maximum number of GS AMM granules moved per controller tick during gs_amm_resize."),
+            gettext_noop("Smaller values smooth online shared-buffer resizes at the cost of completion time.")},
+            &gs_amm_resize_granule_per_tick,
+            1,
+            1,
+            1024,
+            NULL,
+            NULL,
+            NULL},
+        {{"gs_amm_restore_delay_ticks",
+            PGC_SIGHUP,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("Sets the GS AMM floor hold time after a shared-buffer borrow."),
+            gettext_noop("The controller keeps the reduced shared-buffer size for at least this many ticks before restoring.")},
+            &gs_amm_restore_delay_ticks,
+            5,
+            0,
+            3600,
+            NULL,
+            NULL,
+            NULL},
+        {{"gs_amm_restore_rate_mb_per_s",
+            PGC_SIGHUP,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("Sets the GS AMM shared-buffer restore rate limit."),
+            gettext_noop("Shared-buffer restore is throttled to this many MB per controller tick.  Zero disables throttling.")},
+            &gs_amm_restore_rate_mb_per_s,
+            8,
+            0,
+            1048576,
+            NULL,
+            NULL,
+            NULL},
+        {{"gs_amm_ap_admit_rate_mb_per_s",
+            PGC_SIGHUP,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("Sets the GS AMM AP admission token rate."),
+            gettext_noop("Queued AP grants are admitted at this many MB per controller tick.  Zero disables the token bucket.")},
+            &gs_amm_ap_admit_rate_mb_per_s,
+            8,
+            0,
+            1048576,
+            NULL,
+            NULL,
+            NULL},
+        {{"gs_amm_tp_jitter_threshold_pct",
+            PGC_SIGHUP,
+            NODE_ALL,
+            RESOURCES_MEM,
+            gettext_noop("Sets the GS AMM TP TPS jitter threshold."),
+            gettext_noop("When the 10-window TPS coefficient of variation exceeds this value, admission tokens, borrow, restore, and AP stop are applied in order.  Zero disables the jitter control loop.")},
+            &gs_amm_tp_jitter_threshold_pct,
+            10,
+            0,
+            1000,
             NULL,
             NULL,
             NULL},
@@ -6349,6 +6479,65 @@ static void assign_ss_log_backup_file_count(int newval, void *extra)
             DSSRefreshLogger("LOG_BACKUP_FILE_COUNT", &val);
         }
     }
+}
+
+static int gs_amm_shared_buffers_mb(void)
+{
+    return (int)(((int64)g_instance.attr.attr_storage.NBuffers * BLCKSZ) / (1024 * 1024));
+}
+
+static bool check_gs_amm_dynamic_target_mb(int *newval, void **extra, GucSource source)
+{
+    int shared_mb = gs_amm_shared_buffers_mb();
+
+    /* The boot default (512 MB) is initialized before gs_amm_memory_target_mb
+     * has necessarily been loaded in every child process.  Rejecting it here
+     * would prevent startup even when the config file later lowers the value.
+     * Enforce the unified ceiling only for explicit settings. */
+    if (source == PGC_S_DEFAULT)
+        return true;
+    if (gs_amm_memory_target_mb > 0 && shared_mb + *newval > gs_amm_memory_target_mb) {
+        GUC_check_errdetail(
+            "gs_amm_dynamic_target_mb (%d MB) plus shared_buffers (%d MB) exceeds gs_amm_memory_target_mb (%d MB).",
+            *newval, shared_mb, gs_amm_memory_target_mb);
+        return false;
+    }
+    return true;
+}
+
+static bool check_gs_amm_memory_target_mb(int *newval, void **extra, GucSource source)
+{
+    int shared_mb = gs_amm_shared_buffers_mb();
+
+    if (source == PGC_S_DEFAULT)
+        return true;
+    if (*newval > 0 && shared_mb + gs_amm_dynamic_target_mb > *newval) {
+        GUC_check_errdetail(
+            "gs_amm_memory_target_mb (%d MB) must be at least shared_buffers (%d MB) plus gs_amm_dynamic_target_mb (%d MB).",
+            *newval, shared_mb, gs_amm_dynamic_target_mb);
+        return false;
+    }
+    return true;
+}
+
+static bool check_gs_amm_shared_buffers_reserved_mb(int *newval, void **extra, GucSource source)
+{
+    int shared_mb = gs_amm_shared_buffers_mb();
+
+    if (source == PGC_S_DEFAULT)
+        return true;
+    /* During early startup NBuffers may still be the boot default (8 MB)
+     * when the postmaster processes command-line -c values.  Let the value
+     * through; gs_amm_reserved_blocks() clamps it once NBuffers is known. */
+    if (shared_mb < 2 * gs_amm_granule_size_mb + 32)
+        return true;
+    if (*newval > shared_mb - GS_AMM_MIN_DYNAMIC_GRANULES * gs_amm_granule_size_mb) {
+        GUC_check_errdetail(
+            "gs_amm_shared_buffers_reserved_mb (%d MB) must leave at least %d granules in the dynamic zone (shared_buffers %d MB, granule %d MB).",
+            *newval, GS_AMM_MIN_DYNAMIC_GRANULES, shared_mb, gs_amm_granule_size_mb);
+        return false;
+    }
+    return true;
 }
 
 static bool gs_amm_shared_config_owner(void)

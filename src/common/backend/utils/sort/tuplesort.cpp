@@ -536,6 +536,7 @@ struct Tuplesortstate {
      * a granule.  The list is backend-local and only contains live states. */
     Tuplesortstate *amm_reclaim_next;
     bool amm_reclaim_registered;
+    int amm_reclaim_poll_tick;
 };
 
 static THR_LOCAL Tuplesortstate *AmmSortReclaimStates = NULL;
@@ -853,6 +854,7 @@ static void AmmSortRegisterReclaimState(Tuplesortstate *state)
     state->amm_reclaim_next = AmmSortReclaimStates;
     AmmSortReclaimStates = state;
     state->amm_reclaim_registered = true;
+    state->amm_reclaim_poll_tick = 0;
 }
 
 static void AmmSortUnregisterReclaimState(Tuplesortstate *state)
@@ -911,7 +913,17 @@ static bool AmmSortEnsureTupleCapacity(Tuplesortstate* state, Size tuple_bytes)
         selectnewtape(state);
     }
 
-    (void)AmmGranuleContextReleaseFreeMemory(state->tuplecontext);
+    /*
+     * A TP revoke needs whole empty granules, not just the chunks that are
+     * already on the context freelist.  When a revoke is pending, all live
+     * tuples have just been written to tape, so resetting the tuple context
+     * returns every remaining granule chunk and makes
+     * GsAmmGrantProcessPendingReclaim() succeed deterministically.
+     */
+    if (GsAmmGrantReclaimPending())
+        MemoryContextReset(state->tuplecontext);
+    else
+        (void)AmmGranuleContextReleaseFreeMemory(state->tuplecontext);
     (void)AmmGranuleContextReleaseFreeMemory(state->sortcontext);
     (void)GsAmmGrantProcessPendingReclaim();
     capacity_available = AmmGranuleContextCanAllocate(state->tuplecontext, tuple_bytes);
@@ -2221,6 +2233,12 @@ static bool tuplesort_gettuple_common(Tuplesortstate* state, bool forward, SortT
     unsigned int tuplen;
 
     Assert(!WORKER(state));
+
+    /* Periodically give AMM a chance to release a revoked granule at a safe
+     * point.  A running external sort otherwise only polls when its tuple
+     * capacity is exhausted, which may be later than the TP recovery budget. */
+    if (state->amm_reclaim_registered && ((++state->amm_reclaim_poll_tick & 0x3FF) == 0))
+        (void)GsAmmGrantProcessPendingReclaim();
 
     switch (state->status) {
         case TSS_SORTEDINMEM:

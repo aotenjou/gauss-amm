@@ -46,3 +46,22 @@ For a database-free smoke test, feed JSONL samples to the report generator:
 
 Missing optional views or AMM functions become null in samples.jsonl and are
 listed under report data quality; they are never converted to zero.
+
+## Low-memory five-stage comparison
+
+For the retained `gsbench_20g` dataset, use `lowmem.py` for the native versus
+AMM comparison described by the `gauss-amm-lowmem-eval` skill:
+
+    python3 tools/amm-eval/lowmem.py --kernel native \
+      --host /tmp --port 15440 --user ammdb --server-pid-file /path/to/postmaster.pid
+
+The driver uses a unique cgroup v1 memory group (1 GiB by default), runs the
+two TP/eight AP stages and writes per-stage TP latency, AP JSON plans, textual
+Stage 2 EXPLAIN, RSS, cgroup and AMM status evidence. Use `--start-command` to
+launch a stopped kernel after the cgroup is created, and `--stop-command` for a
+clean kernel transition. It never initializes or mutates the data directory.
+
+The native Stage 2 gate is valid only when the textual plan contains
+`external merge` and `Disk:` and the sampled `temp_bytes` delta is positive.
+When the gate fails, the report retains the measurements but does not claim an
+AMM spill-control advantage.

@@ -10,6 +10,7 @@
 
 #include <sys/mman.h>
 #include <stdlib.h>
+#include <math.h>
 
 #include "fmgr.h"
 #include "catalog/pg_type.h"
@@ -27,14 +28,18 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/timestamp.h"
+#include "utils/ammgranule.h"
 #include "utils/tuplesort.h"
 #include "ddes/dms/ss_dms_bufmgr.h"
 
 extern bool superuser(void);
 
 int gs_amm_shared_buffers_min_mb = 64;
+int gs_amm_shared_buffers_reserved_mb = 128;
 int gs_amm_dynamic_target_mb = 512;
+int gs_amm_memory_target_mb = 0;
 int gs_amm_granule_size_mb = 64;
+int gs_amm_ap_scan_ring_pages = 32;
 bool gs_amm_enabled = false;
 THR_LOCAL int gs_amm_workload_role = GS_AMM_WORKLOAD_TP;
 THR_LOCAL int gs_amm_test_ap_cache_label_kb = 0;
@@ -46,6 +51,13 @@ int gs_amm_tp_buffer_miss_threshold_pct = 5;
 int gs_amm_ap_borrow_buffer_hit_guard_pct = 3;
 int gs_amm_tp_tps_decline_guard_pct = 3;
 int gs_amm_tp_cpu_pressure_threshold_pct = 60;
+int gs_amm_resize_granule_per_tick = 1;
+bool gs_amm_borrow_cold_granules = true;
+int gs_amm_restore_delay_ticks = 5;
+int gs_amm_restore_rate_mb_per_s = 8;
+int gs_amm_ap_admit_rate_mb_per_s = 8;
+bool gs_amm_controller_idle_sleep = true;
+int gs_amm_tp_jitter_threshold_pct = 10;
 /* A worker-rate surge is retained exclusively to make acceptance tests
  * deterministic on a shared host.  Production recovery uses host CPU. */
 THR_LOCAL bool gs_amm_tp_test_mode = false;
@@ -63,21 +75,32 @@ typedef enum GsAmmAction {
     GS_AMM_TP_RECOVERY_FREE,
     GS_AMM_TP_RECOVERY_IDLE_AP,
     GS_AMM_TP_DOWNGRADE_PENDING,
+    GS_AMM_TP_DOWNGRADE_APPLIED,
     GS_AMM_TP_RECOVERY_DONE,
     GS_AMM_TP_RECOVERY_DEFERRED,
     GS_AMM_TP_BUFFER_BASELINE_DRAIN,
+    GS_AMM_TP_BUFFER_BASELINE_RESTORE,
     GS_AMM_ACTION_COUNT
 } GsAmmAction;
 
 #define GS_AMM_MIN_GRANULE_MB 1
 #define GS_AMM_RECLAIM_RETRY_INTERVAL_MS 1000
+#define GS_AMM_BORROW_MAX_GRANULES_PER_CALL 4
 #define GS_AMM_MAX_AP_REGISTRY 128
 #define GS_AMM_AP_QUEUE_CAPACITY GS_AMM_MAX_AP_REGISTRY
 #define GS_AMM_TP_WINDOW_MS 1000
 #define GS_AMM_TP_LOW_WINDOWS_BEFORE_DRAIN 3
 #define GS_AMM_TP_HOT_CLEAR_WINDOWS 3
+#define GS_AMM_TP_DOWNGRADE_WINDOWS 8
 #define GS_AMM_TP_TEST_SURGE_LEASE_WINDOWS 3
 #define GS_AMM_TP_TEST_MODE_LEASE_WINDOWS 10
+#define GS_AMM_TPS_JITTER_WINDOW_SAMPLES 10
+#define GS_AMM_TPS_JITTER_STOP_WINDOWS 3
+#define GS_AMM_TPS_WARM_PRESSURE_PCT 40
+#define GS_AMM_AP_BORROW_RETRY_TICKS 5
+#define GS_AMM_AP_FIRST_BORROW_DELAY_TICKS 2
+#define GS_AMM_TP_HOT_CONFIRM_WINDOWS 2
+#define GS_AMM_TPS_WARM_SLOPE_DECLINE_PCT 5
 
 typedef enum GsAmmStage {
     GS_AMM_STAGE_CACHE = 0,
@@ -100,6 +123,13 @@ typedef enum GsAmmTpRecoveryPhase {
     GS_AMM_TP_RECOVERY_MULTIPASS
 } GsAmmTpRecoveryPhase;
 
+typedef enum GsAmmSbCycleState {
+    GS_AMM_SB_STABLE = 0,
+    GS_AMM_SB_DRAINING,
+    GS_AMM_SB_FLOOR,
+    GS_AMM_SB_RESTORING
+} GsAmmSbCycleState;
+
 typedef struct GsAmmApRecord {
     bool active;
     uint64 grant_id;
@@ -116,7 +146,6 @@ typedef struct GsAmmApRecord {
     uint64 used_bytes;
     GsAmmMemoryMode mode;
     GsAmmMemoryMode target_mode;
-    uint64 revoke_epoch;
     bool reclaim_pending;
     int reclaim_granule_id;
     ThreadId backend_pid;
@@ -214,10 +243,12 @@ typedef struct GsAmmSharedState {
     int last_aggregate_target_mb;
     int last_dynamic_deficit_mb;
     uint64 ap_borrow_count;
+    int ap_borrow_retry_ticks;
     char last_supply_source[24];
     uint64 tp_window_shared_blks_hit;
     uint64 tp_window_shared_blks_read;
     uint64 tp_window_completed_queries;
+    uint64 tp_window_cpu_us;
     uint64 tp_cpu_last_total_jiffies;
     uint64 tp_cpu_last_idle_jiffies;
     int tp_cpu_util_pct;
@@ -238,6 +269,7 @@ typedef struct GsAmmSharedState {
     bool tp_tps_baseline_valid;
     bool tp_tps_guarded;
     bool ap_borrow_buffer_hit_guarded;
+    int tp_hot_windows;
     int baseline_active_mb;
     int tp_low_pressure_windows;
     int tp_hot_clear_windows;
@@ -252,6 +284,22 @@ typedef struct GsAmmSharedState {
     uint64 tp_recovered_granules;
     uint64 tp_recovery_deferred_count;
     int ap_downgrade_pending;
+    int tp_downgrade_windows;
+    int resize_pending_target_blocks;
+    GsAmmSbCycleState sb_cycle_state;
+    int sb_cycle_ticks;
+    int sb_restore_credit_mb;
+    int ap_admit_credit_mb;
+    int ap_admit_rate_scale_pct;
+    uint64 tp_prev_window_tps;
+    int tp_tps_history[GS_AMM_TPS_JITTER_WINDOW_SAMPLES];
+    int tp_tps_history_count;
+    int tp_tps_history_index;
+    int tp_jitter_pct;
+    bool tp_jitter_guarded;
+    bool tp_jitter_pause_borrow;
+    bool tp_jitter_pause_restore;
+    int tp_jitter_high_windows;
     uint64 ap_reclaim_poll_count;
     uint64 ap_reclaim_operator_release_bytes;
     GsAmmApRecord ap_registry[GS_AMM_MAX_AP_REGISTRY];
@@ -264,6 +312,8 @@ typedef struct GsAmmSharedState {
     int granule_mb;
     int granule_blocks;
     int total_granules;
+    int reserved_buffer_blocks;
+    int dynamic_first_buffer_id;
     int buffer_active_granules;
     int buffer_draining_granules;
     int reclaiming_granules;
@@ -461,7 +511,6 @@ static bool gs_amm_register_ap_locked(GsAmmSharedState *state, GsAmmGrantToken t
     record->used_bytes = 0;
     record->mode = mode;
     record->target_mode = target_mode;
-    record->revoke_epoch = 0;
     record->reclaim_pending = false;
     record->reclaim_granule_id = -1;
     record->backend_pid = backend_pid;
@@ -480,8 +529,11 @@ static void gs_amm_unregister_ap_locked(GsAmmSharedState *state, GsAmmGrantToken
         return;
     if (record->stop_requested)
         state->tp_ap_stop_completed++;
-    if (record->reclaim_pending && state->ap_downgrade_pending > 0)
+    if (record->reclaim_pending && state->ap_downgrade_pending > 0) {
         state->ap_downgrade_pending--;
+        if (state->ap_downgrade_pending == 0)
+            state->tp_downgrade_windows = 0;
+    }
     (void)memset(record, 0, sizeof(*record));
     if (state->ap_registry_count > 0)
         state->ap_registry_count--;
@@ -516,9 +568,11 @@ static const char *const GS_AMM_ACTION_NAMES[GS_AMM_ACTION_COUNT] = {
     "TP_RECOVERY_FREE",
     "TP_RECOVERY_IDLE_AP",
     "TP_DOWNGRADE_PENDING",
+    "TP_DOWNGRADE_APPLIED",
     "TP_RECOVERY_DONE",
     "TP_RECOVERY_DEFERRED",
-    "TP_BUFFER_BASELINE_DRAIN"
+    "TP_BUFFER_BASELINE_DRAIN",
+    "TP_BUFFER_BASELINE_RESTORE"
 };
 
 static const char *gs_amm_memory_mode_name(GsAmmMemoryMode mode)
@@ -595,6 +649,7 @@ static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_
 static void gs_amm_request_ap_stop_locked(GsAmmSharedState *state);
 static void gs_amm_restore_shared_buffer_after_ap_stop(GsAmmSharedState *state);
 static int gs_amm_current_active_buffer_blocks(GsAmmSharedState *state);
+static int gs_amm_pick_shrink_granule_locked(GsAmmSharedState *state, int target_blocks);
 static void gs_amm_resize_core(int target_blocks, GsAmmResizeOutcome *out);
 static void gs_amm_rebalance_ap_limits_locked(GsAmmSharedState *state);
 static int gs_amm_record_target_kb_locked(const GsAmmSharedState *state, const GsAmmApRecord *record);
@@ -630,12 +685,43 @@ static int gs_amm_configured_granule_blocks(void)
     return (int)blocks;
 }
 
+static int gs_amm_mb_to_blocks(int target_mb);
+
 static int gs_amm_total_granules_for_blocks(int buffer_count, int granule_blocks)
 {
     if (buffer_count <= 0)
         return 1;
     granule_blocks = Max(granule_blocks, 1);
     return (buffer_count + granule_blocks - 1) / granule_blocks;
+}
+
+static int gs_amm_reserved_blocks(void)
+{
+    int granule_blocks = gs_amm_configured_granule_blocks();
+    int max_reserved = NORMAL_SHARED_BUFFER_NUM - GS_AMM_MIN_DYNAMIC_GRANULES * granule_blocks;
+    int reserved_blocks = gs_amm_mb_to_blocks(Max(gs_amm_shared_buffers_reserved_mb, 0));
+
+    if (max_reserved < 0)
+        max_reserved = 0;
+    if (reserved_blocks < 0)
+        reserved_blocks = 0;
+    if (reserved_blocks > max_reserved)
+        reserved_blocks = max_reserved;
+    return reserved_blocks;
+}
+
+static int gs_amm_dynamic_blocks(void)
+{
+    int dynamic_blocks = NORMAL_SHARED_BUFFER_NUM - gs_amm_reserved_blocks();
+
+    if (dynamic_blocks < 0)
+        dynamic_blocks = 0;
+    return dynamic_blocks;
+}
+
+static int gs_amm_dynamic_first_buffer_id(void)
+{
+    return gs_amm_reserved_blocks();
 }
 
 static Size gs_amm_state_shmem_size(int total_granules)
@@ -746,14 +832,15 @@ static bool gs_amm_publish_granule_state_locked(
 Size GsAmmShmemSize(void)
 {
     int granule_blocks = gs_amm_configured_granule_blocks();
-    int total_granules = gs_amm_total_granules_for_blocks(NORMAL_SHARED_BUFFER_NUM, granule_blocks);
+    int dynamic_blocks = gs_amm_dynamic_blocks();
+    int total_granules = gs_amm_total_granules_for_blocks(Max(dynamic_blocks, 1), granule_blocks);
 
     return MAXALIGN(gs_amm_state_shmem_size(total_granules));
 }
 
 static void gs_amm_refresh_granule_counts_locked(GsAmmSharedState *state)
 {
-    int active_blocks = 0;
+    int active_blocks = gs_amm_reserved_blocks();
     uint64 ap_grant_bytes = 0;
 
     state->buffer_active_granules = 0;
@@ -800,16 +887,22 @@ static void gs_amm_init_granule_table(GsAmmSharedState *state)
 {
     int granule_mb = gs_amm_configured_granule_mb();
     int granule_blocks = gs_amm_configured_granule_blocks();
-    int total_granules = gs_amm_total_granules_for_blocks(NORMAL_SHARED_BUFFER_NUM, granule_blocks);
+    int dynamic_first_buffer = gs_amm_dynamic_first_buffer_id();
+    int dynamic_blocks = gs_amm_dynamic_blocks();
+    int total_granules = gs_amm_total_granules_for_blocks(Max(dynamic_blocks, 1), granule_blocks);
 
     state->granule_mb = granule_mb;
     state->granule_blocks = granule_blocks;
     state->total_granules = total_granules;
+    state->reserved_buffer_blocks = gs_amm_reserved_blocks();
+    state->dynamic_first_buffer_id = dynamic_first_buffer;
 
     for (int i = 0; i < total_granules; i++) {
         GsAmmGranuleMeta *granule = &state->granules[i];
-        int first_buffer_id = i * granule_blocks;
-        int buffer_count = Min(granule_blocks, NORMAL_SHARED_BUFFER_NUM - first_buffer_id);
+        int first_buffer_id = dynamic_first_buffer + i * granule_blocks;
+        int buffer_count = Min(granule_blocks, dynamic_blocks - i * granule_blocks);
+        if (buffer_count < 0)
+            buffer_count = 0;
 
         granule->state = GS_AMM_GRANULE_BUFFER_ACTIVE;
         granule->generation = 1;
@@ -834,8 +927,12 @@ static void gs_amm_init_granule_table(GsAmmSharedState *state)
         granule->active_grant_bytes = 0;
         granule->used_bytes = 0;
         granule->alloc_cursor_bytes = 0;
+        granule->access_score = 0;
+        granule->last_access_tick = 0;
     }
     gs_amm_refresh_granule_counts_locked(state);
+    elog(LOG, "GS AMM granule table initialized: reserved_blocks=%d dynamic_blocks=%d granule_blocks=%d total_granules=%d",
+        state->reserved_buffer_blocks, dynamic_blocks, granule_blocks, total_granules);
 }
 
 static double gs_amm_dtree_min_bound_kb(void)
@@ -874,10 +971,26 @@ void GsAmmShmemInit(void)
         gs_amm_init_runtime_config(GsAmmState);
         gs_amm_init_granule_table(GsAmmState);
         GsAmmState->baseline_active_mb = (int)gs_amm_blocks_to_mb(StrategyActiveBufferCount());
-        GsAmmState->tp_pressure_state = GS_AMM_TP_PRESSURE_UNKNOWN;
+        /* Start in the low-flow state so the first AP can be admitted from
+         * dynamic/free inventory without waiting for the controller's first
+         * idle-skipped window.  Borrow still waits for a real TP sample via
+         * tp_buffer_hit_baseline_valid/tp_pressure_valid. */
+        GsAmmState->tp_pressure_state = GS_AMM_TP_PRESSURE_LOW_FLOW;
         GsAmmState->tp_pressure_valid = false;
         GsAmmState->tp_recovery_phase = GS_AMM_TP_RECOVERY_IDLE;
         GsAmmState->ap_multipass_only = false;
+        GsAmmState->resize_pending_target_blocks = 0;
+        GsAmmState->sb_cycle_state = GS_AMM_SB_STABLE;
+        GsAmmState->sb_cycle_ticks = 0;
+        GsAmmState->sb_restore_credit_mb = 0;
+        GsAmmState->ap_admit_credit_mb = 0;
+        GsAmmState->ap_admit_rate_scale_pct = 100;
+        GsAmmState->tp_prev_window_tps = 0;
+        GsAmmState->tp_jitter_pct = 0;
+        GsAmmState->tp_jitter_guarded = false;
+        GsAmmState->tp_jitter_pause_borrow = false;
+        GsAmmState->tp_jitter_pause_restore = false;
+        GsAmmState->tp_jitter_high_windows = 0;
         (void)snprintf_s(GsAmmState->last_supply_source, sizeof(GsAmmState->last_supply_source),
             sizeof(GsAmmState->last_supply_source) - 1, "%s", "none");
     }
@@ -936,14 +1049,86 @@ void gs_amm_dtree_detail(
     detail->admission_target_kb = (int)Min(Max(raw_bounds_kb[0], 1.0), (double)INT_MAX);
 }
 
+void GsAmmOperatorRegister(GsAmmOperatorHandle *handle, GsAmmOperatorType type,
+    uint64 grant_id, MemoryContext memory_context)
+{
+    if (handle == NULL)
+        return;
+    (void)memset_s(handle, sizeof(*handle), 0, sizeof(*handle));
+    handle->type = type;
+    handle->grant_id = grant_id;
+    handle->memory_context = memory_context;
+    handle->poll_count = 0;
+    handle->registered = true;
+}
+
+bool GsAmmOperatorPollReclaim(GsAmmOperatorHandle *handle)
+{
+    if (handle == NULL || !handle->registered)
+        return false;
+
+    /*
+     * Polling every tuple is measurable overhead for the hot path.  Check
+     * the per-backend reclaim flag once every 1024 polls; a TP-driven revoke
+     * is a slow signal, so a 1024-tuple latency is far below the controller's
+     * 1s decision window.
+     */
+    handle->poll_count++;
+    if ((handle->poll_count % 1024) != 0)
+        return false;
+
+    if (handle->grant_id == 0) {
+        /* Operators without an AMM grant (e.g. Seq Scan) have no granule to
+         * release, but still get a cheap poll for future ring control. */
+        return GsAmmGrantReclaimPending();
+    }
+
+    return GsAmmGrantReclaimPending();
+}
+
+Size GsAmmOperatorReleaseFreeMemory(GsAmmOperatorHandle *handle)
+{
+    Size released = 0;
+
+    if (handle == NULL || !handle->registered)
+        return 0;
+
+    if (handle->memory_context != NULL && IsA(handle->memory_context, AmmGranuleContext)) {
+        released = AmmGranuleContextReleaseFreeMemoryTree(handle->memory_context);
+        if (released > 0)
+            GsAmmRecordApReclaimPoll((uint64)released);
+    }
+
+    /*
+     * Confirm the pending reclaim once the operator has released free
+     * chunks.  This is what turns a TP-driven downgrade into a completed
+     * granule return.  It is safe to call unconditionally: the function is a
+     * no-op when no reclaim is pending for this backend.
+     */
+    if (GsAmmGrantReclaimPending())
+        (void)GsAmmGrantProcessPendingReclaim();
+
+    return released;
+}
+
+void GsAmmOperatorUnregister(GsAmmOperatorHandle *handle)
+{
+    if (handle == NULL)
+        return;
+    (void)memset_s(handle, sizeof(*handle), 0, sizeof(*handle));
+}
+
 bool GsAmmBufferIdIsInBufferGranule(int buf_id)
 {
-    return buf_id >= 0 && buf_id < NORMAL_SHARED_BUFFER_NUM;
+    int dynamic_first = gs_amm_dynamic_first_buffer_id();
+
+    return buf_id >= dynamic_first && buf_id < NORMAL_SHARED_BUFFER_NUM;
 }
 
 bool GsAmmBufferIdIsActive(int buf_id)
 {
     GsAmmSharedState *state = GsAmmState;
+    int dynamic_first;
     int granule_id;
     GsAmmGranuleToken token;
 
@@ -956,7 +1141,11 @@ bool GsAmmBufferIdIsActive(int buf_id)
     if (state == NULL || state->total_granules <= 0 || state->granule_blocks <= 0)
         return buf_id < StrategyActiveBufferCount();
 
-    granule_id = Min(buf_id / state->granule_blocks, state->total_granules - 1);
+    dynamic_first = state->dynamic_first_buffer_id;
+    if (buf_id < dynamic_first)
+        return true; /* reserved zone is always ordinary SB cache */
+
+    granule_id = Min((buf_id - dynamic_first) / state->granule_blocks, state->total_granules - 1);
     token = gs_amm_read_granule_token(&state->granules[granule_id]);
     return token.state == GS_AMM_GRANULE_BUFFER_ACTIVE;
 }
@@ -964,6 +1153,7 @@ bool GsAmmBufferIdIsActive(int buf_id)
 bool GsAmmBufferIdGetActiveToken(int buf_id, GsAmmGranuleToken *token)
 {
     GsAmmSharedState *state = GsAmmState;
+    int dynamic_first;
     int granule_id;
 
     if (token == NULL || buf_id < 0 || buf_id >= TOTAL_BUFFER_NUM)
@@ -975,7 +1165,11 @@ bool GsAmmBufferIdGetActiveToken(int buf_id, GsAmmGranuleToken *token)
     if (state == NULL || state->total_granules <= 0 || state->granule_blocks <= 0)
         return buf_id < StrategyActiveBufferCount();
 
-    granule_id = Min(buf_id / state->granule_blocks, state->total_granules - 1);
+    dynamic_first = state->dynamic_first_buffer_id;
+    if (buf_id < dynamic_first)
+        return true;
+
+    granule_id = Min((buf_id - dynamic_first) / state->granule_blocks, state->total_granules - 1);
     *token = gs_amm_read_granule_token(&state->granules[granule_id]);
     return token->state == GS_AMM_GRANULE_BUFFER_ACTIVE;
 }
@@ -983,6 +1177,7 @@ bool GsAmmBufferIdGetActiveToken(int buf_id, GsAmmGranuleToken *token)
 bool GsAmmBufferTokenIsActive(int buf_id, GsAmmGranuleToken token)
 {
     GsAmmSharedState *state = GsAmmState;
+    int dynamic_first;
     int granule_id;
     bool matches;
 
@@ -993,7 +1188,11 @@ bool GsAmmBufferTokenIsActive(int buf_id, GsAmmGranuleToken token)
     if (state == NULL || state->total_granules <= 0 || state->granule_blocks <= 0)
         return false;
 
-    granule_id = Min(buf_id / state->granule_blocks, state->total_granules - 1);
+    dynamic_first = state->dynamic_first_buffer_id;
+    if (buf_id < dynamic_first)
+        return token.state == GS_AMM_GRANULE_BUFFER_ACTIVE;
+
+    granule_id = Min((buf_id - dynamic_first) / state->granule_blocks, state->total_granules - 1);
     GsAmmGranuleToken current = gs_amm_read_granule_token(&state->granules[granule_id]);
     matches = current.state == GS_AMM_GRANULE_BUFFER_ACTIVE &&
         token.state == GS_AMM_GRANULE_BUFFER_ACTIVE &&
@@ -1009,6 +1208,7 @@ bool GsAmmBufferTokenIsActive(int buf_id, GsAmmGranuleToken token)
 bool GsAmmBufferIdIsDraining(int buf_id)
 {
     GsAmmSharedState *state = GsAmmState;
+    int dynamic_first;
     int granule_id;
     GsAmmGranuleToken token;
 
@@ -1017,7 +1217,8 @@ bool GsAmmBufferIdIsDraining(int buf_id)
     if (state == NULL || state->total_granules <= 0 || state->granule_blocks <= 0)
         return false;
 
-    granule_id = Min(buf_id / state->granule_blocks, state->total_granules - 1);
+    dynamic_first = state->dynamic_first_buffer_id;
+    granule_id = Min((buf_id - dynamic_first) / state->granule_blocks, state->total_granules - 1);
     token = gs_amm_read_granule_token(&state->granules[granule_id]);
     return token.state == GS_AMM_GRANULE_BUFFER_DRAINING;
 }
@@ -1093,6 +1294,7 @@ static void gs_amm_summarize_granules_locked(GsAmmSharedState *state, GsAmmGranu
 
     securec_check(rc, "\0", "\0");
     summary->total_granules = state->total_granules;
+    summary->buffer_active_blocks = gs_amm_reserved_blocks();
     for (int i = 0; i < state->total_granules; i++) {
         GsAmmGranuleMeta *granule = &state->granules[i];
 
@@ -1218,6 +1420,22 @@ static const char *gs_amm_tp_recovery_phase_name(GsAmmTpRecoveryPhase phase)
     }
 }
 
+static const char *gs_amm_sb_cycle_state_name(GsAmmSbCycleState state)
+{
+    switch (state) {
+        case GS_AMM_SB_STABLE:
+            return "stable";
+        case GS_AMM_SB_DRAINING:
+            return "draining";
+        case GS_AMM_SB_FLOOR:
+            return "floor";
+        case GS_AMM_SB_RESTORING:
+            return "restoring";
+        default:
+            return "unknown";
+    }
+}
+
 static void gs_amm_set_backpressure_reason_locked(GsAmmSharedState *state, const char *reason)
 {
     int rc;
@@ -1227,6 +1445,53 @@ static void gs_amm_set_backpressure_reason_locked(GsAmmSharedState *state, const
     rc = snprintf_s(state->last_backpressure_reason, sizeof(state->last_backpressure_reason),
         sizeof(state->last_backpressure_reason) - 1, "%s", reason);
     securec_check_ss(rc, "\0", "\0");
+}
+
+static int gs_amm_align_demand_mb_to_granule(int demand_mb, int granule_mb)
+{
+    uint64 aligned;
+
+    if (demand_mb <= 0)
+        return 0;
+    granule_mb = Max(granule_mb, GS_AMM_MIN_GRANULE_MB);
+    aligned = ((uint64)demand_mb + (uint64)granule_mb - 1) / (uint64)granule_mb * (uint64)granule_mb;
+    return (int)Min(aligned, (uint64)INT_MAX);
+}
+
+static bool gs_amm_ap_supply_allowed_locked(const GsAmmSharedState *state)
+{
+    if (state == NULL)
+        return false;
+    if (state->tp_pressure_hot || state->ap_downgrade_pending > 0 ||
+        state->resize_pending_target_blocks != 0)
+        return false;
+    if (state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW)
+        return true;
+    /* Recovery-wait with no running AP is safe to re-open for new APs; TP
+     * recovery has already drained the AP side.  Keeping the queue frozen
+     * here would permanently starve new APs just because TP has not yet
+     * satisfied the TPS/buffer-hit guard. */
+    if (state->tp_pressure_state == GS_AMM_TP_PRESSURE_RECOVERY_WAIT &&
+        state->active_ap_count == 0)
+        return true;
+    return false;
+}
+
+static bool gs_amm_force_multipass_locked(const GsAmmSharedState *state)
+{
+    if (state == NULL || !state->ap_multipass_only)
+        return false;
+    /* Under low TP pressure cache admission is allowed again, even if an
+     * earlier hot/warm recovery left the multipass latch set.  Only keep
+     * forcing multipass while TP is actually hot, the controller is outside
+     * the low-flow state, or a downgrade is still being confirmed. */
+    if (state->tp_pressure_hot ||
+        (state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW &&
+            !(state->tp_pressure_state == GS_AMM_TP_PRESSURE_RECOVERY_WAIT &&
+                state->active_ap_count == 0 && state->ap_downgrade_pending == 0)) ||
+        state->ap_downgrade_pending > 0)
+        return true;
+    return false;
 }
 
 static int gs_amm_queue_demand_mb(const GsAmmApQueueSlot *slot, const GsAmmSharedState *state)
@@ -1239,12 +1504,15 @@ static int gs_amm_queue_demand_mb(const GsAmmApQueueSlot *slot, const GsAmmShare
      * reclaim requests reduce already-admitted APs to one-pass separately;
      * the TP recovery multipass-only phase remains an explicit emergency
      * exception for APs re-entering after shared-buffer restoration. */
-    if (state != NULL && state->ap_multipass_only)
+    if (gs_amm_force_multipass_locked(state))
         demand_kb = (uint64)Max(slot->multi_pass_bound_kb, 1);
     else
         demand_kb = (uint64)Max(slot->admission_target_kb, 1);
-    return (int)Min(Max((demand_kb + 1023) / 1024, (uint64)gs_amm_ap_min_grant_mb),
+    int demand_mb = (int)Min(Max((demand_kb + 1023) / 1024, (uint64)gs_amm_ap_min_grant_mb),
         (uint64)INT_MAX);
+    if (!gs_amm_force_multipass_locked(state) && state != NULL && state->granule_mb > 0)
+        demand_mb = gs_amm_align_demand_mb_to_granule(demand_mb, state->granule_mb);
+    return demand_mb;
 }
 
 static void gs_amm_refresh_ap_queue_totals_locked(GsAmmSharedState *state)
@@ -1379,7 +1647,7 @@ static int gs_amm_record_target_kb_locked(const GsAmmSharedState *state, const G
     if (state == NULL || record == NULL)
         return 0;
     target_kb = gs_amm_ap_target_bound_kb(record);
-    if (state->ap_multipass_only)
+    if (gs_amm_force_multipass_locked(state))
         target_kb = record->multi_pass_bound_kb;
     if (state->stage == GS_AMM_STAGE_FORCE_ONEPASS ||
         (state->stage == GS_AMM_STAGE_CACHE_ONEPASS &&
@@ -2174,15 +2442,18 @@ bool GsAmmGrantProcessPendingReclaim(void)
             return false;
         }
         record->dynamic_granted_bytes = Max(minimum_bytes, record->dynamic_used_bytes);
-        if (state->ap_downgrade_pending > 0)
+        if (state->ap_downgrade_pending > 0) {
             state->ap_downgrade_pending--;
+            if (state->ap_downgrade_pending == 0)
+                state->tp_downgrade_windows = 0;
+        }
         record->reclaim_pending = false;
         record->reclaim_granule_id = -1;
         record->target_mode = GS_AMM_MEMORY_MODE_ONEPASS;
         record->mode = GS_AMM_MEMORY_MODE_ONEPASS;
         gs_amm_rebalance_ap_limits_locked(state);
         gs_amm_refresh_ap_totals_locked(state);
-        state->last_action = GS_AMM_TP_RECOVERY_DONE;
+        state->last_action = GS_AMM_TP_DOWNGRADE_APPLIED;
         SpinLockRelease(&state->mutex);
         return true;
     }
@@ -2200,15 +2471,18 @@ bool GsAmmGrantProcessPendingReclaim(void)
 
     record = gs_amm_find_ap_record_locked(state, token);
     if (record != NULL) {
-        if (record->reclaim_pending && state->ap_downgrade_pending > 0)
+        if (record->reclaim_pending && state->ap_downgrade_pending > 0) {
             state->ap_downgrade_pending--;
+            if (state->ap_downgrade_pending == 0)
+                state->tp_downgrade_windows = 0;
+        }
         record->reclaim_pending = false;
         record->reclaim_granule_id = -1;
         record->target_mode = GS_AMM_MEMORY_MODE_ONEPASS;
         record->mode = GS_AMM_MEMORY_MODE_ONEPASS;
     }
     state->tp_recovered_granules++;
-    state->last_action = GS_AMM_TP_RECOVERY_DONE;
+    state->last_action = GS_AMM_TP_DOWNGRADE_APPLIED;
     gs_amm_rebalance_ap_limits_locked(state);
     gs_amm_refresh_ap_totals_locked(state);
     gs_amm_refresh_granule_counts_locked(state);
@@ -3010,8 +3284,26 @@ void GsAmmOnEnabledGucChange(bool enabled)
         state->tp_tps_guarded = false;
         state->tp_window_completed_queries = 0;
         state->ap_borrow_buffer_hit_guarded = false;
+        state->tp_hot_windows = 0;
         state->ap_borrow_count = 0;
+        state->ap_borrow_retry_ticks = 0;
         state->last_ap_borrow_at = 0;
+        state->resize_pending_target_blocks = 0;
+        state->sb_cycle_state = GS_AMM_SB_STABLE;
+        state->sb_cycle_ticks = 0;
+        state->sb_restore_credit_mb = 0;
+        state->ap_admit_credit_mb = 0;
+        state->ap_admit_rate_scale_pct = 100;
+        state->tp_prev_window_tps = 0;
+        (void)memset_s(state->tp_tps_history, sizeof(state->tp_tps_history), 0,
+            sizeof(state->tp_tps_history));
+        state->tp_tps_history_count = 0;
+        state->tp_tps_history_index = 0;
+        state->tp_jitter_pct = 0;
+        state->tp_jitter_guarded = false;
+        state->tp_jitter_pause_borrow = false;
+        state->tp_jitter_pause_restore = false;
+        state->tp_jitter_high_windows = 0;
         /* Do not carry a previous TP recovery epoch into a new AMM epoch.
          * Otherwise every subsequent AP is admitted against its multi-pass
          * minimum instead of the model's one-pass bound. */
@@ -3678,27 +3970,24 @@ static void gs_amm_resize_core(int target_blocks, GsAmmResizeOutcome *out)
     out->rolled_back = false;
 
     if (target_blocks < active_buffers) {
-        for (int granule_id = state->total_granules - 1; granule_id >= 0 && final_active_buffers > target_blocks;
-             granule_id--) {
+        while (final_active_buffers > target_blocks) {
             GsAmmDrainStats stats;
-            int first_buffer_id;
-            int buffer_count;
+            int granule_id = -1;
+            int first_buffer_id = 0;
+            int buffer_count = 0;
             bool can_drain = false;
 
             SpinLockAcquire(&state->mutex);
-            if (state->granules[granule_id].state == GS_AMM_GRANULE_BUFFER_ACTIVE &&
-                state->granules[granule_id].first_buffer_id >= target_blocks) {
+            granule_id = gs_amm_pick_shrink_granule_locked(state, target_blocks);
+            if (granule_id >= 0) {
                 can_drain = true;
                 first_buffer_id = state->granules[granule_id].first_buffer_id;
                 buffer_count = state->granules[granule_id].buffer_count;
-            } else {
-                first_buffer_id = 0;
-                buffer_count = 0;
             }
             SpinLockRelease(&state->mutex);
 
             if (!can_drain)
-                continue;
+                break;
 
             if (gs_amm_drain_granule_with_operation(state, granule_id, &stats)) {
                 final_active_buffers = gs_amm_current_active_buffer_blocks(state);
@@ -3739,9 +4028,10 @@ static void gs_amm_resize_core(int target_blocks, GsAmmResizeOutcome *out)
 Datum gs_amm_status(PG_FUNCTION_ARGS)
 {
     GsAmmSharedState *state = gs_amm_get_state();
-    char status[4096];
+    char status[8192];
     int active_mb;
     int dynamic_target_mb;
+    int memory_target_mb;
     int dynamic_used_mb;
     int dynamic_pool_free_mb;
     uint64 dynamic_reserved_bytes;
@@ -3804,6 +4094,16 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
     uint64 tp_ap_stop_requested;
     uint64 tp_ap_stop_completed;
     uint64 tp_sb_restore_granules;
+    int resize_pending_target_blocks;
+    GsAmmSbCycleState sb_cycle_state;
+    int sb_cycle_ticks;
+    int ap_admit_credit_mb;
+    int ap_admit_rate_scale_pct;
+    int tp_jitter_pct;
+    bool tp_jitter_guarded;
+    bool tp_jitter_pause_borrow;
+    bool tp_jitter_pause_restore;
+    int tp_jitter_high_windows;
     GsAmmGranuleSummary granule_summary;
 
     SpinLockAcquire(&state->mutex);
@@ -3812,6 +4112,8 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
     if (active_mb <= 0)
         active_mb = (int)gs_amm_blocks_to_mb(StrategyActiveBufferCount());
     dynamic_target_mb = state->dynamic_target_mb;
+    memory_target_mb = gs_amm_memory_target_mb > 0 ? gs_amm_memory_target_mb :
+        (int)gs_amm_blocks_to_mb(NORMAL_SHARED_BUFFER_NUM) + dynamic_target_mb;
     dynamic_used_mb = state->dynamic_used_mb;
     dynamic_pool_free_mb = gs_amm_dynamic_free_mb_locked(state);
     dynamic_reserved_bytes = state->dynamic_reserved_bytes;
@@ -3880,9 +4182,20 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
     tp_ap_stop_requested = state->tp_ap_stop_requested;
     tp_ap_stop_completed = state->tp_ap_stop_completed;
     tp_sb_restore_granules = state->tp_sb_restore_granules;
+    resize_pending_target_blocks = state->resize_pending_target_blocks;
+    sb_cycle_state = state->sb_cycle_state;
+    sb_cycle_ticks = state->sb_cycle_ticks;
+    ap_admit_credit_mb = state->ap_admit_credit_mb;
+    ap_admit_rate_scale_pct = state->ap_admit_rate_scale_pct;
+    tp_jitter_pct = state->tp_jitter_pct;
+    tp_jitter_guarded = state->tp_jitter_guarded;
+    tp_jitter_pause_borrow = state->tp_jitter_pause_borrow;
+    tp_jitter_pause_restore = state->tp_jitter_pause_restore;
+    tp_jitter_high_windows = state->tp_jitter_high_windows;
     SpinLockRelease(&state->mutex);
     int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
-        "amm_enabled=%s active_mb=%d shared_buffers_min_mb=%d dynamic_target_mb=%d dynamic_used_mb=%d "
+        "amm_enabled=%s active_mb=%d shared_buffers_min_mb=%d reserved_mb=%d memory_target_mb=%d "
+        "dynamic_target_mb=%d dynamic_used_mb=%d "
         "dynamic_pool_target_mb=%d dynamic_pool_reserved_mb=%d dynamic_pool_used_mb=%d dynamic_pool_free_mb=%d "
         "active_ap_count=%d stage=%s ap_registry_count=%d ap_granted_bytes_total=%llu "
         "ap_used_bytes_total=%llu ap_reclaimable_bytes_total=%llu ap_queue_len=%d "
@@ -3903,9 +4216,14 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
         "ap_reclaim_poll_count=%llu ap_reclaim_operator_release_bytes=%llu "
         "tp_low_pressure_windows=%d tp_hot_clear_windows=%d tp_recovery_phase=%s ap_multipass_only=%s "
         "tp_ap_stop_requested=%llu tp_ap_stop_completed=%llu tp_sb_restore_granules=%llu "
+        "resize_pending_target_mb=%d sb_cycle_state=%s sb_cycle_ticks=%d "
+        "ap_admit_credit_mb=%d ap_admit_rate_scale_pct=%d "
+        "tp_jitter_pct=%d tp_jitter_guarded=%s tp_jitter_pause_borrow=%s "
+        "tp_jitter_pause_restore=%s tp_jitter_high_windows=%d "
         "native_model_version=%lld native_leaf_id=%lld native_label_override=%s native_last_reason=%s last_action=%s",
         gs_amm_enabled ? "true" : "false", active_mb, gs_amm_shared_buffers_min_mb,
-        dynamic_target_mb, dynamic_used_mb, dynamic_target_mb,
+        gs_amm_shared_buffers_reserved_mb,
+        memory_target_mb, dynamic_target_mb, dynamic_used_mb, dynamic_target_mb,
         (int)Min((dynamic_reserved_bytes + 1024 * 1024 - 1) / (1024 * 1024), (uint64)INT_MAX),
         (int)Min((dynamic_allocated_bytes + 1024 * 1024 - 1) / (1024 * 1024), (uint64)INT_MAX),
         dynamic_pool_free_mb, active_ap_count,
@@ -3942,6 +4260,16 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
         (unsigned long long)tp_ap_stop_requested,
         (unsigned long long)tp_ap_stop_completed,
         (unsigned long long)tp_sb_restore_granules,
+        (int)gs_amm_blocks_to_mb(resize_pending_target_blocks),
+        gs_amm_sb_cycle_state_name(sb_cycle_state),
+        sb_cycle_ticks,
+        ap_admit_credit_mb,
+        ap_admit_rate_scale_pct,
+        tp_jitter_pct,
+        tp_jitter_guarded ? "true" : "false",
+        tp_jitter_pause_borrow ? "true" : "false",
+        tp_jitter_pause_restore ? "true" : "false",
+        tp_jitter_high_windows,
         (long long)native_model_version,
         (long long)native_leaf_id,
         native_label_override ? "true" : "false",
@@ -3951,17 +4279,93 @@ Datum gs_amm_status(PG_FUNCTION_ARGS)
     PG_RETURN_TEXT_P(cstring_to_text(status));
 }
 
+Datum gs_amm_resize(PG_FUNCTION_ARGS)
+{
+    int target_mb = PG_GETARG_INT32(0);
+    int min_mb = Max(gs_amm_shared_buffers_min_mb, gs_amm_shared_buffers_reserved_mb);
+    int max_mb = (int)gs_amm_blocks_to_mb(NORMAL_SHARED_BUFFER_NUM);
+    int target_blocks;
+    GsAmmResizeOutcome outcome;
+    char status[512];
+
+    if (!superuser())
+        ereport(ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("gs_amm_resize is restricted to superusers")));
+    if (!gs_amm_enabled)
+        ereport(ERROR,
+            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                errmsg("gs_amm_resize requires gs_amm_enabled=on")));
+    if (target_mb < min_mb || target_mb > max_mb)
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("gs_amm_resize target %d MB is outside the supported range [%d, %d] MB",
+                    target_mb, min_mb, max_mb)));
+
+    target_blocks = gs_amm_align_resize_target_blocks(
+        gs_amm_mb_to_blocks(target_mb), NORMAL_SHARED_BUFFER_NUM);
+
+    /* Online resize is applied gradually by the controller tick.  Queuing the
+     * target here avoids a large one-shot drain that would stall TP backends
+     * and guarantees borrow/restore/AP admission stay frozen while the
+     * resize is in progress. */
+    GsAmmSharedState *state = gs_amm_get_state();
+    SpinLockAcquire(&state->mutex);
+    state->resize_pending_target_blocks = target_blocks;
+    SpinLockRelease(&state->mutex);
+
+    outcome.decision = "queued";
+    outcome.reason = "none";
+    outcome.target_blocks = target_blocks;
+    outcome.active_blocks = gs_amm_current_active_buffer_blocks(state);
+    outcome.pending_retire_blocks = Max(outcome.active_blocks - target_blocks, 0);
+    outcome.rolled_back = false;
+
+    int rc = snprintf_s(status, sizeof(status), sizeof(status) - 1,
+        "decision=%s reason=%s target_mb=%d target_blocks=%d active_blocks=%d active_mb=%lld "
+        "pending_retire_blocks=%d rolled_back=%s",
+        outcome.decision != NULL ? outcome.decision : "unknown",
+        outcome.reason != NULL ? outcome.reason : "none",
+        target_mb, target_blocks, outcome.active_blocks,
+        (long long)gs_amm_blocks_to_mb(outcome.active_blocks),
+        outcome.pending_retire_blocks, outcome.rolled_back ? "true" : "false");
+    securec_check_ss(rc, "\0", "\0");
+    PG_RETURN_TEXT_P(cstring_to_text(status));
+}
+
+static bool gs_amm_borrow_guard_locked(const GsAmmSharedState *state)
+{
+    /* Central guard for SB borrow.  It deliberately does not re-derive the
+     * one-window miss guard; the controller already publishes the smoothed
+     * guard flags (ap_borrow_buffer_hit_guarded, tp_tps_guarded,
+     * tp_jitter_pause_borrow) with hysteresis. */
+    if (state == NULL)
+        return false;
+    if (!state->tp_pressure_valid || state->tp_pressure_hot ||
+        state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW ||
+        state->ap_downgrade_pending > 0 ||
+        state->resize_pending_target_blocks != 0 ||
+        !state->tp_buffer_hit_baseline_valid)
+        return false;
+    /* TPS/jitter/miss guards only make sense after the first borrowed
+     * granule: they are comparing a post-borrow TP window against the
+     * pre-borrow baseline.  Before the first borrow they must not prevent
+     * the low-flow drain-sb admission from ever starting. */
+    if (state->ap_borrow_count > 0) {
+        if (state->tp_jitter_pause_borrow ||
+            state->tp_tps_guarded ||
+            state->ap_borrow_buffer_hit_guarded)
+            return false;
+    }
+    return true;
+}
+
 static bool gs_amm_prepare_dynamic_capacity(int ap_demand_mb)
 {
     GsAmmSharedState *state = gs_amm_get_state();
     int active_blocks;
     TimestampTz now;
     bool can_borrow = false;
-    uint64 window_hits;
-    uint64 window_reads;
-    uint64 window_accesses;
-    int window_pressure_pct;
-    int baseline_miss_pct;
 
     if (!gs_amm_enabled)
         return false;
@@ -3970,26 +4374,14 @@ static bool gs_amm_prepare_dynamic_capacity(int ap_demand_mb)
     /* A controller tick may not have consumed the current TP window yet.
      * Evaluate the counters in-place before shrinking SB so a newly hot TP
      * workload cannot lose a granule during that interval. */
-    window_hits = state->tp_window_shared_blks_hit;
-    window_reads = state->tp_window_shared_blks_read;
-    window_accesses = window_hits + window_reads;
-    window_pressure_pct = window_accesses > 0 ?
-        (int)((window_reads * 100) / window_accesses) : 0;
-    baseline_miss_pct = state->tp_buffer_hit_baseline_valid &&
-        state->tp_buffer_hit_baseline_accesses > 0 ?
-        Max(0, 100 - (int)((state->tp_buffer_hit_baseline_hits * 100) /
-            state->tp_buffer_hit_baseline_accesses)) : 0;
     if (gs_amm_dynamic_free_mb_locked(state) < ap_demand_mb &&
         gs_amm_dynamic_free_mb_locked(state) + gs_amm_free_granule_mb_locked(state) < ap_demand_mb &&
-        state->tp_pressure_valid && !state->tp_pressure_hot &&
-        state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW &&
-        state->ap_downgrade_pending == 0 &&
-        state->tp_buffer_hit_baseline_valid &&
-        !state->ap_borrow_buffer_hit_guarded &&
-        !(state->ap_borrow_count > 0 && window_accesses > 0 &&
-            gs_amm_tp_buffer_miss_threshold_pct > 0 &&
-            window_pressure_pct >= baseline_miss_pct + gs_amm_tp_buffer_miss_threshold_pct) &&
-        (state->last_ap_borrow_at == 0 || now - state->last_ap_borrow_at >= GS_AMM_TP_WINDOW_MS * 1000)) {
+        gs_amm_borrow_guard_locked(state) &&
+        (state->sb_cycle_state == GS_AMM_SB_STABLE ||
+            state->sb_cycle_state == GS_AMM_SB_DRAINING ||
+            state->sb_cycle_state == GS_AMM_SB_FLOOR) &&
+        (state->ap_borrow_count > 0 ||
+            state->ap_borrow_retry_ticks >= GS_AMM_AP_FIRST_BORROW_DELAY_TICKS)) {
         state->last_ap_borrow_at = now;
         can_borrow = true;
     }
@@ -3997,52 +4389,80 @@ static bool gs_amm_prepare_dynamic_capacity(int ap_demand_mb)
     if (!can_borrow)
         return false;
 
-    active_blocks = gs_amm_current_active_buffer_blocks(state);
     /* A free granule may have appeared after the first snapshot (for example
      * when TP recovery completed).  Recheck the complete supply order before
      * shrinking shared buffers so a lower-priority source is never consumed
      * while a higher-priority source is available. */
     SpinLockAcquire(&state->mutex);
-    window_hits = state->tp_window_shared_blks_hit;
-    window_reads = state->tp_window_shared_blks_read;
-    window_accesses = window_hits + window_reads;
-    window_pressure_pct = window_accesses > 0 ?
-        (int)((window_reads * 100) / window_accesses) : 0;
-    baseline_miss_pct = state->tp_buffer_hit_baseline_valid &&
-        state->tp_buffer_hit_baseline_accesses > 0 ?
-        Max(0, 100 - (int)((state->tp_buffer_hit_baseline_hits * 100) /
-            state->tp_buffer_hit_baseline_accesses)) : 0;
-    if (gs_amm_dynamic_free_mb_locked(state) >= ap_demand_mb ||
-        gs_amm_dynamic_free_mb_locked(state) + gs_amm_free_granule_mb_locked(state) >= ap_demand_mb ||
-        !state->tp_pressure_valid || state->tp_pressure_hot ||
-        state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW ||
-        state->ap_downgrade_pending > 0 ||
-        state->ap_borrow_buffer_hit_guarded || !state->tp_buffer_hit_baseline_valid ||
-        (state->ap_borrow_count > 0 && window_accesses > 0 &&
-            gs_amm_tp_buffer_miss_threshold_pct > 0 &&
-            window_pressure_pct >= baseline_miss_pct + gs_amm_tp_buffer_miss_threshold_pct)) {
+    if (gs_amm_dynamic_free_mb_locked(state) + gs_amm_free_granule_mb_locked(state) >= ap_demand_mb) {
+        SpinLockRelease(&state->mutex);
+        return true;
+    }
+    if (!gs_amm_borrow_guard_locked(state) ||
+        (state->sb_cycle_state != GS_AMM_SB_STABLE &&
+            state->sb_cycle_state != GS_AMM_SB_DRAINING &&
+            state->sb_cycle_state != GS_AMM_SB_FLOOR)) {
         state->last_ap_borrow_at = 0;
         SpinLockRelease(&state->mutex);
         return false;
     }
     SpinLockRelease(&state->mutex);
-    if (ap_demand_mb > 0 && active_blocks > gs_amm_mb_to_blocks(gs_amm_shared_buffers_min_mb)) {
+
+    /* Low TP pressure: keep borrowing granules, in capped batches, until the
+     * queued cache/one-pass demand is fully backed.  Before every batch the
+     * guard is re-checked so a TP miss-ratio/TPS-jitter degradation stops the
+     * borrowing immediately and lets the queue fall back to multipass. */
+    if (ap_demand_mb > 0) {
         GsAmmResizeOutcome outcome;
-        int target_blocks = Max(active_blocks - state->granule_blocks,
-            gs_amm_mb_to_blocks(gs_amm_shared_buffers_min_mb));
-        gs_amm_resize_core(gs_amm_align_resize_target_blocks(
-            target_blocks, NORMAL_SHARED_BUFFER_NUM), &outcome);
+        int dynamic_free_mb;
+        int free_granule_mb;
+        int deficit_mb;
+        int borrowable_blocks;
+        int borrow_blocks;
+        int max_borrow_blocks;
+        int target_blocks;
+
+        active_blocks = gs_amm_current_active_buffer_blocks(state);
+        SpinLockAcquire(&state->mutex);
+        dynamic_free_mb = gs_amm_dynamic_free_mb_locked(state);
+        free_granule_mb = gs_amm_free_granule_mb_locked(state);
+        deficit_mb = Max(ap_demand_mb - dynamic_free_mb - free_granule_mb, 0);
+        if (deficit_mb <= 0) {
+            SpinLockRelease(&state->mutex);
+            return true;
+        }
+        if (!gs_amm_borrow_guard_locked(state)) {
+            state->last_ap_borrow_at = 0;
+            SpinLockRelease(&state->mutex);
+            return false;
+        }
+        SpinLockRelease(&state->mutex);
+
+        borrowable_blocks = Max(active_blocks - gs_amm_reserved_blocks(), 0);
+        if (borrowable_blocks < state->granule_blocks)
+            return false;
+        max_borrow_blocks = GS_AMM_BORROW_MAX_GRANULES_PER_CALL * state->granule_blocks;
+        borrow_blocks = Min(gs_amm_mb_to_blocks(deficit_mb), borrowable_blocks);
+        borrow_blocks = Min(borrow_blocks, max_borrow_blocks);
+        borrow_blocks = Max(borrow_blocks, state->granule_blocks);
+        target_blocks = Max(active_blocks - borrow_blocks, gs_amm_reserved_blocks());
+        target_blocks = gs_amm_align_resize_target_blocks(
+            target_blocks, NORMAL_SHARED_BUFFER_NUM);
+        gs_amm_resize_core(target_blocks, &outcome);
+
         SpinLockAcquire(&state->mutex);
         if (outcome.decision == NULL || strcmp(outcome.decision, "shrunk") != 0) {
             state->last_ap_borrow_at = 0;
             SpinLockRelease(&state->mutex);
             return false;
-        } else {
-            state->last_action = GS_AMM_BORROW_FROM_BUFFER;
-            state->ap_borrow_count++;
-            (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
-                sizeof(state->last_supply_source) - 1, "%s", "shared_buffer");
         }
+        state->last_action = GS_AMM_BORROW_FROM_BUFFER;
+        state->ap_borrow_count++;
+        state->sb_cycle_state = GS_AMM_SB_DRAINING;
+        state->sb_cycle_ticks = 0;
+        state->sb_restore_credit_mb = 0;
+        (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
+            sizeof(state->last_supply_source) - 1, "%s", "shared_buffer");
         SpinLockRelease(&state->mutex);
         return true;
     }
@@ -4066,11 +4486,11 @@ static void gs_amm_supply_ap_demand(void)
     gs_amm_refresh_ap_target_totals_locked(state);
     /* TP recovery owns the allocator until all requested AP downgrades have
      * been confirmed.  Do not grow an existing AP or consume SB capacity. */
-    if (state->tp_pressure_hot || state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW ||
-        state->ap_downgrade_pending > 0) {
+    if (!gs_amm_ap_supply_allowed_locked(state)) {
         state->pending_demand_mb = 0;
         (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
-            sizeof(state->last_supply_source) - 1, "%s", "tp_recovery");
+            sizeof(state->last_supply_source) - 1, "%s",
+            state->resize_pending_target_blocks != 0 ? "resize_pending" : "tp_recovery");
         SpinLockRelease(&state->mutex);
         return;
     }
@@ -4115,13 +4535,17 @@ static void gs_amm_supply_ap_demand(void)
         /* Active APs are the first consumer of every higher-priority source,
          * but an outstanding active deficit must still be allowed to borrow
          * from shared buffers once dynamic and free-granule supply is empty. */
-        if (dynamic_free_mb + free_granule_mb < pending_mb)
+        if (dynamic_free_mb + free_granule_mb < pending_mb &&
+            (state->sb_cycle_state == GS_AMM_SB_STABLE ||
+                state->sb_cycle_state == GS_AMM_SB_DRAINING ||
+                state->sb_cycle_state == GS_AMM_SB_FLOOR) &&
+            (!state->tp_jitter_pause_borrow || state->ap_borrow_count == 0))
             should_borrow = true;
     }
     SpinLockRelease(&state->mutex);
 
     if (should_borrow)
-        (void)gs_amm_prepare_dynamic_capacity(Min(pending_mb, gs_amm_configured_granule_mb()));
+        (void)gs_amm_prepare_dynamic_capacity(pending_mb);
 }
 
 /*
@@ -4146,15 +4570,16 @@ static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_
 
     if (state == NULL || grant_token == NULL || granted_kb == NULL || grant_granules == NULL ||
         state->maintenance_resetting || state->active_ap_count >= GS_AMM_MAX_AP_REGISTRY ||
-        state->tp_pressure_hot || state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW ||
-        state->ap_downgrade_pending > 0)
+        !gs_amm_ap_supply_allowed_locked(state))
         return false;
     if (gs_amm_queue_has_entries_locked(state))
         return false;
 
-    demand_mb = (int)Min((Max((uint64)(state->ap_multipass_only ? multi_pass_bound_kb : admission_target_kb), 1) + 1023) / 1024,
+    demand_mb = (int)Min((Max((uint64)(gs_amm_force_multipass_locked(state) ? multi_pass_bound_kb : admission_target_kb), 1) + 1023) / 1024,
         (uint64)INT_MAX);
     demand_mb = Max(demand_mb, gs_amm_ap_min_grant_mb);
+    if (!gs_amm_force_multipass_locked(state) && state->granule_mb > 0)
+        demand_mb = gs_amm_align_demand_mb_to_granule(demand_mb, state->granule_mb);
     dynamic_free_mb = gs_amm_dynamic_free_mb_locked(state);
     free_granule_mb = gs_amm_free_granule_mb_locked(state);
     if (dynamic_free_mb + free_granule_mb < demand_mb)
@@ -4179,8 +4604,8 @@ static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_
     }
     if (!gs_amm_register_ap_locked(state, token, cache_bound_kb, one_pass_bound_kb,
         multi_pass_bound_kb, admission_target_kb, demand_mb * 1024, (uint64)dynamic_grant_kb * 1024,
-    state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
-        state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
+    gs_amm_force_multipass_locked(state) ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
+        gs_amm_force_multipass_locked(state) ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
         t_thrd.proc_cxt.MyProcPid, t_thrd.proc->backendId)) {
         (void)gs_amm_forward_unwind_ap_granules_locked(state, token);
         gs_amm_refresh_granule_counts_locked(state);
@@ -4205,6 +4630,7 @@ static bool gs_amm_try_admit_ap_locked(GsAmmSharedState *state, int cache_bound_
 static void gs_amm_process_ap_queue(void)
 {
     GsAmmSharedState *state = gs_amm_get_state();
+    bool borrow_failed = false;
 
     for (;;) {
         GsAmmApQueueSlot wake_slot;
@@ -4224,17 +4650,30 @@ static void gs_amm_process_ap_queue(void)
         bool granted = false;
         bool need_capacity = false;
         bool registry_full = false;
+        bool grant_multipass = false;
         GsAmmGranuleSummary granule_summary;
 
         (void)memset_s(&wake_slot, sizeof(wake_slot), 0, sizeof(wake_slot));
         SpinLockAcquire(&state->mutex);
+        if (gs_amm_ap_admit_rate_mb_per_s > 0) {
+            int token_cap = Max(gs_amm_ap_admit_rate_mb_per_s * 2,
+                Max(state->granule_mb * 2, state->dynamic_target_mb));
+            int effective_rate = gs_amm_ap_admit_rate_mb_per_s;
+
+            if (state->ap_admit_rate_scale_pct != 100)
+                effective_rate = Max(effective_rate * state->ap_admit_rate_scale_pct / 100, 1);
+            state->ap_admit_credit_mb = Min(token_cap, state->ap_admit_credit_mb + effective_rate);
+        }
         GsAmmApQueueSlot *head = gs_amm_queue_head_locked(state);
-        if (state->tp_pressure_hot || state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW ||
-            state->ap_downgrade_pending > 0) {
-            gs_amm_set_backpressure_reason_locked(state, "tp_recovery");
+        if (!gs_amm_ap_supply_allowed_locked(state)) {
+            if (state->resize_pending_target_blocks != 0)
+                gs_amm_set_backpressure_reason_locked(state, "resize_pending");
+            else
+                gs_amm_set_backpressure_reason_locked(state, "tp_recovery");
             SpinLockRelease(&state->mutex);
             return;
         }
+        grant_multipass = gs_amm_force_multipass_locked(state);
         if (head == NULL) {
             SpinLockRelease(&state->mutex);
             return;
@@ -4244,7 +4683,18 @@ static void gs_amm_process_ap_queue(void)
         free_granule_mb = gs_amm_free_granule_mb_locked(state);
         gs_amm_summarize_granules_locked(state, &granule_summary);
         active_buffer_mb = (int)gs_amm_blocks_to_mb(granule_summary.buffer_active_blocks);
-        sb_borrowable_mb = Max(active_buffer_mb - gs_amm_shared_buffers_min_mb, 0);
+        sb_borrowable_mb = Max(active_buffer_mb - (int)gs_amm_blocks_to_mb(gs_amm_reserved_blocks()), 0);
+        if ((state->sb_cycle_state != GS_AMM_SB_STABLE &&
+                state->sb_cycle_state != GS_AMM_SB_DRAINING &&
+                state->sb_cycle_state != GS_AMM_SB_FLOOR) ||
+            (state->tp_jitter_pause_borrow && state->ap_borrow_count > 0) ||
+            state->resize_pending_target_blocks != 0 ||
+            !state->tp_pressure_valid || !state->tp_buffer_hit_baseline_valid ||
+            (state->ap_borrow_buffer_hit_guarded && state->ap_borrow_count > 0) ||
+            state->tp_pressure_hot ||
+            state->tp_pressure_state != GS_AMM_TP_PRESSURE_LOW_FLOW ||
+            state->ap_downgrade_pending > 0)
+            sb_borrowable_mb = 0;
         available_mb = (int64)dynamic_free_mb + free_granule_mb + sb_borrowable_mb;
         demand_kb = (int64)demand_mb * 1024;
         dynamic_free_kb = (int64)dynamic_free_mb * 1024;
@@ -4252,18 +4702,71 @@ static void gs_amm_process_ap_queue(void)
         need_capacity = available_mb < demand_mb;
         /* Convert borrowable SB capacity into a free granule before trying
          * to reserve the queue head.  A queue slot is only left blocked once
-         * the SB floor has been reached. */
-        if (!state->maintenance_resetting && !registry_full &&
+         * the SB floor has been reached.  If borrowing does not make progress
+         * (for example because only a small dynamic zone remains), fall
+         * through to the multipass compression path below instead of retrying
+         * the same failed borrow every tick. */
+        if (!state->maintenance_resetting && !registry_full && !borrow_failed &&
+            (!state->tp_jitter_pause_borrow || state->ap_borrow_count == 0) &&
+            (state->sb_cycle_state == GS_AMM_SB_STABLE ||
+                state->sb_cycle_state == GS_AMM_SB_DRAINING ||
+                state->sb_cycle_state == GS_AMM_SB_FLOOR) &&
             dynamic_free_mb + free_granule_mb < demand_mb && sb_borrowable_mb > 0) {
+            bool borrowed;
+
             SpinLockRelease(&state->mutex);
-            (void)gs_amm_prepare_dynamic_capacity(demand_mb);
-            return;
+            borrowed = gs_amm_prepare_dynamic_capacity(demand_mb);
+            if (borrowed) {
+                SpinLockAcquire(&state->mutex);
+                state->ap_borrow_retry_ticks = 0;
+                SpinLockRelease(&state->mutex);
+                return;
+            }
+            SpinLockAcquire(&state->mutex);
+            state->ap_borrow_retry_ticks++;
+            if (state->ap_borrow_retry_ticks <= GS_AMM_AP_BORROW_RETRY_TICKS) {
+                /* The SB drain is still making progress (or the guard
+                 * currently pauses further batches).  Keep the queue head
+                 * waiting instead of compressing it to multipass after a
+                 * single deferred borrow attempt. */
+                gs_amm_set_backpressure_reason_locked(state, "borrow_drain_pending");
+                SpinLockRelease(&state->mutex);
+                return;
+            }
+            state->ap_borrow_retry_ticks = 0;
+            borrow_failed = true;
+            continue;
         }
-        if (state->maintenance_resetting || registry_full || need_capacity) {
+        if (state->maintenance_resetting || registry_full) {
             if (registry_full)
                 gs_amm_set_backpressure_reason_locked(state, "registry_full");
-            else if (need_capacity)
+            SpinLockRelease(&state->mutex);
+            return;
+        }
+        /* Once SB is already at its floor, stop awarding the whole remaining
+         * pool to the FIFO head.  Compress the queued session to its
+         * multi-pass bound so several slow APs can make progress concurrently
+         * and the shared buffer floor is never drained further.  Only when
+         * even that minimum grant cannot be backed does the queue become
+         * backpressure-bound. */
+        if (need_capacity) {
+            int multipass_mb = (int)Max((head->multi_pass_bound_kb + 1023) / 1024,
+                gs_amm_ap_min_grant_mb);
+            int available_now_mb = (int)Min(available_mb, (int64)(INT_MAX / 1024));
+
+            if (available_now_mb < gs_amm_ap_min_grant_mb) {
                 gs_amm_set_backpressure_reason_locked(state, "capacity_floor");
+                SpinLockRelease(&state->mutex);
+                return;
+            }
+            demand_mb = Min(available_now_mb, multipass_mb);
+            demand_kb = (int64)demand_mb * 1024;
+            grant_multipass = true;
+            (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
+                sizeof(state->last_supply_source) - 1, "%s", "multipass");
+        }
+        if (gs_amm_ap_admit_rate_mb_per_s > 0 && state->ap_admit_credit_mb < demand_mb) {
+            gs_amm_set_backpressure_reason_locked(state, "admit_rate");
             SpinLockRelease(&state->mutex);
             return;
         }
@@ -4289,8 +4792,8 @@ static void gs_amm_process_ap_queue(void)
                     head->one_pass_bound_kb, head->multi_pass_bound_kb, head->admission_target_kb,
                     demand_mb * 1024,
                     (uint64)dynamic_grant_kb * 1024,
-                    state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
-                    state->ap_multipass_only ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
+                    grant_multipass ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
+                    grant_multipass ? GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE,
                     /* The queue is admitted by the controller/backend that
                      * happens to process the FIFO head, but cancellation must
                      * target the AP backend that owns the waiting slot. */
@@ -4302,12 +4805,14 @@ static void gs_amm_process_ap_queue(void)
                     state->last_prediction_mb = head->prediction_mb;
                     state->last_action = GS_AMM_AP_EXPAND;
                     state->ap_queue_admit_count++;
+                    if (gs_amm_ap_admit_rate_mb_per_s > 0)
+                        state->ap_admit_credit_mb = Max(state->ap_admit_credit_mb - demand_mb, 0);
                     wake_slot = *head;
                     wake_slot.state = GS_AMM_AP_QUEUE_GRANTED;
                     wake_slot.grant_token = token;
                     wake_slot.granted_kb = demand_mb * 1024;
                     wake_slot.grant_granules = grant_granules;
-                    wake_slot.memory_mode = state->ap_multipass_only ?
+                    wake_slot.memory_mode = grant_multipass ?
                         GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE;
                     *head = wake_slot;
                     gs_amm_refresh_ap_totals_locked(state);
@@ -4383,8 +4888,6 @@ static bool gs_amm_request_tp_downgrade_locked(GsAmmSharedState *state)
     best->reclaim_pending = true;
     best->reclaim_granule_id = best_granule_id;
     best->target_mode = GS_AMM_MEMORY_MODE_ONEPASS;
-    if (best->revoke_epoch != PG_UINT64_MAX)
-        best->revoke_epoch++;
     state->ap_downgrade_pending++;
     state->tp_recovery_requested_granules++;
     gs_amm_rebalance_ap_limits_locked(state);
@@ -4404,6 +4907,299 @@ static bool gs_amm_expand_one_tp_granule(GsAmmSharedState *state)
         return false;
     final_blocks = gs_amm_expand_granules(state, target_blocks, false);
     return final_blocks > active_blocks;
+}
+
+static uint64 gs_amm_granule_access_score(GsAmmGranuleMeta *granule)
+{
+    uint64 score = 0;
+
+    if (granule == NULL || granule->buffer_count <= 0)
+        return 0;
+
+    for (int offset = 0; offset < granule->buffer_count; offset++) {
+        BufferDesc *buf = GetBufferDescriptor(granule->first_buffer_id + offset);
+        uint64 buf_state = LockBufHdr(buf);
+
+        score += BUF_STATE_GET_USAGECOUNT(buf_state);
+        UnlockBufHdr(buf, buf_state);
+    }
+    return score;
+}
+
+static bool gs_amm_has_active_granule_above_locked(const GsAmmSharedState *state, int granule_id)
+{
+    if (state == NULL)
+        return false;
+    for (int i = granule_id + 1; i < state->total_granules; i++) {
+        if (state->granules[i].state == GS_AMM_GRANULE_BUFFER_ACTIVE)
+            return true;
+    }
+    return false;
+}
+
+static int gs_amm_pick_shrink_granule_locked(GsAmmSharedState *state, int target_blocks)
+{
+    int best_id = -1;
+    uint64 best_score = PG_UINT64_MAX;
+
+    if (state == NULL)
+        return -1;
+
+    for (int i = state->total_granules - 1; i >= 0; i--) {
+        GsAmmGranuleMeta *granule = &state->granules[i];
+
+        if (granule->state != GS_AMM_GRANULE_BUFFER_ACTIVE || granule->scan_inflight)
+            continue;
+        if (granule->first_buffer_id < target_blocks)
+            continue;
+        /* Shared-buffer contiguity requires the drained granule to be the
+         * highest active granule.  Cold selection is therefore only effective
+         * when a single resize request drains multiple granules; for the
+         * single-granule borrow case this still records the eviction score. */
+        if (gs_amm_borrow_cold_granules) {
+            if (gs_amm_has_active_granule_above_locked(state, i))
+                continue;
+            uint64 score = gs_amm_granule_access_score(granule);
+            granule->access_score = score;
+            granule->last_access_tick = GetCurrentTimestamp();
+            if (best_id < 0 || score < best_score) {
+                best_id = i;
+                best_score = score;
+            }
+        } else {
+            return i;
+        }
+    }
+
+    return best_id;
+}
+
+static void gs_amm_controller_resize_step(GsAmmSharedState *state)
+{
+    int pending_target;
+    int active_blocks;
+    int step_granules;
+    int64 step_blocks;
+    int target_blocks;
+    GsAmmResizeOutcome outcome;
+
+    if (state == NULL)
+        return;
+
+    SpinLockAcquire(&state->mutex);
+    pending_target = state->resize_pending_target_blocks;
+    SpinLockRelease(&state->mutex);
+    if (pending_target == 0)
+        return;
+
+    active_blocks = gs_amm_current_active_buffer_blocks(state);
+    if (active_blocks == pending_target) {
+        SpinLockAcquire(&state->mutex);
+        state->resize_pending_target_blocks = 0;
+        SpinLockRelease(&state->mutex);
+        return;
+    }
+
+    step_granules = Max(gs_amm_resize_granule_per_tick, 1);
+    step_blocks = (int64)step_granules * state->granule_blocks;
+    if (pending_target < active_blocks)
+        target_blocks = Max((int64)active_blocks - step_blocks, (int64)pending_target);
+    else
+        target_blocks = Min((int64)active_blocks + step_blocks, (int64)pending_target);
+    target_blocks = gs_amm_align_resize_target_blocks((int)target_blocks, NORMAL_SHARED_BUFFER_NUM);
+
+    if (target_blocks == active_blocks)
+        return;
+
+    gs_amm_resize_core(target_blocks, &outcome);
+
+    active_blocks = gs_amm_current_active_buffer_blocks(state);
+    if (active_blocks == pending_target) {
+        SpinLockAcquire(&state->mutex);
+        state->resize_pending_target_blocks = 0;
+        state->last_action = GS_AMM_TP_BUFFER_BASELINE_RESTORE;
+        SpinLockRelease(&state->mutex);
+    }
+}
+
+static void gs_amm_controller_sb_cycle_step(GsAmmSharedState *state)
+{
+    bool restore_now = false;
+    int baseline_blocks = 0;
+
+    if (state == NULL)
+        return;
+
+    SpinLockAcquire(&state->mutex);
+    if (state->resize_pending_target_blocks == 0) {
+        bool ap_demand_pending = gs_amm_queue_has_entries_locked(state) ||
+            gs_amm_active_ap_growth_pending_locked(state) ||
+            state->pending_demand_mb > 0;
+
+        if (state->sb_cycle_state == GS_AMM_SB_DRAINING) {
+            state->sb_cycle_state = GS_AMM_SB_FLOOR;
+            state->sb_cycle_ticks = 0;
+            state->sb_restore_credit_mb = 0;
+        } else if (state->sb_cycle_state == GS_AMM_SB_FLOOR) {
+            /* Keep the SB floor while AP capacity is still being borrowed. */
+            if (ap_demand_pending)
+                state->sb_cycle_ticks = 0;
+            else {
+                state->sb_cycle_ticks++;
+                if (state->sb_cycle_ticks >= Max(gs_amm_restore_delay_ticks, 0)) {
+                    state->sb_cycle_state = GS_AMM_SB_RESTORING;
+                    state->sb_cycle_ticks = 0;
+                }
+            }
+        } else if (state->sb_cycle_state == GS_AMM_SB_RESTORING && ap_demand_pending) {
+            /* AP demand reappeared while restoring: stop and hold the floor
+             * again until the next low-pressure admission is satisfied. */
+            state->sb_cycle_state = GS_AMM_SB_FLOOR;
+            state->sb_cycle_ticks = 0;
+            state->sb_restore_credit_mb = 0;
+        }
+    }
+
+    if (state->sb_cycle_state == GS_AMM_SB_RESTORING && !state->tp_jitter_pause_restore &&
+        state->resize_pending_target_blocks == 0 &&
+        !gs_amm_queue_has_entries_locked(state) &&
+        !gs_amm_active_ap_growth_pending_locked(state) &&
+        state->pending_demand_mb == 0) {
+        int rate_mb = Max(gs_amm_restore_rate_mb_per_s, 0);
+
+        if (rate_mb == 0)
+            state->sb_restore_credit_mb = state->granule_mb;
+        else
+            state->sb_restore_credit_mb += rate_mb;
+        if (state->sb_restore_credit_mb >= state->granule_mb)
+            restore_now = true;
+    }
+    baseline_blocks = gs_amm_mb_to_blocks(state->baseline_active_mb);
+    SpinLockRelease(&state->mutex);
+
+    if (!restore_now)
+        return;
+
+    if (gs_amm_expand_one_tp_granule(state)) {
+        int active_blocks = gs_amm_current_active_buffer_blocks(state);
+
+        SpinLockAcquire(&state->mutex);
+        state->sb_restore_credit_mb = Max(state->sb_restore_credit_mb - state->granule_mb, 0);
+        if (active_blocks >= baseline_blocks) {
+            state->sb_cycle_state = GS_AMM_SB_STABLE;
+            state->sb_cycle_ticks = 0;
+            state->sb_restore_credit_mb = 0;
+        }
+        state->last_action = GS_AMM_TP_BUFFER_BASELINE_RESTORE;
+        SpinLockRelease(&state->mutex);
+    } else {
+        int active_blocks = gs_amm_current_active_buffer_blocks(state);
+
+        if (active_blocks >= baseline_blocks) {
+            SpinLockAcquire(&state->mutex);
+            state->sb_cycle_state = GS_AMM_SB_STABLE;
+            state->sb_cycle_ticks = 0;
+            state->sb_restore_credit_mb = 0;
+            SpinLockRelease(&state->mutex);
+        }
+    }
+}
+
+/* TP hot recovery step.  The controller first asks the least-used active AP
+ * granule/backend to spill and return a granule (graceful downgrade).  Only
+ * after GS_AMM_TP_DOWNGRADE_WINDOWS consecutive hot windows with no confirmed
+ * downgrade does it escalate to cancel-and-stop. */
+static bool gs_amm_tp_hot_recovery_step_locked(GsAmmSharedState *state, bool set_multipass_only)
+{
+    if (state == NULL)
+        return false;
+
+    if (state->ap_downgrade_pending > 0) {
+        state->tp_downgrade_windows++;
+        if (state->tp_downgrade_windows >= GS_AMM_TP_DOWNGRADE_WINDOWS) {
+            gs_amm_request_ap_stop_locked(state);
+            state->last_action = GS_AMM_TP_DOWNGRADE_PENDING;
+            return true;
+        }
+        state->last_action = GS_AMM_TP_DOWNGRADE_PENDING;
+        return false;
+    }
+
+    state->tp_downgrade_windows = 0;
+    if (state->active_ap_count == 0)
+        return false;
+
+    if (gs_amm_request_tp_downgrade_locked(state)) {
+        /* Hot recovery keeps future APs in multipass until TP is stable again.
+         * Warm early downgrade only spills the current AP; future APs may
+         * re-enter with cache/one-pass admission once low TP pressure holds. */
+        if (set_multipass_only)
+            state->ap_multipass_only = true;
+        state->last_action = GS_AMM_TP_DOWNGRADE_PENDING;
+    }
+    return false;
+}
+
+static void gs_amm_update_tp_jitter_locked(GsAmmSharedState *state, uint64 tps)
+{
+    int count;
+    double mean;
+    double variance;
+    double stdev;
+
+    if (state == NULL)
+        return;
+
+    state->tp_tps_history[state->tp_tps_history_index] = (int)Min(tps, (uint64)INT_MAX);
+    state->tp_tps_history_index =
+        (state->tp_tps_history_index + 1) % GS_AMM_TPS_JITTER_WINDOW_SAMPLES;
+    state->tp_tps_history_count = Min(
+        state->tp_tps_history_count + 1, GS_AMM_TPS_JITTER_WINDOW_SAMPLES);
+    count = state->tp_tps_history_count;
+
+    if (count < 3) {
+        state->tp_jitter_pct = 0;
+        state->tp_jitter_guarded = false;
+        return;
+    }
+
+    mean = 0.0;
+    for (int i = 0; i < count; i++)
+        mean += (double)state->tp_tps_history[i];
+    mean /= (double)count;
+
+    variance = 0.0;
+    for (int i = 0; i < count; i++) {
+        double delta = (double)state->tp_tps_history[i] - mean;
+
+        variance += delta * delta;
+    }
+    variance /= (double)count;
+    stdev = sqrt(variance);
+    state->tp_jitter_pct = mean > 0.0 ?
+        (int)Min(stdev * 100.0 / mean, 1000.0) : 0;
+    state->tp_jitter_guarded = gs_amm_tp_jitter_threshold_pct > 0 &&
+        state->tp_jitter_pct > gs_amm_tp_jitter_threshold_pct;
+
+    /* The jitter ladder only makes sense while AP work exists.  Sporadic
+     * single TP queries (for example a monitoring script) would otherwise
+     * produce a misleadingly high coefficient of variation and pause
+     * borrow/restore forever. */
+    if (state->tp_jitter_guarded && (state->active_ap_count > 0 || state->queued_ap_count > 0)) {
+        state->tp_jitter_high_windows++;
+        if (state->tp_jitter_high_windows == 1) {
+            state->ap_admit_rate_scale_pct = 50;
+        } else if (state->tp_jitter_high_windows == 2) {
+            state->tp_jitter_pause_borrow = true;
+        } else if (state->tp_jitter_high_windows == 3) {
+            state->tp_jitter_pause_restore = true;
+        }
+    } else {
+        state->tp_jitter_high_windows = 0;
+        state->ap_admit_rate_scale_pct = 100;
+        state->tp_jitter_pause_borrow = false;
+        state->tp_jitter_pause_restore = false;
+    }
 }
 
 void GsAmmRecordTpBufferUsage(uint64 shared_blks_hit, uint64 shared_blks_read,
@@ -4429,6 +5225,18 @@ void GsAmmRecordTpBufferUsage(uint64 shared_blks_hit, uint64 shared_blks_read,
     SpinLockRelease(&state->mutex);
 }
 
+void GsAmmRecordTpCpuUsage(uint64 cpu_us)
+{
+    GsAmmSharedState *state;
+
+    if (!gs_amm_enabled || gs_amm_workload_role != GS_AMM_WORKLOAD_TP || cpu_us == 0)
+        return;
+    state = gs_amm_get_state();
+    SpinLockAcquire(&state->mutex);
+    state->tp_window_cpu_us += cpu_us;
+    SpinLockRelease(&state->mutex);
+}
+
 void GsAmmRecordApReclaimPoll(uint64 released_bytes)
 {
     GsAmmSharedState *state;
@@ -4447,6 +5255,18 @@ void GsAmmRecordApReclaimPoll(uint64 released_bytes)
         state->ap_reclaim_operator_release_bytes += released_bytes;
     }
     SpinLockRelease(&state->mutex);
+}
+
+static int gs_amm_host_cpu_count(void)
+{
+    static int cached = 0;
+    long online;
+
+    if (cached > 0)
+        return cached;
+    online = sysconf(_SC_NPROCESSORS_ONLN);
+    cached = (online > 0) ? (int)online : 1;
+    return cached;
 }
 
 /* Read aggregate host CPU jiffies.  The controller stores consecutive
@@ -4515,8 +5335,21 @@ void GsAmmControllerTick(void)
     if (!gs_amm_enabled)
         return;
     state = gs_amm_get_state();
+
+    if (gs_amm_controller_idle_sleep) {
+        bool idle;
+
+        SpinLockAcquire(&state->mutex);
+        idle = state->active_ap_count == 0 && state->queued_ap_count == 0 &&
+            state->tp_recovery_phase == GS_AMM_TP_RECOVERY_IDLE &&
+            state->resize_pending_target_blocks == 0 &&
+            state->sb_cycle_state == GS_AMM_SB_STABLE;
+        SpinLockRelease(&state->mutex);
+        if (idle)
+            return;
+    }
+
     now = GetCurrentTimestamp();
-    cpu_sample_valid = gs_amm_read_host_cpu_jiffies(&cpu_total_jiffies, &cpu_idle_jiffies);
     test_mode = gs_amm_tp_test_mode;
     test_worker_surge = gs_amm_tp_test_worker_surge;
     SpinLockAcquire(&state->mutex);
@@ -4535,23 +5368,35 @@ void GsAmmControllerTick(void)
         return;
     }
     state->tp_last_window_at = now;
+    /* Apply queued online resize and the borrow/restore one-way state machine
+     * before collecting this window's pressure samples.  Both operations may
+     * sleep (buffer drain/expand) and must run without the state spinlock. */
+    SpinLockRelease(&state->mutex);
+    gs_amm_controller_resize_step(state);
+    gs_amm_controller_sb_cycle_step(state);
+    SpinLockAcquire(&state->mutex);
     /* A test worker publishes a short shared lease.  Pagewriter owns the
      * one-second tick, so a thread-local test GUC alone would be invisible
      * to the process that makes the scheduling decision. */
     test_mode = state->tp_test_mode_until > now;
     test_worker_surge = state->tp_test_worker_surge_until > now;
+    /* Host CPU is a diagnostic snapshot only.  The pressure guard consumes
+     * TP-attributable CPU, so an AP sort saturating a single-core host can no
+     * longer be mistaken for a TP surge. */
+    cpu_sample_valid = gs_amm_read_host_cpu_jiffies(&cpu_total_jiffies, &cpu_idle_jiffies);
     if (cpu_sample_valid) {
-        if (state->tp_cpu_util_valid && cpu_total_jiffies > state->tp_cpu_last_total_jiffies) {
-            uint64 total_delta = cpu_total_jiffies - state->tp_cpu_last_total_jiffies;
-            uint64 idle_delta = cpu_idle_jiffies >= state->tp_cpu_last_idle_jiffies ?
-                cpu_idle_jiffies - state->tp_cpu_last_idle_jiffies : 0;
-
-            idle_delta = Min(idle_delta, total_delta);
-            cpu_util_pct = (int)(((total_delta - idle_delta) * 100) / total_delta);
-            state->tp_cpu_util_pct = cpu_util_pct;
-        }
         state->tp_cpu_last_total_jiffies = cpu_total_jiffies;
         state->tp_cpu_last_idle_jiffies = cpu_idle_jiffies;
+    }
+    {
+        uint64 tp_cpu_us = state->tp_window_cpu_us;
+        uint64 window_capacity_us =
+            (uint64)GS_AMM_TP_WINDOW_MS * 1000 * (uint64)gs_amm_host_cpu_count();
+
+        state->tp_window_cpu_us = 0;
+        if (window_capacity_us > 0)
+            cpu_util_pct = (int)Min((tp_cpu_us * 100) / window_capacity_us, (uint64)100);
+        state->tp_cpu_util_pct = cpu_util_pct;
         state->tp_cpu_util_valid = true;
     }
     hits = state->tp_window_shared_blks_hit;
@@ -4563,7 +5408,9 @@ void GsAmmControllerTick(void)
         bool empty_window_hot = false;
         bool restore_after_empty = false;
 
+        state->tp_prev_window_tps = state->tp_recent_tps;
         state->tp_recent_tps = completed_queries;
+        gs_amm_update_tp_jitter_locked(state, completed_queries);
         state->tp_window_shared_blks_hit = 0;
         state->tp_window_shared_blks_read = 0;
         state->tp_window_completed_queries = 0;
@@ -4580,7 +5427,10 @@ void GsAmmControllerTick(void)
                 state->tp_pressure_hot = false;
                 state->tp_pressure_state = GS_AMM_TP_PRESSURE_LOW_FLOW;
             }
-            bool allow_ap_supply = state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW &&
+            bool allow_ap_supply = state->tp_pressure_valid &&
+                (state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW ||
+                    (state->tp_pressure_state == GS_AMM_TP_PRESSURE_RECOVERY_WAIT &&
+                        state->active_ap_count == 0)) &&
                 state->ap_downgrade_pending == 0;
             SpinLockRelease(&state->mutex);
             if (allow_ap_supply) {
@@ -4605,7 +5455,8 @@ void GsAmmControllerTick(void)
             gs_amm_tp_cpu_pressure_threshold_pct > 0 &&
             state->tp_cpu_util_pct >= gs_amm_tp_cpu_pressure_threshold_pct;
         state->tp_cpu_guarded = cpu_guarded;
-        if (test_mode ? test_worker_surge : cpu_guarded) {
+        if ((test_mode ? test_worker_surge : cpu_guarded) &&
+            (state->active_ap_count > 0 || state->queued_ap_count > 0)) {
             state->tp_hot_clear_windows = 0;
             state->tp_pressure_hot = true;
             state->tp_pressure_state = GS_AMM_TP_PRESSURE_HOT_RECOVERY;
@@ -4622,20 +5473,27 @@ void GsAmmControllerTick(void)
             }
         }
         restore_after_empty = !state->tp_pressure_hot &&
-            state->tp_recovery_phase == GS_AMM_TP_RECOVERY_WAIT_AP &&
+            (state->tp_recovery_phase == GS_AMM_TP_RECOVERY_WAIT_AP ||
+                state->tp_recovery_phase == GS_AMM_TP_RECOVERY_STOP_AP) &&
             state->active_ap_count == 0;
         bool allow_ap_supply = state->tp_pressure_valid &&
-            state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW &&
+            (state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW ||
+                (state->tp_pressure_state == GS_AMM_TP_PRESSURE_RECOVERY_WAIT &&
+                    state->active_ap_count == 0)) &&
             state->ap_downgrade_pending == 0;
         SpinLockRelease(&state->mutex);
         if (empty_window_hot) {
+            bool ap_stopped;
+
             SpinLockAcquire(&state->mutex);
             state->tp_recovery_phase = GS_AMM_TP_RECOVERY_STOP_AP;
-            gs_amm_request_ap_stop_locked(state);
-            bool ap_stopped = state->active_ap_count == 0;
+            (void)gs_amm_tp_hot_recovery_step_locked(state, true);
+            ap_stopped = state->active_ap_count == 0;
             SpinLockRelease(&state->mutex);
             if (ap_stopped)
                 gs_amm_restore_shared_buffer_after_ap_stop(state);
+            else
+                (void)gs_amm_expand_one_tp_granule(state);
             return;
         }
         if (restore_after_empty)
@@ -4649,7 +5507,9 @@ void GsAmmControllerTick(void)
         pressure_pct = (int)((reads * 100) / accesses);
         hit_pct = (int)((hits * 100) / accesses);
     }
+    state->tp_prev_window_tps = state->tp_recent_tps;
     state->tp_recent_tps = completed_queries;
+    gs_amm_update_tp_jitter_locked(state, completed_queries);
     if (completed_queries > 0 && (!state->tp_tps_baseline_valid ||
         /* During the low-flow setup window, let the baseline follow the
          * actual two-worker rate even when AP already owns granules.  Once
@@ -4788,6 +5648,16 @@ void GsAmmControllerTick(void)
         }
     }
     hot = state->tp_pressure_hot;
+
+    /* Warm-phase early downgrade was removed: in low-flow TP the guard ladder
+     * pauses borrowing on TPS decline/jitter; the hot CPU path owns AP stop
+     * decisions.  This keeps drain-sb admissions stable instead of spilling
+     * the AP immediately after its first borrowed grant. */
+
+    /* Jitter closed-loop: the ladder above already pauses borrow/restore
+     * when low-TP TPS becomes noisy.  Do not stop APs on jitter alone; the
+     * hot/warm miss path owns AP stop decisions. */
+
     if (hit_guarded)
         gs_amm_set_backpressure_reason_locked(state, "buffer_hit_guard");
     else if (tps_guarded)
@@ -4805,29 +5675,37 @@ void GsAmmControllerTick(void)
     SpinLockRelease(&state->mutex);
     if (!hot) {
         SpinLockAcquire(&state->mutex);
-        bool waiting_for_ap = state->tp_recovery_phase == GS_AMM_TP_RECOVERY_WAIT_AP &&
+        bool waiting_for_ap = (state->tp_recovery_phase == GS_AMM_TP_RECOVERY_WAIT_AP ||
+            state->tp_recovery_phase == GS_AMM_TP_RECOVERY_STOP_AP) &&
             state->active_ap_count == 0;
         SpinLockRelease(&state->mutex);
         if (waiting_for_ap)
             gs_amm_restore_shared_buffer_after_ap_stop(state);
     }
-    if (!hot && state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW) {
+    if (!hot && (state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW ||
+        state->tp_pressure_state == GS_AMM_TP_PRESSURE_RECOVERY_WAIT)) {
         gs_amm_supply_ap_demand();
         gs_amm_process_ap_queue();
     }
     if (hot) {
-        /* TP owns the memory during a hot window.  Cancel every active AP
-         * query first, then wait for normal grant cleanup before resizing SB. */
+        /* TP owns the memory during a hot window.  Ask running APs to spill
+         * and return one granule first (graceful downgrade).  The controller
+         * escalates to cancel-and-stop only after several consecutive hot
+         * windows without a confirmed downgrade, which keeps the stop path as
+         * an emergency fallback instead of the primary mechanism. */
+        bool ap_stopped;
+
         SpinLockAcquire(&state->mutex);
         state->tp_recovery_phase = GS_AMM_TP_RECOVERY_STOP_AP;
         (void)snprintf_s(state->last_supply_source, sizeof(state->last_supply_source),
             sizeof(state->last_supply_source) - 1, "%s", "tp_recovery_stop_ap");
-        gs_amm_request_ap_stop_locked(state);
-        state->last_action = GS_AMM_TP_DOWNGRADE_PENDING;
-        bool ap_stopped = state->active_ap_count == 0;
+        (void)gs_amm_tp_hot_recovery_step_locked(state, true);
+        ap_stopped = state->active_ap_count == 0;
         SpinLockRelease(&state->mutex);
         if (ap_stopped)
             gs_amm_restore_shared_buffer_after_ap_stop(state);
+        else
+            (void)gs_amm_expand_one_tp_granule(state);
         return;
     }
 
@@ -4845,9 +5723,18 @@ void GsAmmControllerTick(void)
         SpinLockAcquire(&state->mutex);
         if (state->tp_pressure_valid && state->tp_pressure_state == GS_AMM_TP_PRESSURE_LOW_FLOW &&
             state->tp_low_pressure_windows >= GS_AMM_TP_LOW_WINDOWS_BEFORE_DRAIN &&
-            state->ap_downgrade_pending == 0) {
+            state->ap_downgrade_pending == 0 &&
+            state->resize_pending_target_blocks == 0) {
             baseline_blocks = gs_amm_mb_to_blocks(state->baseline_active_mb);
             can_drain_baseline = baseline_blocks > 0;
+            /* Leave the emergency multipass-only mode once TP has been calm
+             * for several windows.  Otherwise every later AP is admitted
+             * against its multi-pass minimum (often the 4 MB floor) and never
+             * borrows shared buffer again after a single TP recovery. */
+            if (state->ap_multipass_only) {
+                state->ap_multipass_only = false;
+                state->tp_recovery_phase = GS_AMM_TP_RECOVERY_IDLE;
+            }
         }
         SpinLockRelease(&state->mutex);
 
@@ -4864,6 +5751,31 @@ void GsAmmControllerTick(void)
                     SpinLockAcquire(&state->mutex);
                     state->last_action = GS_AMM_TP_BUFFER_BASELINE_DRAIN;
                     SpinLockRelease(&state->mutex);
+                }
+            } else if (active_blocks < baseline_blocks) {
+                /* Grow the shared buffer back toward its startup baseline once
+                 * no AP is borrowing.  Without this an AP burst leaves SB at
+                 * the floor forever, so scenario-1 resize can never recover and
+                 * stage-5 TP has to re-warm a needlessly small cache.  One
+                 * granule per low-pressure window keeps the change smooth. */
+                bool no_active_ap;
+                GsAmmResizeOutcome outcome;
+                int target_blocks;
+
+                SpinLockAcquire(&state->mutex);
+                no_active_ap = state->active_ap_count == 0 && state->ap_downgrade_pending == 0 &&
+                    !state->tp_jitter_pause_restore &&
+                    state->sb_cycle_state == GS_AMM_SB_STABLE;
+                SpinLockRelease(&state->mutex);
+                if (no_active_ap) {
+                    target_blocks = Min(active_blocks + state->granule_blocks, baseline_blocks);
+                    gs_amm_resize_core(gs_amm_align_resize_target_blocks(
+                        target_blocks, NORMAL_SHARED_BUFFER_NUM), &outcome);
+                    if (outcome.decision != NULL && strcmp(outcome.decision, "expanded") == 0) {
+                        SpinLockAcquire(&state->mutex);
+                        state->last_action = GS_AMM_TP_BUFFER_BASELINE_RESTORE;
+                        SpinLockRelease(&state->mutex);
+                    }
                 }
             }
         }
@@ -4961,7 +5873,7 @@ bool GsAmmAdmitBoundsWithTarget(int cache_bound_kb, int one_pass_bound_kb, int m
     directly_admitted = gs_amm_try_admit_ap_locked(state, cache_bound_kb, one_pass_bound_kb,
         multi_pass_bound_kb, admission_target_kb, prediction_mb, &direct_token, &direct_granted_kb,
         &direct_grant_granules);
-    direct_memory_mode = state->ap_multipass_only ?
+    direct_memory_mode = gs_amm_force_multipass_locked(state) ?
         GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE;
     SpinLockRelease(&state->mutex);
 
@@ -5006,7 +5918,7 @@ bool GsAmmAdmitBoundsWithTarget(int cache_bound_kb, int one_pass_bound_kb, int m
     directly_admitted = gs_amm_try_admit_ap_locked(state, cache_bound_kb, one_pass_bound_kb,
         multi_pass_bound_kb, admission_target_kb, prediction_mb, &direct_token, &direct_granted_kb,
         &direct_grant_granules);
-    direct_memory_mode = state->ap_multipass_only ?
+    direct_memory_mode = gs_amm_force_multipass_locked(state) ?
         GS_AMM_MEMORY_MODE_MULTIPASS : GS_AMM_MEMORY_MODE_CACHE;
     if (!directly_admitted && !gs_amm_enqueue_ap_request_locked(state, cache_bound_kb, one_pass_bound_kb,
         multi_pass_bound_kb, admission_target_kb, prediction_mb, &ticket)) {

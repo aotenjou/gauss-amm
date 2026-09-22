@@ -27,16 +27,45 @@ typedef AmmGranuleChunkData AmmGranuleBlock;
 
 static uint64 AmmGranuleContextCurrentCapacity(AmmGranuleContextPtr context)
 {
+    uint64 pool;
+    uint64 limit;
     uint64 capacity;
 
     if (context == NULL)
         return 0;
-    capacity = GsAmmCurrentBackendGrantPoolBytes();
-    if (capacity == 0)
-        capacity = GsAmmGrantEffectiveMemoryLimit(context->grant_token.grant_id, context->maxBytes);
+
+    /*
+     * The AP grant capacity visible to an operator must be constrained by
+     * both the physical pool (granules + dynamic quota currently owned by
+     * this backend) and the controller's current effective grant limit.
+     * A TP-driven downgrade lowers only record->effective_grant_kb, so
+     * taking Min(pool, limit) is what turns a revoke into a hard capacity
+     * drop that makes sort/hash spill and release granules.
+     */
+    pool = GsAmmCurrentBackendGrantPoolBytes();
+    limit = GsAmmGrantEffectiveMemoryLimit(context->grant_token.grant_id, context->maxBytes);
+    if (pool == 0)
+        capacity = limit;
+    else if (limit == 0)
+        capacity = pool;
+    else
+        capacity = Min(pool, limit);
     if (capacity == 0)
         capacity = context->maxBytes;
-    context->maxBytes = capacity;
+
+    /*
+     * A TP-driven revoke must become visible as a hard allocation stop even
+     * when record->effective_grant_kb is not below the current pool (for
+     * example a multipass grant already sized below its one-pass bound).
+     * While this backend's reclaim is pending, cap capacity at liveBytes so
+     * any new tuple allocation fails; the operator then spills, releases
+     * free chunks, and confirms the reclaim via GsAmmGrantProcessPendingReclaim.
+     * Do not store this transient cap in context->maxBytes: maxBytes remains
+     * the grant request used for GsAmmGrantEffectiveMemoryLimit().
+     */
+    if (GsAmmGrantReclaimPending() && context->liveBytes < capacity)
+        capacity = context->liveBytes;
+
     context->set.maxSpaceSize = capacity;
     return capacity;
 }
