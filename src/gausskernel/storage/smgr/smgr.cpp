@@ -949,7 +949,7 @@ ScalarToDatum GetTransferFuncByTypeOid(Oid attTypeOid)
             return convertScalarToDatumT<UNKNOWNOID>;
         }
         default: {
-            return convertScalarToDatumT<-2>;
+            return convertScalarToDatumT<UNKNOWNOID>;
         }
     }
 }
@@ -1054,4 +1054,3 @@ void SmgrChunkFragmentsRestore(const RelFileNode& rnode, ForkNumber forknum, cha
 
     return;
 }
-

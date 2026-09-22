@@ -23,6 +23,8 @@
 #include "executor/node/nodeHashjoin.h"
 #include "miscadmin.h"
 #include "utils/anls_opt.h"
+#include "storage/gs_amm.h"
+#include "utils/ammgranule.h"
 #include "utils/memutils.h"
 
 /*
@@ -71,6 +73,7 @@ static TupleTableSlot* ExecHashJoin(PlanState* state)
     int batchno;
     MemoryContext oldcxt = NULL;
     JoinType jointype;
+    uint64 amm_poll_count = 0;
 
     /*
      * get information from HashJoin node
@@ -116,7 +119,25 @@ static TupleTableSlot* ExecHashJoin(PlanState* state)
          * each time through.
          */
         CHECK_FOR_INTERRUPTS();
-        
+
+        /*
+         * AMM unified reclaim poll for hash join.  When TP pressure asks
+         * this backend to return memory, release any free chunks in the
+         * hash-table AmmGranuleContexts and confirm the reclaim.  The hash
+         * table itself keeps its live tuples; subsequent growth is stopped
+         * by the grant capacity drop, which forces the existing AMM hash
+         * batching/spill path.
+         */
+        amm_poll_count++;
+        if ((amm_poll_count % 1024) == 0 && gs_amm_enabled && hashtable != NULL) {
+            if (hashtable->hashCxt != NULL && IsA(hashtable->hashCxt, AmmGranuleContext)) {
+                (void)AmmGranuleContextReleaseFreeMemoryTree(hashtable->hashCxt);
+            }
+            if (GsAmmGrantReclaimPending()) {
+                (void)GsAmmGrantProcessPendingReclaim();
+            }
+        }
+
         switch (node->hj_JoinState) {
             case HJ_BUILD_HASHTABLE: {
                 /*

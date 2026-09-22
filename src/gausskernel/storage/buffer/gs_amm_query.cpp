@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <math.h>
 #include <string.h>
+#include <sys/resource.h>
 
 #include "access/heapam.h"
 #include "access/xact.h"
@@ -79,7 +80,20 @@ typedef struct GsAmmTpQueryState {
     uint64 pending_read;
     uint64 pending_queries;
     TimestampTz pending_since;
+    uint64 start_cpu_us;
 } GsAmmTpQueryState;
+
+/* Per-backend CPU time.  AMM uses this (not host-wide /proc/stat) so that an
+ * AP sort saturating a small host is never mistaken for TP pressure. */
+static uint64 gs_amm_self_cpu_us(void)
+{
+    struct rusage usage;
+
+    if (getrusage(RUSAGE_SELF, &usage) != 0)
+        return 0;
+    return (uint64)usage.ru_utime.tv_sec * 1000000 + (uint64)usage.ru_utime.tv_usec +
+        (uint64)usage.ru_stime.tv_sec * 1000000 + (uint64)usage.ru_stime.tv_usec;
+}
 
 #define GS_AMM_NATIVE_GRANT_MODE_NONE 0
 
@@ -132,6 +146,7 @@ static void gs_amm_clear_tp_query_state(void)
     gs_amm_tp_query_state.active = false;
     gs_amm_tp_query_state.start_hit = 0;
     gs_amm_tp_query_state.start_read = 0;
+    gs_amm_tp_query_state.start_cpu_us = 0;
 }
 
 static void gs_amm_flush_tp_usage(bool force)
@@ -808,6 +823,7 @@ bool GsAmmTpExecutorStart(QueryDesc *query_desc, int eflags)
     state->owner_session = u_sess;
     state->owner_session_id = u_sess->session_id;
     state->owner_query_desc = query_desc;
+    state->start_cpu_us = gs_amm_self_cpu_us();
     state->active = u_sess->instr_cxt.pg_buffer_usage != NULL;
     if (state->active) {
         state->start_hit = u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit;
@@ -821,19 +837,24 @@ void GsAmmTpExecutorEnd(QueryDesc *query_desc, bool success)
     GsAmmTpQueryState *state = &gs_amm_tp_query_state;
     uint64 hit;
     uint64 read;
+    uint64 now_cpu_us;
 
     (void)success;
-    if (!state->active || state->owner_query_desc != query_desc ||
-        u_sess->instr_cxt.pg_buffer_usage == NULL)
+    if (state->owner_query_desc != query_desc)
         return;
-    hit = u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit;
-    read = u_sess->instr_cxt.pg_buffer_usage->shared_blks_read;
-    if (state->pending_queries == 0)
-        state->pending_since = GetCurrentTimestamp();
-    state->pending_hit += hit >= state->start_hit ? hit - state->start_hit : 0;
-    state->pending_read += read >= state->start_read ? read - state->start_read : 0;
-    state->pending_queries++;
-    gs_amm_flush_tp_usage(false);
+    now_cpu_us = gs_amm_self_cpu_us();
+    if (now_cpu_us > state->start_cpu_us)
+        GsAmmRecordTpCpuUsage(now_cpu_us - state->start_cpu_us);
+    if (state->active && u_sess->instr_cxt.pg_buffer_usage != NULL) {
+        hit = u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit;
+        read = u_sess->instr_cxt.pg_buffer_usage->shared_blks_read;
+        if (state->pending_queries == 0)
+            state->pending_since = GetCurrentTimestamp();
+        state->pending_hit += hit >= state->start_hit ? hit - state->start_hit : 0;
+        state->pending_read += read >= state->start_read ? read - state->start_read : 0;
+        state->pending_queries++;
+        gs_amm_flush_tp_usage(false);
+    }
     gs_amm_clear_tp_query_state();
 }
 

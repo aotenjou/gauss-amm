@@ -77,6 +77,7 @@
 #include "replication/walsender.h"
 #include "storage/buf/bufmgr.h"
 #include "storage/freespace.h"
+#include "storage/gs_amm.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
@@ -231,12 +232,31 @@ static void initscan(HeapScanDesc scan, ScanKey key, bool is_rescan)
     if (scan->rs_base.rs_nblocks > (uint32)(g_instance.attr.attr_storage.NBuffers / 4)) {
         allow_strat = ((scan->rs_base.rs_flags & SO_ALLOW_STRAT) != 0);
         allow_sync = ((scan->rs_base.rs_flags & SO_ALLOW_SYNC) != 0);
+        /*
+         * AMM AP sessions must not let a large Seq Scan pollute the
+         * reserved shared-buffer zone.  Force a small BAS_BULKREAD ring so
+         * the scan reuses only a handful of buffers while it runs.
+         */
+        if (allow_strat && gs_amm_enabled &&
+            gs_amm_workload_role == GS_AMM_WORKLOAD_AP) {
+            allow_sync = false;
+        }
     } else
         allow_strat = allow_sync = false;
 
     if (allow_strat) {
-        if (scan->rs_base.rs_strategy == NULL)
-            scan->rs_base.rs_strategy = GetAccessStrategy(BAS_BULKREAD);
+        if (scan->rs_base.rs_strategy == NULL) {
+            if (gs_amm_enabled && gs_amm_workload_role == GS_AMM_WORKLOAD_AP) {
+                int saved_ring_kb = u_sess->attr.attr_storage.bulk_read_ring_size;
+                int ap_ring_kb = Max(gs_amm_ap_scan_ring_pages * (int)(BLCKSZ / 1024), 16);
+
+                u_sess->attr.attr_storage.bulk_read_ring_size = ap_ring_kb;
+                scan->rs_base.rs_strategy = GetAccessStrategy(BAS_BULKREAD);
+                u_sess->attr.attr_storage.bulk_read_ring_size = saved_ring_kb;
+            } else {
+                scan->rs_base.rs_strategy = GetAccessStrategy(BAS_BULKREAD);
+            }
+        }
     } else {
         if (scan->rs_base.rs_strategy != NULL)
             FreeAccessStrategy(scan->rs_base.rs_strategy);

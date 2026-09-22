@@ -877,6 +877,8 @@ maintainer-clean: distclean
 	      ../common/backend/utils/errcodes.h \
 	      ../common/backend/utils/misc/guc-file.cpp
 
+# MOT's static archive needs libatomic after the archive on Ubuntu/GCC 10.
+LIBS += -latomic
 
 ##########################################################################
 #

@@ -1796,6 +1796,7 @@ extern Datum gs_amm_status(PG_FUNCTION_ARGS);
 extern Datum gs_amm_begin_ap(PG_FUNCTION_ARGS);
 extern Datum gs_amm_begin_ap_bounds(PG_FUNCTION_ARGS);
 extern Datum gs_amm_end_ap(PG_FUNCTION_ARGS);
+extern Datum gs_amm_resize(PG_FUNCTION_ARGS);
 extern Datum gs_workmem_dtree_predict(PG_FUNCTION_ARGS);
 extern Datum gs_workmem_dtree_predict_detail(PG_FUNCTION_ARGS);
 
