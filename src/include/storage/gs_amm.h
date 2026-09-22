@@ -104,6 +104,7 @@ typedef struct GsAmmAdmissionResult {
 } GsAmmAdmissionResult;
 
 extern int gs_amm_shared_buffers_min_mb;
+extern int gs_amm_tp_reserve_mb;
 extern int gs_amm_dynamic_target_mb;
 extern int gs_amm_granule_size_mb;
 extern bool gs_amm_enabled;

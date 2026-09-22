@@ -23,7 +23,7 @@
 | 维度 | 原始基线 | 本次改造后 |
 | --- | --- | --- |
 | 内存控制对象 | `shared_buffers` 与执行器内存相互独立，执行器主要通过 `work_mem` 限制 | 使用统一的 AMM granule pool，在共享缓冲区与 AP grant 之间在线转换 |
-| 调节粒度 | 无 shared buffer 到 AP 的可复用物理内存粒度 | 默认 64 MB granule，有界 drain、回收与扩容 |
+| 调节粒度 | 无 shared buffer 到 AP 的可复用物理内存粒度 | 默认 8 MB granule，有界 drain、回收与扩容 |
 | AP 内存 | 常规内存上下文分配，`work_mem` 主要是额度控制 | sort/hash 可使用 `AmmGranuleContext`，从 AP 拥有的共享缓冲区 granule 直接分配 |
 | 预测来源 | 无内核内置 work_mem 决策树与叶子信息 | 内核静态决策树输出三档预测、模型版本和叶子 ID |
 | 预测反馈 | 无按模型叶子的内核在线反馈 | 预测结果直接进入准入和 granule 控制，不在主线引入运行时校准反馈 |
@@ -80,7 +80,7 @@ granule 状态机为：
 | `AP_RESERVED` | 已为 AP grant 预留，但尚未进入实际分配使用 |
 | `AP_ACTIVE` | 正被 AP 专用 MemoryContext 使用 |
 
-`InitBufferPool()` 完成 shared buffer 初始化后，会初始化 AMM 共享内存与 granule 表。正常 shared buffer 覆盖的 granule 初始标记为 `BUFFER_ACTIVE`。默认 granule 大小为 64 MB；尾部不足一个 granule 的 buffer 也作为一个受管理 granule 处理。
+`InitBufferPool()` 完成 shared buffer 初始化后，会初始化 AMM 共享内存与 granule 表。正常 shared buffer 覆盖的 granule 初始标记为 `BUFFER_ACTIVE`。默认 granule 大小为 8 MB；尾部不足一个 granule 的 buffer 也作为一个受管理 granule 处理。
 
 `generation` 在 granule 重新分配给不同用途时递增，grant 释放时同时校验 generation。该机制防止旧 grant 或已经失效的引用跨代使用。
 
@@ -228,7 +228,7 @@ GUC 定义位于 `src/common/backend/utils/misc/guc/guc_storage.cpp`，配置样
 | GUC | 默认值 | 作用 |
 | --- | ---: | --- |
 | `gs_amm_enabled` | `false` | 启用 AMM controller、granule ownership 和执行器接入 |
-| `gs_amm_granule_size_mb` | `64` | 固定 ownership granule 大小 |
+| `gs_amm_granule_size_mb` | `8` | 固定 ownership granule 大小 |
 | `gs_amm_shared_buffers_min_mb` | `64` | shared buffer 最小保留量 |
 | `gs_amm_dynamic_target_mb` | `512` | 动态 AP 内存目标 |
 | `gs_amm_tp_buffer_miss_threshold_pct` | `5` | TP buffer miss 百分比达到该值时触发恢复；`0` 关闭该路径 |
@@ -346,7 +346,7 @@ GUC 定义位于 `src/common/backend/utils/misc/guc/guc_storage.cpp`，配置样
 ### 11.2 性能与稳定性风险
 
 1. shared buffer shrink 直接影响缓存工作集。即使采用 granule、drain 和 guard，也必须按真实 TP 工作集标定 `shared_buffers_min_mb`，不能把最终保留容量压低到活跃工作集以下。
-2. 过小 granule 会提升状态维护和 drain 次数，过大 granule 会增大一次迁移影响；默认 64 MB 是初始折中，需在目标机上测量。
+2. 过小 granule 会提升状态维护和 drain 次数，过大 granule 会增大一次迁移影响；默认 8 MB 优先降低低内存主机上的单次迁移扰动，仍需在目标机上测量。
 3. 物理读率、dirty backlog、pagewriter 节奏、存储延迟和 sysbench 观察窗口会影响 guard 的触发准确性，部署前必须建立 TP-only 基线。
 4. AMM 准入采用 fail-open：特征收集或 admission 故障只会放弃 grant，查询仍继续执行；需要持续观测失败原因和队列反压。
 5. 内部校准会改变 grant，可能影响 AP 延迟、spill 和 TP 并发关系，应在混合负载中验证。

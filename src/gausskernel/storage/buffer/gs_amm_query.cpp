@@ -27,6 +27,7 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
+#include "utils/timestamp.h"
 #include "utils/tuplesort.h"
 #include "utils/workmem_xgb_v5_model.h"
 
@@ -74,12 +75,21 @@ typedef struct GsAmmTpQueryState {
     bool active;
     uint64 start_hit;
     uint64 start_read;
+    uint64 pending_hit;
+    uint64 pending_read;
+    uint64 pending_queries;
+    TimestampTz pending_since;
 } GsAmmTpQueryState;
 
 #define GS_AMM_NATIVE_GRANT_MODE_NONE 0
 
 static THR_LOCAL GsAmmNativeQueryState gs_amm_native_query_state;
 static THR_LOCAL GsAmmTpQueryState gs_amm_tp_query_state;
+
+/* Shared TP counters are sampled in one-second windows.  Batch updates from
+ * each backend to keep the query completion path off the shared spinlock. */
+#define GS_AMM_TP_FLUSH_QUERY_COUNT 8
+#define GS_AMM_TP_FLUSH_INTERVAL_MS 100
 
 static void gs_amm_clear_native_query_state(void);
 static void gs_amm_clear_executor_frames(void);
@@ -122,6 +132,31 @@ static void gs_amm_clear_tp_query_state(void)
     gs_amm_tp_query_state.active = false;
     gs_amm_tp_query_state.start_hit = 0;
     gs_amm_tp_query_state.start_read = 0;
+}
+
+static void gs_amm_flush_tp_usage(bool force)
+{
+    GsAmmTpQueryState *state = &gs_amm_tp_query_state;
+    TimestampTz now;
+    long secs = 0;
+    int usecs = 0;
+    bool due;
+
+    if (state->pending_queries == 0)
+        return;
+    now = GetCurrentTimestamp();
+    if (state->pending_since != 0)
+        TimestampDifference(state->pending_since, now, &secs, &usecs);
+    due = force || state->pending_queries >= GS_AMM_TP_FLUSH_QUERY_COUNT ||
+        (state->pending_since != 0 &&
+            (secs * 1000L + usecs / 1000L) >= GS_AMM_TP_FLUSH_INTERVAL_MS);
+    if (!due)
+        return;
+    GsAmmRecordTpBufferUsage(state->pending_hit, state->pending_read, state->pending_queries);
+    state->pending_hit = 0;
+    state->pending_read = 0;
+    state->pending_queries = 0;
+    state->pending_since = 0;
 }
 
 uint64 GsAmmCurrentQueryLifecycleGeneration(void)
@@ -758,6 +793,18 @@ bool GsAmmTpExecutorStart(QueryDesc *query_desc, int eflags)
     (void)eflags;
     if (!gs_amm_enabled || gs_amm_workload_role != GS_AMM_WORKLOAD_TP || query_desc == NULL)
         return false;
+    if (state->owner_session != NULL &&
+        (state->owner_session != u_sess || state->owner_session_id != u_sess->session_id)) {
+        gs_amm_flush_tp_usage(true);
+        state->pending_hit = 0;
+        state->pending_read = 0;
+        state->pending_queries = 0;
+        state->pending_since = 0;
+    }
+    /* A low-rate backend may have fewer than the batch threshold in its
+     * previous window.  Check the elapsed-time bound at the next query so
+     * those counters are not stranded until a session switch. */
+    gs_amm_flush_tp_usage(false);
     state->owner_session = u_sess;
     state->owner_session_id = u_sess->session_id;
     state->owner_query_desc = query_desc;
@@ -781,8 +828,12 @@ void GsAmmTpExecutorEnd(QueryDesc *query_desc, bool success)
         return;
     hit = u_sess->instr_cxt.pg_buffer_usage->shared_blks_hit;
     read = u_sess->instr_cxt.pg_buffer_usage->shared_blks_read;
-    GsAmmRecordTpBufferUsage(hit >= state->start_hit ? hit - state->start_hit : 0,
-        read >= state->start_read ? read - state->start_read : 0, 1);
+    if (state->pending_queries == 0)
+        state->pending_since = GetCurrentTimestamp();
+    state->pending_hit += hit >= state->start_hit ? hit - state->start_hit : 0;
+    state->pending_read += read >= state->start_read ? read - state->start_read : 0;
+    state->pending_queries++;
+    gs_amm_flush_tp_usage(false);
     gs_amm_clear_tp_query_state();
 }
 

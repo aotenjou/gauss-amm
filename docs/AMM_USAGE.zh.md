@@ -6,7 +6,7 @@
 
 AMM 将 normal shared buffer 按固定 granule 划分。当 AP 查询获得预测 grant 时，控制器在动态池预算内分配 AP granule。TP 压力达到 miss 阈值时，按 FREE granule、闲置 AP granule、运行中 AP 降级到 multipass 的顺序释放容量；TP 连续低压三个窗口后，每次最多向 shared-buffer 基线归还一个 granule。
 
-本文覆盖的是当前交付源码实现，默认 granule 为 64 MB，AP 专用 allocator 首期只接入 sort/hash。它不代表所有执行器算子均已经使用 AMM allocator。
+本文覆盖的是当前交付源码实现，默认 granule 为 8 MB，AP 专用 allocator 首期只接入 sort/hash。它不代表所有执行器算子均已经使用 AMM allocator。
 
 ## 2. 使用前提
 
@@ -37,7 +37,7 @@ gs_amm_enabled = on
 ```conf
 # AMM 的保守起点
 gs_amm_enabled = on
-gs_amm_granule_size_mb = 64              # 修改本项后需重启
+gs_amm_granule_size_mb = 8               # 修改本项后需重启
 gs_amm_shared_buffers_min_mb = 1024
 gs_amm_dynamic_target_mb = 512
 ```
@@ -60,7 +60,7 @@ SELECT pg_catalog.gs_amm_status();
 | 参数 | 默认值 | 生效 | 用途 |
 | --- | ---: | --- | --- |
 | `gs_amm_enabled` | `off` | reload | AMM controller、granule ownership 和自动执行器接入总开关 |
-| `gs_amm_granule_size_mb` | `64` | 重启 | 固定 granule 大小及共享内存布局 |
+| `gs_amm_granule_size_mb` | `8` | 重启 | 固定 granule 大小及共享内存布局 |
 | `gs_amm_shared_buffers_min_mb` | `64` | reload | shared buffer 允许缩减到的下限 |
 | `gs_amm_dynamic_target_mb` | `512` | reload | 动态 AP 内存池目标 |
 | `gs_amm_tp_buffer_miss_threshold_pct` | `5` | reload | TP shared-buffer miss 百分比阈值；达到后优先给 buffer 释放 granule |
