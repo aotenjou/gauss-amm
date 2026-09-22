@@ -1,5 +1,11 @@
 ![openGauss Logo](doc/openGauss-logo.png "openGauss logo")
 
+The model data, boundary collection, XGBoost training, prediction, and test
+workflow is kept in [`model-data/`](model-data/) alongside the AMM kernel.
+Keeping this workflow in its own top-level directory allows the kernel and its
+training evidence to be versioned together without mixing generated model
+artifacts into the kernel source tree.
+
 [English](./README.en.md) | 简体中文
 
 ## AMM 评估框架

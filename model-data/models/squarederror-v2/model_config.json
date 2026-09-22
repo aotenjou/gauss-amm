@@ -1,0 +1,291 @@
+{
+  "model_abi_version": "xgb-memory-v2",
+  "schema_version": "memory-bounds-v2",
+  "label_protocol": "native-v2",
+  "xgboost_version": "2.1.4",
+  "feature_names": [
+    "hash_join_nodes",
+    "sort_nodes",
+    "aggregate_nodes",
+    "window_nodes",
+    "max_plan_rows_log10",
+    "max_plan_width",
+    "total_cost",
+    "parallel_workers_planned",
+    "parallel_aware_nodes",
+    "system_available_memory_mb",
+    "memory_pressure_score",
+    "involved_table_total_size_mb",
+    "involved_index_total_size_mb",
+    "table_count",
+    "index_table_ratio",
+    "total_cost_log1p",
+    "table_size_log1p",
+    "index_size_log1p",
+    "rows_width_log1p",
+    "active_sessions",
+    "current_session_private_memory_mb",
+    "system_total_memory_mb",
+    "plan_node_count",
+    "sort_input_rows",
+    "sort_tuple_width",
+    "sort_input_bytes",
+    "sort_key_count",
+    "sort_input_rows_log1p",
+    "sort_input_bytes_log1p",
+    "max_plan_rows_log10_missing",
+    "max_plan_width_missing",
+    "total_cost_missing",
+    "system_available_memory_mb_missing",
+    "memory_pressure_score_missing",
+    "involved_table_total_size_mb_missing",
+    "involved_index_total_size_mb_missing",
+    "table_count_missing",
+    "index_table_ratio_missing",
+    "sort_input_rows_missing",
+    "sort_tuple_width_missing",
+    "sort_input_bytes_missing",
+    "active_sessions_missing",
+    "current_session_private_memory_mb_missing",
+    "system_total_memory_mb_missing",
+    "plan_node_count_missing",
+    "sort_key_count_missing"
+  ],
+  "targets": [
+    "cache_mb",
+    "one_pass_mb"
+  ],
+  "target_transform": "log1p",
+  "device": "cpu",
+  "gpu_id": null,
+  "feature_abi": "v2",
+  "balance_workload": false,
+  "gsbench_shape_weight": false,
+  "ap_shape_weight": 1.0,
+  "objective": "reg:squarederror",
+  "quantile_alpha": 0.55,
+  "calibrate": true,
+  "calibration_grid": [
+    0.95,
+    1.0,
+    1.05,
+    1.1
+  ],
+  "calibration_file": "calibration.json",
+  "calibration": {
+    "cache_mb": 1.0,
+    "one_pass_mb": 1.0,
+    "selection_metric": "mean_qerror",
+    "source": "template_disjoint_validation"
+  },
+  "observed_multi_pass_only": true,
+  "feature_imputation": {
+    "hash_join_nodes": 1.0,
+    "sort_nodes": 1.0,
+    "aggregate_nodes": 0.0,
+    "window_nodes": 0.0,
+    "max_plan_rows_log10": 5.47559,
+    "max_plan_width": 253.0,
+    "total_cost": 378858.96499999997,
+    "parallel_workers_planned": 0.0,
+    "parallel_aware_nodes": 0.0,
+    "system_available_memory_mb": 205849.5,
+    "memory_pressure_score": 0.2006,
+    "involved_table_total_size_mb": 1892.312,
+    "involved_index_total_size_mb": 737.766,
+    "table_count": 2.0,
+    "index_table_ratio": 0.38984555242838276,
+    "total_cost_log1p": 12.843654744626136,
+    "table_size_log1p": 7.546082955377973,
+    "index_size_log1p": 6.604981226692202,
+    "rows_width_log1p": 7.249041312099779,
+    "active_sessions": 6.5,
+    "current_session_private_memory_mb": 0.0,
+    "system_total_memory_mb": 257507.0,
+    "plan_node_count": 7.0,
+    "sort_input_rows": 2.0,
+    "sort_tuple_width": 251.0,
+    "sort_input_bytes": 372.0,
+    "sort_key_count": 3.0,
+    "sort_input_rows_log1p": 1.0986122886681096,
+    "sort_input_bytes_log1p": 5.921578419643816,
+    "max_plan_rows_log10_missing": 0.0,
+    "max_plan_width_missing": 0.0,
+    "total_cost_missing": 0.0,
+    "system_available_memory_mb_missing": 0.0,
+    "memory_pressure_score_missing": 0.0,
+    "involved_table_total_size_mb_missing": 0.0,
+    "involved_index_total_size_mb_missing": 0.0,
+    "table_count_missing": 0.0,
+    "index_table_ratio_missing": 0.0,
+    "sort_input_rows_missing": 0.0,
+    "sort_tuple_width_missing": 0.0,
+    "sort_input_bytes_missing": 0.0,
+    "active_sessions_missing": 0.0,
+    "current_session_private_memory_mb_missing": 0.0,
+    "system_total_memory_mb_missing": 0.0,
+    "plan_node_count_missing": 0.0,
+    "sort_key_count_missing": 0.0
+  },
+  "feature_ranges": {
+    "hash_join_nodes": {
+      "count": 1200,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "sort_nodes": {
+      "count": 1200,
+      "min": 1.0,
+      "max": 3.0
+    },
+    "aggregate_nodes": {
+      "count": 1200,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "window_nodes": {
+      "count": 1200,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "max_plan_rows_log10": {
+      "count": 1200,
+      "min": 5.463639,
+      "max": 6.00153
+    },
+    "max_plan_width": {
+      "count": 1200,
+      "min": 129.0,
+      "max": 287.0
+    },
+    "total_cost": {
+      "count": 1200,
+      "min": 94110.39,
+      "max": 654434.21
+    },
+    "parallel_workers_planned": {
+      "count": 1200,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "parallel_aware_nodes": {
+      "count": 1200,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "system_available_memory_mb": {
+      "count": 1200,
+      "min": 191032.0,
+      "max": 210522.0
+    },
+    "memory_pressure_score": {
+      "count": 1200,
+      "min": 0.1825,
+      "max": 0.2581
+    },
+    "involved_table_total_size_mb": {
+      "count": 1167,
+      "min": 368.055,
+      "max": 7547.352
+    },
+    "involved_index_total_size_mb": {
+      "count": 1167,
+      "min": 137.102,
+      "max": 2929.281
+    },
+    "table_count": {
+      "count": 1200,
+      "min": 2.0,
+      "max": 3.0
+    },
+    "index_table_ratio": {
+      "count": 1167,
+      "min": 0.3725041094401652,
+      "max": 0.39501261451966585
+    },
+    "total_cost_log1p": {
+      "count": 1200,
+      "min": 11.452234359693817,
+      "max": 13.391527867835462
+    },
+    "table_size_log1p": {
+      "count": 1200,
+      "min": 0.0,
+      "max": 8.929084540271234
+    },
+    "index_size_log1p": {
+      "count": 1200,
+      "min": 0.0,
+      "max": 7.9828536018494365
+    },
+    "rows_width_log1p": {
+      "count": 1200,
+      "min": 6.559345273294147,
+      "max": 7.4130176654000355
+    },
+    "active_sessions": {
+      "count": 1200,
+      "min": 4.0,
+      "max": 9.0
+    },
+    "current_session_private_memory_mb": {
+      "count": 0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "system_total_memory_mb": {
+      "count": 1200,
+      "min": 257507.0,
+      "max": 257507.0
+    },
+    "plan_node_count": {
+      "count": 1200,
+      "min": 5.0,
+      "max": 10.0
+    },
+    "sort_input_rows": {
+      "count": 1200,
+      "min": 1.0,
+      "max": 295029.0
+    },
+    "sort_tuple_width": {
+      "count": 1200,
+      "min": 129.0,
+      "max": 287.0
+    },
+    "sort_input_bytes": {
+      "count": 1200,
+      "min": 129.0,
+      "max": 54875394.0
+    },
+    "sort_key_count": {
+      "count": 1200,
+      "min": 1.0,
+      "max": 9.0
+    },
+    "sort_input_rows_log1p": {
+      "count": 1200,
+      "min": 0.6931471805599453,
+      "max": 12.594832325066633
+    },
+    "sort_input_bytes_log1p": {
+      "count": 1200,
+      "min": 4.867534450455582,
+      "max": 17.820575627511378
+    }
+  },
+  "params": {
+    "objective": "reg:squarederror",
+    "n_estimators": 240,
+    "max_depth": 4,
+    "learning_rate": 0.04,
+    "min_child_weight": 2.0,
+    "subsample": 0.9,
+    "colsample_bytree": 0.9,
+    "reg_alpha": 0.05,
+    "reg_lambda": 2.0,
+    "max_bin": 64,
+    "n_jobs": 2,
+    "random_state": 20260904
+  }
+}

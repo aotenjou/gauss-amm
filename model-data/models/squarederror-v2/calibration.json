@@ -1,0 +1,12 @@
+{
+  "cache_mb": 1.0,
+  "one_pass_mb": 1.0,
+  "selection_metric": "mean_qerror",
+  "source": "template_disjoint_validation",
+  "grid": [
+    0.95,
+    1.0,
+    1.05,
+    1.1
+  ]
+}

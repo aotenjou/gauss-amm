@@ -1,0 +1,14 @@
+[
+  "Wide Hash Join: return fact_sales id, payload, amount and account payload from the required broad join, ordered by fact_sales id",
+  "Wide Hash Join followed by a full ORDER BY fact_sales payload and account payload; retain the unaggregated joined rows",
+  "Wide Hash Join followed by DISTINCT on fact_sales customer_id, product_id, store_id, payload and account payload, then full ORDER BY",
+  "Wide Hash Join in a CTE, then rank all joined rows with ROW_NUMBER partitioned by store_id and ordered by amount; retain payload columns",
+  "Wide Hash Join in a CTE, then compute running SUM(amount) partitioned by customer_id and ordered by sale_date; retain payload columns",
+  "Wide Hash Join followed by GROUP BY customer_id, product_id, store_id, sale_date, fact_sales payload and account payload, then full ORDER BY",
+  "Wide Hash Join followed by GROUP BY customer_id, product_id, store_id, account payload, then full ORDER BY SUM(amount)",
+  "Wide Hash Join followed by GROUPING SETS over customer_id, product_id and store_id; include account payload and a full ORDER BY",
+  "Wide Hash Join with a CTE that projects fact_sales payload and account payload, then a full ORDER BY on both payload values and amount",
+  "Wide Hash Join with a broad date-trunc projection of sale_date, preserving fact_sales payload and account payload, then full ORDER BY",
+  "Wide Hash Join followed by a window RANK partitioned by customer_id and ordered by amount; retain all joined rows and payload columns",
+  "Wide Hash Join followed by a high-cardinality aggregate over customer_id, product_id, store_id, sale_date and payload, with full ORDER BY"
+]

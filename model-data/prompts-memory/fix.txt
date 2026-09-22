@@ -1,0 +1,18 @@
+The following openGauss 5.0 SQL template failed validation.
+
+Error:
+{{ERROR}}
+
+Original template:
+{{SQL}}
+
+Return a corrected SELECT-only template and placeholder JSON using exactly the output format required below.
+- Keep a broad gsbench.fact_sales or gsbench.sort_data input.
+- Preserve a memory-intensive Sort, Hash Join, Hash Aggregate, or WindowAgg shape and do not add LIMIT.
+- Use only schema-confirmed names and portable openGauss 5.0 syntax.
+
+Schema:
+{{SCHEMA}}
+
+Requirement:
+{{REQUIREMENT}}

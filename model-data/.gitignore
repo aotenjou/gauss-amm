@@ -1,0 +1,7 @@
+api.env
+*.env
+__pycache__/
+*.py[cod]
+output*/
+runtime/
+*.log

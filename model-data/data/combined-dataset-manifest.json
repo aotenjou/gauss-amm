@@ -1,0 +1,53 @@
+{
+  "schema_version": "memory-bounds-v2",
+  "label_protocol": "native-v2",
+  "rows": 4444,
+  "three_bound_rows": 2820,
+  "observed_three_bound_rows": 1200,
+  "derived_multi_pass_rows": 1620,
+  "missing_multi_pass_rows": 1624,
+  "observed_only": false,
+  "split_rows": {
+    "train": 3112,
+    "validation": 669,
+    "test": 663
+  },
+  "workload_counts": {
+    "dsb": 600,
+    "gsbench": 2224,
+    "job": 420,
+    "tpcds": 600,
+    "tpch": 600
+  },
+  "source_stats": {
+    "dsb": {
+      "accepted": 600
+    },
+    "gsbench": {
+      "accepted": 2224
+    },
+    "job": {
+      "accepted": 420
+    },
+    "tpcds": {
+      "accepted": 600
+    },
+    "tpch": {
+      "accepted": 600
+    }
+  },
+  "rejected_rows": 0,
+  "duplicate_rows": 0,
+  "sources": [
+    "data/legacy/tpch_sf1.jsonl",
+    "data/legacy/tpcds_sf1.jsonl",
+    "data/legacy/dsb_sf1.jsonl",
+    "data/legacy/job.jsonl",
+    "data/native-v2-gsbench-1200.jsonl",
+    "data/native-v2-sort-coverage.jsonl",
+    "data/ap-shape-coverage.jsonl"
+  ],
+  "seed": 20260906,
+  "sample_weight": "inverse_workload_frequency_normalized_to_mean_one",
+  "sha256": "919b803cff9203e1dd0017a862cf193258a6e8a91073cdd1d7634b0d47064ccf"
+}

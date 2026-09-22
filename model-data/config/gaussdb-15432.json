@@ -1,0 +1,17 @@
+{
+  "database": {
+    "host": "/tmp",
+    "port": 15432,
+    "user": "baiyutao",
+    "dbname": "tpcds_sf1",
+    "schema": "public"
+  },
+  "model": {
+    "api_key_env": "OPENAI_API_KEY",
+    "base_url": "https://api.deepseek.com",
+    "name": "deepseek-chat"
+  },
+  "api_env_file": "../api.env",
+  "spec_file": "../specs_memory.json",
+  "prompt_dir": "../prompts-memory"
+}
